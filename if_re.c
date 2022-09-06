@@ -7887,7 +7887,8 @@ static void re_init_unlock(void *xsc)  	/* Software & Hardware Initialize */
         return;
 }
 
-static void re_init(void *xsc)  	/* Software & Hardware Initialize */
+
+static void re_init_locked(void *xsc)  	/* Software & Hardware Initialize */
 {
         struct re_softc		*sc = xsc;
         struct ifnet		*ifp;
@@ -7902,6 +7903,15 @@ static void re_init(void *xsc)  	/* Software & Hardware Initialize */
 
         sc->re_link_chg_det = 1;
         re_start_timer(sc);
+}
+
+static void re_init(void *xsc)  	/* Software & Hardware Initialize */
+{
+        struct re_softc		*sc = xsc;
+
+        RE_LOCK(sc);
+        re_init_locked(sc);
+        RE_UNLOCK(sc);
 }
 
 static u_int32_t re_get_default_imr_8125(struct re_softc *sc)
@@ -7961,6 +7971,7 @@ static void re_disable_imr_8125(struct re_softc *sc)
         } else
                 CSR_WRITE_4(sc, RE_IMR0_8125, 0x00000000);
 }
+
 static void re_hw_start_unlock_8125(struct re_softc *sc)
 {
         struct ifnet		*ifp;
@@ -9707,7 +9718,7 @@ static void re_int_task(void *arg, int npending)
                         if ((status & RE_ISR_FIFO_OFLOW) &&
                             (!(status & (RE_ISR_RX_OK | RE_ISR_TX_OK | RE_ISR_RX_OVERRUN)))) {
                                 re_reset(sc);
-                                re_init(sc);
+                                re_init_locked(sc);
                                 sc->rx_fifo_overflow = 0;
                                 CSR_WRITE_2(sc, RE_ISR, RE_ISR_FIFO_OFLOW);
                         }
@@ -9718,7 +9729,7 @@ static void re_int_task(void *arg, int npending)
 
         if (status & RE_ISR_SYSTEM_ERR) {
                 re_reset(sc);
-                re_init(sc);
+                re_init_locked(sc);
         }
 
         if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
@@ -9814,7 +9825,7 @@ static void re_int_task_8125(void *arg, int npending)
         if (!sc->use_new_intr_mapping) {
                 if (status & RE_ISR_SYSTEM_ERR) {
                         re_reset(sc);
-                        re_init(sc);
+                        re_init_locked(sc);
                 }
         }
 
@@ -10043,7 +10054,7 @@ static int re_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
                                 error = re_alloc_buf(sc);
 
                                 if (error == 0) {
-                                        re_init(sc);
+                                        re_init_locked(sc);
                                 }
                         } else {
                                 //if not running
@@ -10069,7 +10080,7 @@ static int re_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
         case SIOCSIFFLAGS:
                 RE_LOCK(sc);
                 if (ifp->if_flags & IFF_UP) {
-                        re_init(sc);
+                        re_init_locked(sc);
                 } else if (ifp->if_drv_flags & IFF_DRV_RUNNING) {
                         re_stop(sc);
                 }
