@@ -888,9 +888,7 @@ static int re_eri_write(struct re_softc *sc, int addr, int len, u_int32_t value,
 
 static void re_release_rx_buf(struct re_softc *sc)
 {
-        struct ifnet		*ifp;
         int i;
-        ifp = RE_GET_IFNET(sc);
 
         if (sc->re_desc.re_rx_mtag) {
                 for (i = 0; i < RE_RX_BUF_NUM; i++) {
@@ -913,9 +911,7 @@ static void re_release_rx_buf(struct re_softc *sc)
 }
 static void re_release_tx_buf(struct re_softc *sc)
 {
-        struct ifnet		*ifp;
         int i;
-        ifp = RE_GET_IFNET(sc);
 
         if (sc->re_desc.re_tx_mtag) {
                 for (i = 0; i < RE_TX_BUF_NUM; i++) {
@@ -6902,7 +6898,9 @@ static void re_txeof(struct re_softc *sc)  	/* Transmit OK/ERR handler */
 static void re_rxeof(sc)	/* Receive Data OK/ERR handler */
 struct re_softc		*sc;
 {
+#if OS_VER < VERSION(4,9)
         struct ether_header	*eh;
+#endif
         struct mbuf		*m;
         struct ifnet		*ifp;
         union RxDesc *rxptr;
@@ -7019,7 +7017,9 @@ struct re_softc		*sc;
                         }
                 }
 
+#if OS_VER < VERSION(4,9)
                 eh = mtod(m, struct ether_header *);
+#endif
 #if OS_VER < VERSION(11,0)
                 ifp->if_ipackets++;
 #else
@@ -7309,10 +7309,7 @@ u_int32_t		mask4;
 static void re_set_rx_packet_filter_in_sleep_state(sc)
 struct re_softc		*sc;
 {
-        struct ifnet		*ifp;
         u_int32_t		rxfilt;
-
-        ifp = RE_GET_IFNET(sc);
 
         rxfilt = CSR_READ_4(sc, RE_RXCFG);
 
@@ -30242,13 +30239,12 @@ u_int16_t MP_ReadEPhyUshort(struct re_softc *sc, u_int8_t RegAddr)
 
 static u_int8_t re_calc_efuse_dummy_bit(u_int16_t reg)
 {
-        int s,a,b;
+        int s,a;
         u_int8_t dummyBitPos = 0;
 
 
         s=reg% 32;
         a=s % 16;
-        b=s/16;
 
         if (s/16) {
                 dummyBitPos = (u_int8_t)(16-a);
@@ -30856,19 +30852,16 @@ static void OOB_mutex_lock(struct re_softc *sc)
 static void OOB_mutex_unlock(struct re_softc *sc)
 {
         u_int16_t ocp_reg_mutex_ib;
-        u_int16_t ocp_reg_mutex_oob;
         u_int16_t ocp_reg_mutex_prio;
 
         switch (sc->re_type) {
         case MACFG_63:
         case MACFG_64:
         case MACFG_65:
-                ocp_reg_mutex_oob = 0x16;
                 ocp_reg_mutex_ib = 0x17;
                 ocp_reg_mutex_prio = 0x9C;
                 break;
         case MACFG_66:
-                ocp_reg_mutex_oob = 0x06;
                 ocp_reg_mutex_ib = 0x07;
                 ocp_reg_mutex_prio = 0x9C;
                 break;
@@ -30880,7 +30873,6 @@ static void OOB_mutex_unlock(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         default:
-                ocp_reg_mutex_oob = 0x110;
                 ocp_reg_mutex_ib = 0x114;
                 ocp_reg_mutex_prio = 0x11C;
                 break;
