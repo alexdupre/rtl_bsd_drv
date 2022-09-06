@@ -85,7 +85,7 @@ __FBSDID("$FreeBSD: src/sys/dev/re/if_re.c,v " RE_VERSION __DATE__ " " __TIME__ 
 #include <sys/endian.h>
 
 #include <dev/mii/mii.h>
-#include <dev/re/if_rereg.h>
+#include "if_rereg.h"
 #ifdef ENABLE_FIBER_SUPPORT
 #include <dev/re/if_fiber.h>
 #endif //ENABLE_FIBER_SUPPORT
