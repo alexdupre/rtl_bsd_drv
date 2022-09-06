@@ -7213,7 +7213,8 @@ static void re_int_task(void *arg, int npending)
                 return;
         }
 
-        re_rxeof(sc);
+        if (status & (RE_ISR_RX_OK|RE_ISR_RX_ERR|RE_ISR_FIFO_OFLOW))
+                re_rxeof(sc);
 
         if (sc->re_type == MACFG_21) {
                 if (status & RE_ISR_FIFO_OFLOW) {
@@ -7237,7 +7238,8 @@ static void re_int_task(void *arg, int npending)
                 }
         }
 
-        re_txeof(sc);
+        if (status & (RE_ISR_TX_OK|RE_ISR_TX_ERR|RE_ISR_TDU))
+                re_txeof(sc);
 
         if (status & RE_ISR_SYSTEM_ERR) {
                 re_reset(sc);
@@ -7300,9 +7302,11 @@ static void re_int_task_8125(void *arg, int npending)
                 return;
         }
 
-        re_rxeof(sc);
+        if (status & (RE_ISR_RX_OK|RE_ISR_RX_ERR|RE_ISR_FIFO_OFLOW))
+                re_rxeof(sc);
 
-        re_txeof(sc);
+        if (status & (RE_ISR_TX_OK|RE_ISR_TX_ERR|RE_ISR_TDU))
+                re_txeof(sc);
 
         if (status & RE_ISR_SYSTEM_ERR) {
                 re_reset(sc);
