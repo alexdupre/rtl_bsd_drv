@@ -985,6 +985,7 @@ struct re_softc {
 #endif //OS_VER < VERSION(7,0)
         void (*int_task)(void *, int);
         void (*hw_start_unlock)(struct re_softc *);
+        struct taskqueue *re_tq;
 };
 
 enum bits {
