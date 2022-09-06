@@ -381,9 +381,13 @@ static driver_t re_driver = {
         sizeof(struct re_softc)
 };
 
+#if __FreeBSD_version >= 1400058
+DRIVER_MODULE(if_re, pci, re_driver, 0, 0);
+#else
 static devclass_t re_devclass;
 
 DRIVER_MODULE(if_re, pci, re_driver, re_devclass, 0, 0);
+#endif
 
 static void
 ClearAndSetEthPhyBit(
