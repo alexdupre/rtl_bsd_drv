@@ -1,0 +1,11 @@
+.depend.if_re.o
+bus_if.h
+device_if.h
+export_syms
+if_re.ko
+if_re.o
+machine
+opt_bdg.h
+opt_global.h
+pci_if.h
+x86
