@@ -300,50 +300,62 @@ static int re_sysctl_pci_registers        (SYSCTL_HANDLER_ARGS);
 static int re_sysctl_msix_tbl             (SYSCTL_HANDLER_ARGS);
 
 /* Tunables. */
+SYSCTL_NODE(_hw, OID_AUTO, re, CTLFLAG_RW | CTLFLAG_MPSAFE, 0, "");
 static int msi_disable = 1;
-TUNABLE_INT("hw.re.msi_disable", &msi_disable);
+SYSCTL_INT(_hw_re, OID_AUTO, msi_disable, CTLFLAG_RDTUN, &msi_disable, 0,
+    "");
 static int msix_disable = 0;
-TUNABLE_INT("hw.re.msix_disable", &msix_disable);
+SYSCTL_INT(_hw_re, OID_AUTO, msix_disable, CTLFLAG_RDTUN, &msix_disable, 0,
+    "");
 static int prefer_iomap = 0;
-TUNABLE_INT("hw.re.prefer_iomap", &prefer_iomap);
+SYSCTL_INT(_hw_re, OID_AUTO, prefer_iomap, CTLFLAG_RDTUN, &prefer_iomap, 0,
+    "");
 static int re_lro_entry_count = 128;
-TUNABLE_INT("hw.re.lro_entry_count", &re_lro_entry_count);
+SYSCTL_INT(_hw_re, OID_AUTO, lro_entry_count, CTLFLAG_RDTUN,
+    &re_lro_entry_count, 0, "");
 static int re_lro_mbufq_depth = RE_RX_BUF_NUM;
-TUNABLE_INT("hw.re.lro_mbufq_depth", &re_lro_mbufq_depth);
+SYSCTL_INT(_hw_re, OID_AUTO, lro_mbufq_depth, CTLFLAG_RDTUN,
+    &re_lro_mbufq_depth, 0, "");
 #ifdef ENABLE_EEE
 static int eee_enable = 1;
 #else
 static int eee_enable = 0;
 #endif
-TUNABLE_INT("hw.re.eee_enable", &eee_enable);
+SYSCTL_INT(_hw_re, OID_AUTO, eee_enable, CTLFLAG_RDTUN, &eee_enable, 0,
+    "");
 static int phy_power_saving = 1;
-TUNABLE_INT("hw.re.phy_power_saving", &phy_power_saving);
+SYSCTL_INT(_hw_re, OID_AUTO, phy_power_saving, CTLFLAG_RDTUN,
+    &phy_power_saving, 0, "");
 static int phy_mdix_mode = RE_ETH_PHY_AUTO_MDI_MDIX;
-TUNABLE_INT("hw.re.phy_mdix_mode", &phy_mdix_mode);
+SYSCTL_INT(_hw_re, OID_AUTO, phy_mdix_mode, CTLFLAG_RDTUN, &phy_mdix_mode,
+    0, "");
 #ifdef ENABLE_S5WOL
 static int s5wol = 1;
 #else
 static int s5wol = 0;
-TUNABLE_INT("hw.re.s5wol", &s5wol);
+SYSCTL_INT(_hw_re, OID_AUTO, s5wol, CTLFLAG_RDTUN, &s5wol, 0, "");
 #endif
 #ifdef ENABLE_S0_MAGIC_PACKET
 static int s0_magic_packet = 1;
 #else
 static int s0_magic_packet = 0;
 #endif
-TUNABLE_INT("hw.re.s0_magic_packet", &s0_magic_packet);
+SYSCTL_INT(_hw_re, OID_AUTO, s0_magic_packet, CTLFLAG_RDTUN,
+    &s0_magic_packet, 0, "");
 #ifdef CONFIG_SOC_LAN
 static int config_soc_lan = 1;
 #else
 static int config_soc_lan = 0;
 #endif
-TUNABLE_INT("hw.re.config_soc_lan", &config_soc_lan);
+SYSCTL_INT(_hw_re, OID_AUTO, config_soc_lan, CTLFLAG_RDTUN,
+    &config_soc_lan, 0, "");
 #ifdef ENABLE_INTERRUPT_MITIGATIN
 static int interrupt_mitigation = 1;
 #else
 static int interrupt_mitigation = 0;
 #endif
-TUNABLE_INT("hw.re.interrupt_mitigation", &interrupt_mitigation);
+SYSCTL_INT(_hw_re, OID_AUTO, interrupt_mitigation, CTLFLAG_RDTUN,
+    &interrupt_mitigation, 0, "");
 
 #define RE_CSUM_FEATURES_IPV4    (CSUM_IP | CSUM_TCP | CSUM_UDP)
 #define RE_CSUM_FEATURES_IPV6    (CSUM_TCP_IPV6 | CSUM_UDP_IPV6)
