@@ -3905,7 +3905,7 @@ static int re_attach(device_t dev)
                 goto fail_intr;
         }
         error = taskqueue_start_threads(&sc->re_tq, 1, PI_NET, "%s taskq",
-                                        device_get_nameunit(sc->dev));
+                                        device_get_nameunit(dev));
         if (error) goto fail_intr;
 #endif
 #if OS_VER < VERSION(7,0)
