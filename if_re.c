@@ -3876,7 +3876,11 @@ static int re_attach(device_t dev)
         }
 
 #if OS_VER>=VERSION(7,0)
+#if OS_VER>=VERSION(13,0)
         NET_TASK_INIT(&sc->re_inttask, 0, sc->int_task, sc);
+#else
+        TASK_INIT(&sc->re_inttask, 0, sc->int_task, sc);
+#endif
 #endif
 
         /*
