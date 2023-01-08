@@ -3,7 +3,7 @@
 =  8168FB/8168G/818GU/8168H/8168EP/8411/8168FP                                  =
 =  8101E/8102E/8103E/8401/8105E/8106E/8402                                      =
 =  8125 Driver                                                                  =
-=  for FreeBSD v4.x/5.x/6.x/7.x/8.x/9.x/10.x/11.x//12.x/13.x                    =
+=  for FreeBSD v4.x/5.x/6.x/7.x/8.x/9.x/10.x/11.x/12.x/13.x                     =
 =================================================================================
 
 This driver is modified by Realtek Semiconductor corp. and it has been tested OK
@@ -34,13 +34,13 @@ Method 2:
 			# cd /usr/src/sys/modules/re
 			# cp Makefile Makefile.org
 
-			# cd /usr/src/sys/i386/conf/
+			# cd /usr/src/sys/<ARCH>/conf/
 			# cp GENERIC GENERIC.org
 
 		2. recompile your kernel (you must install your FreeBSD source code first !!)
-			# vim /usr/src/sys/i386/conf/GENERIC and delete re
-			# vim /usr/src/sys/modules/Makefile and delete re
-			# cd /usr/src/sys/i386/conf
+			# vi /usr/src/sys/<ARCH>/conf/GENERIC and delete re
+			# vi /usr/src/sys/modules/Makefile and delete re
+			# cd /usr/src/sys/<ARCH>/conf
 			# /usr/sbin/config GENERIC
 
 			(for FreeBSD 5.x/6.x/7.x/8.x/9.x)

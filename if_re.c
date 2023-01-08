@@ -47,7 +47,7 @@
 #else
 #define FIBER_SUFFIX ""
 #endif
-#define RE_VERSION "1.97.00" FIBER_SUFFIX
+#define RE_VERSION "1.98.00" FIBER_SUFFIX
 
 __FBSDID("$FreeBSD: src/sys/dev/re/if_re.c,v " RE_VERSION __DATE__ " " __TIME__ "  wpaul Exp $");
 
@@ -889,9 +889,7 @@ static int re_eri_write(struct re_softc *sc, int addr, int len, u_int32_t value,
 
 static void re_release_rx_buf(struct re_softc *sc)
 {
-        struct ifnet		*ifp;
         int i;
-        ifp = RE_GET_IFNET(sc);
 
         if (sc->re_desc.re_rx_mtag) {
                 for (i = 0; i < RE_RX_BUF_NUM; i++) {
@@ -914,9 +912,7 @@ static void re_release_rx_buf(struct re_softc *sc)
 }
 static void re_release_tx_buf(struct re_softc *sc)
 {
-        struct ifnet		*ifp;
         int i;
-        ifp = RE_GET_IFNET(sc);
 
         if (sc->re_desc.re_tx_mtag) {
                 for (i = 0; i < RE_TX_BUF_NUM; i++) {
@@ -1397,7 +1393,7 @@ static bool re_check_dash_other_fun_present(struct re_softc *sc)
 static void re_set_mac_mcu_8168ep_2(struct re_softc *sc)
 {
         static const uint16_t mcu_patch_code_8168ep_2[] = {
-                0xE008, 0xE017, 0xE052, 0xE057, 0xE059, 0xE05B, 0xE05D, 0xE05F, 0xC50F,
+                0xE008, 0xE017, 0xE052, 0xE056, 0xE058, 0xE05A, 0xE05C, 0xE05E, 0xC50F,
                 0x76A4, 0x49E3, 0xF007, 0x49C0, 0xF103, 0xC607, 0xBE00, 0xC606, 0xBE00,
                 0xC602, 0xBE00, 0x0BDA, 0x0BB6, 0x0BBA, 0xDC00, 0xB400, 0xB401, 0xB402,
                 0xB403, 0xB404, 0xC02E, 0x7206, 0x49AE, 0xF1FE, 0xC12B, 0x9904, 0xC12A,
@@ -1406,9 +1402,9 @@ static void re_set_mac_mcu_8168ep_2(struct re_softc *sc)
                 0x740E, 0x49CE, 0xF1FE, 0x9908, 0x990A, 0x9A0C, 0x9B0E, 0x740E, 0x49CE,
                 0xF1FE, 0xFF80, 0xB004, 0xB003, 0xB002, 0xB001, 0xB000, 0xC604, 0xC002,
                 0xB800, 0x1FC8, 0xE000, 0xE8E0, 0xF128, 0x0002, 0xFFFF, 0xF000, 0x8001,
-                0x8002, 0x8003, 0x8004, 0x48C1, 0x48C2, 0x9C46, 0xC402, 0xBC00, 0x0490,
-                0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000,
-                0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000
+                0x8002, 0x8003, 0x8004, 0x48C1, 0x48C2, 0xC502, 0xBD00, 0x0490, 0xC602,
+                0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602,
+                0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000
         };
 
         DisableMcuBPs(sc);
@@ -1563,7 +1559,7 @@ static void re_set_mac_mcu_8168fp_1(struct re_softc *sc)
                 MP_WriteMcuAccessRegWord(sc, 0xFC34, 0x0A68);
                 MP_WriteMcuAccessRegWord(sc, 0xFC36, 0x0A84);
 
-        } else if (sc->HwPkgDet == 0x6) {
+        } else if (sc->HwPkgDet == 0x05 || sc->HwPkgDet == 0x06) {
                 static const uint16_t mcu_patch_code_8168fp_1_2[] = {
                         0xE008, 0xE00A, 0xE031, 0xE033, 0xE035, 0xE144, 0xE166, 0xE168, 0xC502,
                         0xBD00, 0x0000, 0xC725, 0x75E0, 0x48D0, 0x9DE0, 0xC722, 0x75E0, 0x1C78,
@@ -1627,7 +1623,7 @@ static void re_set_mac_mcu_8168fp_1(struct re_softc *sc)
                 breakPointEnabled = 0x00FC;
         else if (sc->HwPkgDet == 0x0F)
                 breakPointEnabled = 0x00FF;
-        else if (sc->HwPkgDet == 0x06)
+        else if (sc->HwPkgDet == 0x05 || sc->HwPkgDet == 0x06)
                 breakPointEnabled = 0x0022;
 
         MP_WriteMcuAccessRegWord(sc, 0xFC38, breakPointEnabled);
@@ -2339,10 +2335,14 @@ static void re_hw_init(struct re_softc *sc)
                 break;
         }
 
+        re_enable_cfg9346_write(sc);
+
         if (s0_magic_packet == 0)
                 re_disable_magic_packet(sc);
         else
                 re_enable_magic_packet(sc);
+
+        re_disable_cfg9346_write(sc);
 
         switch(sc->re_type) {
         case MACFG_5:
@@ -3504,13 +3504,11 @@ static int re_attach(device_t dev)
         command = pci_read_config(dev, PCIR_COMMAND, 4);
 
         if (prefer_iomap == 0) {
-                sc->re_res_id = PCIR_BAR(1);
+                sc->re_res_id = PCIR_BAR(2);
                 sc->re_res_type = SYS_RES_MEMORY;
-                /* PCIE NIC use different BARs. */
-                if (sc->re_device_id == RT_DEVICEID_8168 || sc->re_device_id == RT_DEVICEID_8161 ||
-                    sc->re_device_id == RT_DEVICEID_8161 || sc->re_device_id == RT_DEVICEID_8136 ||
-                    sc->re_device_id == RT_DEVICEID_8125)
-                        sc->re_res_id = PCIR_BAR(2);
+                /* PCI NIC use different BARs. */
+                if (sc->re_device_id == RT_DEVICEID_8169 || sc->re_device_id == RT_DEVICEID_8169SC)
+                        sc->re_res_id = PCIR_BAR(1);
         } else {
                 sc->re_res_id = PCIR_BAR(0);
                 sc->re_res_type = SYS_RES_IOPORT;
@@ -3848,18 +3846,24 @@ static int re_attach(device_t dev)
         ifp->if_snd.ifq_drv_maxlen = IFQ_MAXLEN;
         IFQ_SET_READY(&ifp->if_snd);
 
-        if (sc->re_device_id == RT_DEVICEID_8125) {
+        switch (sc->re_type) {
+        case MACFG_80:
+        case MACFG_81:
+        case MACFG_82:
+        case MACFG_83:
                 sc->ifmedia_upd = re_ifmedia_upd_8125;
                 sc->ifmedia_sts = re_ifmedia_sts_8125;
                 sc->intr = re_intr_8125;
                 sc->int_task = re_int_task_8125;
                 sc->hw_start_unlock = re_hw_start_unlock_8125;
-        } else {
+                break;
+        default:
                 sc->ifmedia_upd = re_ifmedia_upd;
                 sc->ifmedia_sts = re_ifmedia_sts;
                 sc->intr = re_intr;
                 sc->int_task = re_int_task;
                 sc->hw_start_unlock = re_hw_start_unlock;
+                break;
         }
 
 #if OS_VER>=VERSION(7,0)
@@ -6361,15 +6365,6 @@ re_setwol(struct re_softc *sc)
         /* Enable config register write. */
         re_enable_cfg9346_write(sc);
 
-        /* Enable PME. */
-        if (sc->re_device_id==RT_DEVICEID_8169 || sc->re_device_id==RT_DEVICEID_8169SC) {
-                v = CSR_READ_1(sc, RE_CFG1);
-                v &= ~RE_CFG1_PME;
-                if ((ifp->if_capenable & IFCAP_WOL) != 0)
-                        v |= RE_CFG1_PME;
-                CSR_WRITE_1(sc, RE_CFG1, v);
-        }
-
         if (ifp->if_capenable & IFCAP_WOL_MAGIC)
                 re_enable_magic_packet(sc);
         else
@@ -6398,9 +6393,9 @@ re_setwol(struct re_softc *sc)
 
         /* Request PME if WOL is requested. */
         pmstat = pci_read_config(sc->dev, pmc + PCIR_POWER_STATUS, 2);
-        pmstat &= ~(PCIM_PSTAT_PMEENABLE);
+        pmstat &= ~(PCIM_PSTAT_PME | PCIM_PSTAT_PMEENABLE);
         if ((ifp->if_capenable & IFCAP_WOL) != 0)
-                pmstat |= PCIM_PSTAT_PMEENABLE;
+                pmstat |= PCIM_PSTAT_PME | PCIM_PSTAT_PMEENABLE;
         pci_write_config(sc->dev, pmc + PCIR_POWER_STATUS, pmstat, 2);
 
         /* Put controller into sleep mode. */
@@ -6431,12 +6426,6 @@ re_clrwol(struct re_softc *sc)
 
         /* Enable config register write. */
         re_enable_cfg9346_write(sc);
-
-        if (sc->re_device_id==RT_DEVICEID_8169 || sc->re_device_id==RT_DEVICEID_8169SC) {
-                v = CSR_READ_1(sc, RE_CFG1);
-                v &= ~RE_CFG1_PME;
-                CSR_WRITE_1(sc, RE_CFG1, v);
-        }
 
         v = CSR_READ_1(sc, RE_CFG3);
         v &= ~(RL_CFG3_WOL_LINK);
@@ -6480,19 +6469,31 @@ static void re_stop(struct re_softc *sc)  	/* Stop Driver */
                     ~(RE_RXCFG_RX_ALLPHYS | RE_RXCFG_RX_INDIV | RE_RXCFG_RX_MULTI |
                       RE_RXCFG_RX_BROAD | RE_RXCFG_RX_RUNT | RE_RXCFG_RX_ERRPKT));
 
-        if (sc->re_device_id==RT_DEVICEID_8125) {
+        switch (sc->re_type) {
+        case MACFG_80:
+        case MACFG_81:
+        case MACFG_82:
+        case MACFG_83:
                 CSR_WRITE_4(sc, RE_IMR0_8125, 0x00000000);
                 CSR_WRITE_4(sc, RE_ISR0_8125, 0xffffffff);
-        } else {
+                break;
+        default:
                 CSR_WRITE_2(sc, RE_IMR, 0x0000);
                 CSR_WRITE_2(sc, RE_ISR, 0xffff);
+                break;
         }
-        if (sc->re_type == MACFG_50 || sc->re_type == MACFG_51 || sc->re_type == MACFG_52) {
+
+        switch (sc->re_type) {
+        case MACFG_50:
+        case MACFG_51:
+        case MACFG_52:
                 re_eri_write(sc, 0x1bc, 4, 0x0000001f, ERIAR_ExGMAC);
                 re_eri_write(sc, 0x1dc, 4, 0x0000002d, ERIAR_ExGMAC);
-        } else if (sc->re_type == MACFG_38) {
+                break;
+        case MACFG_38:
                 re_eri_write(sc, 0x1bc, 4, 0x0000001f, ERIAR_ExGMAC);
                 re_eri_write(sc, 0x1dc, 4, 0x0000003f, ERIAR_ExGMAC);
+                break;
         }
 
         switch (sc->re_type) {
@@ -6559,7 +6560,8 @@ static void re_start(struct ifnet *ifp)  	/* Transmit Packet*/
                         break;
                 }
 
-                if (sc->re_device_id == RT_DEVICEID_8125) {
+                if (sc->re_type == MACFG_80 || sc->re_type == MACFG_81 ||
+                    sc->re_type == MACFG_82 || sc->re_type == MACFG_83) {
                         if (re_8125_pad(sc, m_head) != 0) {
                                 IFQ_DRV_PREPEND(&ifp->if_snd, m_head);
                                 ifp->if_drv_flags |= IFF_DRV_OACTIVE;
@@ -6765,12 +6767,18 @@ static void WritePacket(struct re_softc	*sc, caddr_t addr, int len,int fs_flag,i
                         BUS_DMASYNC_PREREAD|BUS_DMASYNC_PREWRITE);
 
         if (ls_flag) {
-                if (sc->re_device_id==RT_DEVICEID_8125) {
+                switch (sc->re_type) {
+                case MACFG_80:
+                case MACFG_81:
+                case MACFG_82:
+                case MACFG_83:
                         CSR_WRITE_2(sc, RE_TPPOLL_8125, RE_NPQ_8125);
                         CSR_WRITE_2(sc, RE_TPPOLL_8125, RE_NPQ_8125);
-                } else {
+                        break;
+                default:
                         CSR_WRITE_1(sc, RE_TPPOLL, RE_NPQ);
                         CSR_WRITE_1(sc, RE_TPPOLL, RE_NPQ);
+                        break;
                 }
         }
 
@@ -6912,7 +6920,6 @@ static void re_txeof(struct re_softc *sc)  	/* Transmit OK/ERR handler */
 static void re_rxeof(sc)	/* Receive Data OK/ERR handler */
 struct re_softc		*sc;
 {
-        struct ether_header	*eh;
         struct mbuf		*m;
         struct ifnet		*ifp;
         union RxDesc *rxptr;
@@ -7029,7 +7036,6 @@ struct re_softc		*sc;
                         }
                 }
 
-                eh = mtod(m, struct ether_header *);
 #if OS_VER < VERSION(11,0)
                 ifp->if_ipackets++;
 #else
@@ -7319,10 +7325,7 @@ u_int32_t		mask4;
 static void re_set_rx_packet_filter_in_sleep_state(sc)
 struct re_softc		*sc;
 {
-        struct ifnet		*ifp;
         u_int32_t		rxfilt;
-
-        ifp = RE_GET_IFNET(sc);
 
         rxfilt = CSR_READ_4(sc, RE_RXCFG);
 
@@ -7521,8 +7524,6 @@ caddr_t			data;
                 error = ifmedia_ioctl(ifp, ifr, &sc->media, command);
                 break;
         case SIOCSIFCAP:
-
-
                 mask = ifr->ifr_reqcap ^ ifp->if_capenable;
                 reinit = 0;
 
@@ -20277,6 +20278,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x13, 0xB82E);
         MP_WritePhyUshort(sc, 0x14, 0x0001);
 
+
         MP_WritePhyUshort(sc, 0x1F, 0x0A43);
         MP_WritePhyUshort(sc, 0x13, 0xB820);
         MP_WritePhyUshort(sc, 0x14, 0x0090);
@@ -20298,19 +20300,20 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x13, 0xB820);
         MP_WritePhyUshort(sc, 0x14, 0x0010);
 
+
         MP_WritePhyUshort(sc, 0x13, 0x83f3);
         MP_WritePhyUshort(sc, 0x14, 0xaf84);
         MP_WritePhyUshort(sc, 0x14, 0x0baf);
         MP_WritePhyUshort(sc, 0x14, 0x8466);
         MP_WritePhyUshort(sc, 0x14, 0xaf84);
         MP_WritePhyUshort(sc, 0x14, 0xcdaf);
-        MP_WritePhyUshort(sc, 0x14, 0x8736);
+        MP_WritePhyUshort(sc, 0x14, 0x873c);
         MP_WritePhyUshort(sc, 0x14, 0xaf87);
-        MP_WritePhyUshort(sc, 0x14, 0x39af);
-        MP_WritePhyUshort(sc, 0x14, 0x8739);
+        MP_WritePhyUshort(sc, 0x14, 0x3faf);
+        MP_WritePhyUshort(sc, 0x14, 0x8760);
         MP_WritePhyUshort(sc, 0x14, 0xaf87);
-        MP_WritePhyUshort(sc, 0x14, 0x39af);
-        MP_WritePhyUshort(sc, 0x14, 0x8739);
+        MP_WritePhyUshort(sc, 0x14, 0x60af);
+        MP_WritePhyUshort(sc, 0x14, 0x8760);
         MP_WritePhyUshort(sc, 0x14, 0xef79);
         MP_WritePhyUshort(sc, 0x14, 0xfb89);
         MP_WritePhyUshort(sc, 0x14, 0xe987);
@@ -20357,7 +20360,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0x3719);
         MP_WritePhyUshort(sc, 0x14, 0x19ae);
         MP_WritePhyUshort(sc, 0x14, 0xcfbf);
-        MP_WritePhyUshort(sc, 0x14, 0x8763);
+        MP_WritePhyUshort(sc, 0x14, 0x878a);
         MP_WritePhyUshort(sc, 0x14, 0x0244);
         MP_WritePhyUshort(sc, 0x14, 0xdc3c);
         MP_WritePhyUshort(sc, 0x14, 0x0005);
@@ -20379,28 +20382,28 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0x5fd4);
         MP_WritePhyUshort(sc, 0x14, 0x0003);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x7502);
+        MP_WritePhyUshort(sc, 0x14, 0x9c02);
         MP_WritePhyUshort(sc, 0x14, 0x4498);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x7202);
+        MP_WritePhyUshort(sc, 0x14, 0x9902);
         MP_WritePhyUshort(sc, 0x14, 0x4a5f);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x6602);
+        MP_WritePhyUshort(sc, 0x14, 0x8d02);
         MP_WritePhyUshort(sc, 0x14, 0x4a5f);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x6902);
+        MP_WritePhyUshort(sc, 0x14, 0x9002);
         MP_WritePhyUshort(sc, 0x14, 0x44dc);
         MP_WritePhyUshort(sc, 0x14, 0xad28);
         MP_WritePhyUshort(sc, 0x14, 0xf7bf);
-        MP_WritePhyUshort(sc, 0x14, 0x876f);
+        MP_WritePhyUshort(sc, 0x14, 0x8796);
         MP_WritePhyUshort(sc, 0x14, 0x0244);
         MP_WritePhyUshort(sc, 0x14, 0xdcad);
         MP_WritePhyUshort(sc, 0x14, 0x28f7);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x6c02);
+        MP_WritePhyUshort(sc, 0x14, 0x9302);
         MP_WritePhyUshort(sc, 0x14, 0x4a5f);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x6c02);
+        MP_WritePhyUshort(sc, 0x14, 0x9302);
         MP_WritePhyUshort(sc, 0x14, 0x4a56);
         MP_WritePhyUshort(sc, 0x14, 0xbf46);
         MP_WritePhyUshort(sc, 0x14, 0x5c02);
@@ -20425,12 +20428,12 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0x3c00);
         MP_WritePhyUshort(sc, 0x14, 0x03aa);
         MP_WritePhyUshort(sc, 0x14, 0x2cbf);
-        MP_WritePhyUshort(sc, 0x14, 0x8769);
+        MP_WritePhyUshort(sc, 0x14, 0x8790);
         MP_WritePhyUshort(sc, 0x14, 0x0244);
         MP_WritePhyUshort(sc, 0x14, 0xdcad);
         MP_WritePhyUshort(sc, 0x14, 0x2823);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x6f02);
+        MP_WritePhyUshort(sc, 0x14, 0x9602);
         MP_WritePhyUshort(sc, 0x14, 0x44dc);
         MP_WritePhyUshort(sc, 0x14, 0xad28);
         MP_WritePhyUshort(sc, 0x14, 0x1a02);
@@ -20441,10 +20444,10 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0x49e5);
         MP_WritePhyUshort(sc, 0x14, 0xad50);
         MP_WritePhyUshort(sc, 0x14, 0xf7bf);
-        MP_WritePhyUshort(sc, 0x14, 0x876c);
+        MP_WritePhyUshort(sc, 0x14, 0x8793);
         MP_WritePhyUshort(sc, 0x14, 0x024a);
         MP_WritePhyUshort(sc, 0x14, 0x5fbf);
-        MP_WritePhyUshort(sc, 0x14, 0x876c);
+        MP_WritePhyUshort(sc, 0x14, 0x8793);
         MP_WritePhyUshort(sc, 0x14, 0x024a);
         MP_WritePhyUshort(sc, 0x14, 0x56ef);
         MP_WritePhyUshort(sc, 0x14, 0x95ff);
@@ -20456,7 +20459,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0x15ad);
         MP_WritePhyUshort(sc, 0x14, 0x2406);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x6002);
+        MP_WritePhyUshort(sc, 0x14, 0x8702);
         MP_WritePhyUshort(sc, 0x14, 0x4a56);
         MP_WritePhyUshort(sc, 0x14, 0xef96);
         MP_WritePhyUshort(sc, 0x14, 0xfefc);
@@ -20475,11 +20478,11 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0xf700);
         MP_WritePhyUshort(sc, 0x14, 0xae12);
         MP_WritePhyUshort(sc, 0x14, 0x0286);
-        MP_WritePhyUshort(sc, 0x14, 0x9702);
+        MP_WritePhyUshort(sc, 0x14, 0x9d02);
         MP_WritePhyUshort(sc, 0x14, 0x8565);
         MP_WritePhyUshort(sc, 0x14, 0x0285);
         MP_WritePhyUshort(sc, 0x14, 0x9d02);
-        MP_WritePhyUshort(sc, 0x14, 0x865a);
+        MP_WritePhyUshort(sc, 0x14, 0x8660);
         MP_WritePhyUshort(sc, 0x14, 0xae04);
         MP_WritePhyUshort(sc, 0x14, 0x10e4);
         MP_WritePhyUshort(sc, 0x14, 0x87f9);
@@ -20496,17 +20499,17 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0xe187);
         MP_WritePhyUshort(sc, 0x14, 0xecef);
         MP_WritePhyUshort(sc, 0x14, 0x64bf);
-        MP_WritePhyUshort(sc, 0x14, 0x8748);
+        MP_WritePhyUshort(sc, 0x14, 0x876f);
         MP_WritePhyUshort(sc, 0x14, 0x0244);
         MP_WritePhyUshort(sc, 0x14, 0xdc1b);
         MP_WritePhyUshort(sc, 0x14, 0x46aa);
         MP_WritePhyUshort(sc, 0x14, 0x0abf);
-        MP_WritePhyUshort(sc, 0x14, 0x874b);
+        MP_WritePhyUshort(sc, 0x14, 0x8772);
         MP_WritePhyUshort(sc, 0x14, 0x0244);
         MP_WritePhyUshort(sc, 0x14, 0xdc1b);
         MP_WritePhyUshort(sc, 0x14, 0x46ab);
         MP_WritePhyUshort(sc, 0x14, 0x06bf);
-        MP_WritePhyUshort(sc, 0x14, 0x8745);
+        MP_WritePhyUshort(sc, 0x14, 0x876c);
         MP_WritePhyUshort(sc, 0x14, 0x024a);
         MP_WritePhyUshort(sc, 0x14, 0x5ffe);
         MP_WritePhyUshort(sc, 0x14, 0xef96);
@@ -20525,7 +20528,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0x0285);
         MP_WritePhyUshort(sc, 0x14, 0xc9ae);
         MP_WritePhyUshort(sc, 0x14, 0x0d02);
-        MP_WritePhyUshort(sc, 0x14, 0x860d);
+        MP_WritePhyUshort(sc, 0x14, 0x8613);
         MP_WritePhyUshort(sc, 0x14, 0xae08);
         MP_WritePhyUshort(sc, 0x14, 0xe287);
         MP_WritePhyUshort(sc, 0x14, 0xf7f6);
@@ -20538,7 +20541,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0xfafb);
         MP_WritePhyUshort(sc, 0x14, 0xef79);
         MP_WritePhyUshort(sc, 0x14, 0xfbbf);
-        MP_WritePhyUshort(sc, 0x14, 0x8748);
+        MP_WritePhyUshort(sc, 0x14, 0x876f);
         MP_WritePhyUshort(sc, 0x14, 0x0244);
         MP_WritePhyUshort(sc, 0x14, 0xdcef);
         MP_WritePhyUshort(sc, 0x14, 0x64e2);
@@ -20554,11 +20557,14 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0xf636);
         MP_WritePhyUshort(sc, 0x14, 0xe687);
         MP_WritePhyUshort(sc, 0x14, 0xf7ae);
-        MP_WritePhyUshort(sc, 0x14, 0x13e2);
+        MP_WritePhyUshort(sc, 0x14, 0x19e2);
         MP_WritePhyUshort(sc, 0x14, 0x87f7);
         MP_WritePhyUshort(sc, 0x14, 0xf736);
         MP_WritePhyUshort(sc, 0x14, 0xe687);
-        MP_WritePhyUshort(sc, 0x14, 0xf702);
+        MP_WritePhyUshort(sc, 0x14, 0xf700);
+        MP_WritePhyUshort(sc, 0x14, 0x00ae);
+        MP_WritePhyUshort(sc, 0x14, 0x0200);
+        MP_WritePhyUshort(sc, 0x14, 0x0002);
         MP_WritePhyUshort(sc, 0x14, 0x49ca);
         MP_WritePhyUshort(sc, 0x14, 0xef57);
         MP_WritePhyUshort(sc, 0x14, 0xe687);
@@ -20583,7 +20589,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0x49e5);
         MP_WritePhyUshort(sc, 0x14, 0xac50);
         MP_WritePhyUshort(sc, 0x14, 0x1abf);
-        MP_WritePhyUshort(sc, 0x14, 0x8748);
+        MP_WritePhyUshort(sc, 0x14, 0x876f);
         MP_WritePhyUshort(sc, 0x14, 0x0244);
         MP_WritePhyUshort(sc, 0x14, 0xdcef);
         MP_WritePhyUshort(sc, 0x14, 0x64e2);
@@ -20596,7 +20602,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0xe587);
         MP_WritePhyUshort(sc, 0x14, 0xeaae);
         MP_WritePhyUshort(sc, 0x14, 0x06bf);
-        MP_WritePhyUshort(sc, 0x14, 0x8745);
+        MP_WritePhyUshort(sc, 0x14, 0x876c);
         MP_WritePhyUshort(sc, 0x14, 0x024a);
         MP_WritePhyUshort(sc, 0x14, 0x5fe2);
         MP_WritePhyUshort(sc, 0x14, 0x87f7);
@@ -20610,15 +20616,15 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0xf9fa);
         MP_WritePhyUshort(sc, 0x14, 0xef69);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x3f02);
+        MP_WritePhyUshort(sc, 0x14, 0x6602);
         MP_WritePhyUshort(sc, 0x14, 0x44dc);
         MP_WritePhyUshort(sc, 0x14, 0xad28);
         MP_WritePhyUshort(sc, 0x14, 0x29bf);
-        MP_WritePhyUshort(sc, 0x14, 0x873c);
+        MP_WritePhyUshort(sc, 0x14, 0x8763);
         MP_WritePhyUshort(sc, 0x14, 0x0244);
         MP_WritePhyUshort(sc, 0x14, 0xdcef);
         MP_WritePhyUshort(sc, 0x14, 0x54bf);
-        MP_WritePhyUshort(sc, 0x14, 0x8739);
+        MP_WritePhyUshort(sc, 0x14, 0x8760);
         MP_WritePhyUshort(sc, 0x14, 0x0244);
         MP_WritePhyUshort(sc, 0x14, 0xdcac);
         MP_WritePhyUshort(sc, 0x14, 0x290d);
@@ -20632,7 +20638,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0x0402);
         MP_WritePhyUshort(sc, 0x14, 0xae06);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x4502);
+        MP_WritePhyUshort(sc, 0x14, 0x6c02);
         MP_WritePhyUshort(sc, 0x14, 0x4a5f);
         MP_WritePhyUshort(sc, 0x14, 0xef96);
         MP_WritePhyUshort(sc, 0x14, 0xfefd);
@@ -20645,7 +20651,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0xad25);
         MP_WritePhyUshort(sc, 0x14, 0x41d2);
         MP_WritePhyUshort(sc, 0x14, 0x0002);
-        MP_WritePhyUshort(sc, 0x14, 0x86ed);
+        MP_WritePhyUshort(sc, 0x14, 0x86f3);
         MP_WritePhyUshort(sc, 0x14, 0xe087);
         MP_WritePhyUshort(sc, 0x14, 0xebe1);
         MP_WritePhyUshort(sc, 0x14, 0x87ec);
@@ -20674,7 +20680,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0x08c9);
         MP_WritePhyUshort(sc, 0x14, 0xae06);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x4202);
+        MP_WritePhyUshort(sc, 0x14, 0x6902);
         MP_WritePhyUshort(sc, 0x14, 0x4a5f);
         MP_WritePhyUshort(sc, 0x14, 0xfeef);
         MP_WritePhyUshort(sc, 0x14, 0x96ff);
@@ -20684,72 +20690,88 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0xef79);
         MP_WritePhyUshort(sc, 0x14, 0xa200);
         MP_WritePhyUshort(sc, 0x14, 0x05bf);
-        MP_WritePhyUshort(sc, 0x14, 0x8748);
+        MP_WritePhyUshort(sc, 0x14, 0x876f);
         MP_WritePhyUshort(sc, 0x14, 0xae33);
         MP_WritePhyUshort(sc, 0x14, 0xa201);
         MP_WritePhyUshort(sc, 0x14, 0x05bf);
-        MP_WritePhyUshort(sc, 0x14, 0x874b);
+        MP_WritePhyUshort(sc, 0x14, 0x8772);
         MP_WritePhyUshort(sc, 0x14, 0xae2b);
         MP_WritePhyUshort(sc, 0x14, 0xa202);
         MP_WritePhyUshort(sc, 0x14, 0x05bf);
-        MP_WritePhyUshort(sc, 0x14, 0x874e);
+        MP_WritePhyUshort(sc, 0x14, 0x8775);
         MP_WritePhyUshort(sc, 0x14, 0xae23);
         MP_WritePhyUshort(sc, 0x14, 0xa203);
         MP_WritePhyUshort(sc, 0x14, 0x05bf);
-        MP_WritePhyUshort(sc, 0x14, 0x8751);
+        MP_WritePhyUshort(sc, 0x14, 0x8778);
         MP_WritePhyUshort(sc, 0x14, 0xae1b);
         MP_WritePhyUshort(sc, 0x14, 0xa204);
         MP_WritePhyUshort(sc, 0x14, 0x05bf);
-        MP_WritePhyUshort(sc, 0x14, 0x8754);
+        MP_WritePhyUshort(sc, 0x14, 0x877b);
         MP_WritePhyUshort(sc, 0x14, 0xae13);
         MP_WritePhyUshort(sc, 0x14, 0xa205);
         MP_WritePhyUshort(sc, 0x14, 0x05bf);
-        MP_WritePhyUshort(sc, 0x14, 0x8757);
+        MP_WritePhyUshort(sc, 0x14, 0x877e);
         MP_WritePhyUshort(sc, 0x14, 0xae0b);
         MP_WritePhyUshort(sc, 0x14, 0xa206);
         MP_WritePhyUshort(sc, 0x14, 0x05bf);
-        MP_WritePhyUshort(sc, 0x14, 0x875a);
+        MP_WritePhyUshort(sc, 0x14, 0x8781);
         MP_WritePhyUshort(sc, 0x14, 0xae03);
         MP_WritePhyUshort(sc, 0x14, 0xbf87);
-        MP_WritePhyUshort(sc, 0x14, 0x5d02);
+        MP_WritePhyUshort(sc, 0x14, 0x8402);
         MP_WritePhyUshort(sc, 0x14, 0x44dc);
         MP_WritePhyUshort(sc, 0x14, 0xef64);
         MP_WritePhyUshort(sc, 0x14, 0xef97);
         MP_WritePhyUshort(sc, 0x14, 0xfffc);
         MP_WritePhyUshort(sc, 0x14, 0x04af);
         MP_WritePhyUshort(sc, 0x14, 0x00ed);
-        MP_WritePhyUshort(sc, 0x14, 0x54a4);
-        MP_WritePhyUshort(sc, 0x14, 0x3474);
-        MP_WritePhyUshort(sc, 0x14, 0xa600);
-        MP_WritePhyUshort(sc, 0x14, 0x22a4);
-        MP_WritePhyUshort(sc, 0x14, 0x3411);
+        MP_WritePhyUshort(sc, 0x14, 0x0220);
+        MP_WritePhyUshort(sc, 0x14, 0xa5f8);
+        MP_WritePhyUshort(sc, 0x14, 0xfaef);
+        MP_WritePhyUshort(sc, 0x14, 0x69bf);
+        MP_WritePhyUshort(sc, 0x14, 0x4554);
+        MP_WritePhyUshort(sc, 0x14, 0x0244);
+        MP_WritePhyUshort(sc, 0x14, 0xdce0);
+        MP_WritePhyUshort(sc, 0x14, 0x87ff);
+        MP_WritePhyUshort(sc, 0x14, 0x1f01);
+        MP_WritePhyUshort(sc, 0x14, 0x9e06);
+        MP_WritePhyUshort(sc, 0x14, 0xe587);
+        MP_WritePhyUshort(sc, 0x14, 0xff02);
+        MP_WritePhyUshort(sc, 0x14, 0x4b05);
+        MP_WritePhyUshort(sc, 0x14, 0xef96);
+        MP_WritePhyUshort(sc, 0x14, 0xfefc);
+        MP_WritePhyUshort(sc, 0x14, 0xaf03);
+        MP_WritePhyUshort(sc, 0x14, 0x8c54);
+        MP_WritePhyUshort(sc, 0x14, 0xa434);
+        MP_WritePhyUshort(sc, 0x14, 0x74a6);
+        MP_WritePhyUshort(sc, 0x14, 0x0022);
+        MP_WritePhyUshort(sc, 0x14, 0xa434);
+        MP_WritePhyUshort(sc, 0x14, 0x11b8);
+        MP_WritePhyUshort(sc, 0x14, 0x4222);
         MP_WritePhyUshort(sc, 0x14, 0xb842);
-        MP_WritePhyUshort(sc, 0x14, 0x22b8);
-        MP_WritePhyUshort(sc, 0x14, 0x42f0);
-        MP_WritePhyUshort(sc, 0x14, 0xa200);
         MP_WritePhyUshort(sc, 0x14, 0xf0a2);
-        MP_WritePhyUshort(sc, 0x14, 0x02f0);
-        MP_WritePhyUshort(sc, 0x14, 0xa204);
+        MP_WritePhyUshort(sc, 0x14, 0x00f0);
+        MP_WritePhyUshort(sc, 0x14, 0xa202);
         MP_WritePhyUshort(sc, 0x14, 0xf0a2);
-        MP_WritePhyUshort(sc, 0x14, 0x06f0);
-        MP_WritePhyUshort(sc, 0x14, 0xa208);
+        MP_WritePhyUshort(sc, 0x14, 0x04f0);
+        MP_WritePhyUshort(sc, 0x14, 0xa206);
         MP_WritePhyUshort(sc, 0x14, 0xf0a2);
-        MP_WritePhyUshort(sc, 0x14, 0x0af0);
-        MP_WritePhyUshort(sc, 0x14, 0xa20c);
+        MP_WritePhyUshort(sc, 0x14, 0x08f0);
+        MP_WritePhyUshort(sc, 0x14, 0xa20a);
         MP_WritePhyUshort(sc, 0x14, 0xf0a2);
-        MP_WritePhyUshort(sc, 0x14, 0x0e55);
-        MP_WritePhyUshort(sc, 0x14, 0xb820);
-        MP_WritePhyUshort(sc, 0x14, 0xd9c6);
-        MP_WritePhyUshort(sc, 0x14, 0x08aa);
-        MP_WritePhyUshort(sc, 0x14, 0xc430);
-        MP_WritePhyUshort(sc, 0x14, 0x00c6);
-        MP_WritePhyUshort(sc, 0x14, 0x1433);
-        MP_WritePhyUshort(sc, 0x14, 0xc41a);
-        MP_WritePhyUshort(sc, 0x14, 0x88c4);
-        MP_WritePhyUshort(sc, 0x14, 0x2e22);
+        MP_WritePhyUshort(sc, 0x14, 0x0cf0);
+        MP_WritePhyUshort(sc, 0x14, 0xa20e);
+        MP_WritePhyUshort(sc, 0x14, 0x55b8);
+        MP_WritePhyUshort(sc, 0x14, 0x20d9);
+        MP_WritePhyUshort(sc, 0x14, 0xc608);
+        MP_WritePhyUshort(sc, 0x14, 0xaac4);
+        MP_WritePhyUshort(sc, 0x14, 0x3000);
+        MP_WritePhyUshort(sc, 0x14, 0xc614);
+        MP_WritePhyUshort(sc, 0x14, 0x33c4);
+        MP_WritePhyUshort(sc, 0x14, 0x1a88);
         MP_WritePhyUshort(sc, 0x14, 0xc42e);
-        MP_WritePhyUshort(sc, 0x14, 0x54c4);
-        MP_WritePhyUshort(sc, 0x14, 0x1a00);
+        MP_WritePhyUshort(sc, 0x14, 0x22c4);
+        MP_WritePhyUshort(sc, 0x14, 0x2e54);
+        MP_WritePhyUshort(sc, 0x14, 0xc41a);
         MP_WritePhyUshort(sc, 0x13, 0xb818);
         MP_WritePhyUshort(sc, 0x14, 0x1a01);
         MP_WritePhyUshort(sc, 0x13, 0xb81a);
@@ -20759,7 +20781,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x13, 0xb81e);
         MP_WritePhyUshort(sc, 0x14, 0x00e7);
         MP_WritePhyUshort(sc, 0x13, 0xb846);
-        MP_WritePhyUshort(sc, 0x14, 0xffff);
+        MP_WritePhyUshort(sc, 0x14, 0x0389);
         MP_WritePhyUshort(sc, 0x13, 0xb848);
         MP_WritePhyUshort(sc, 0x14, 0xffff);
         MP_WritePhyUshort(sc, 0x13, 0xb84a);
@@ -20767,7 +20789,8 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x13, 0xb84c);
         MP_WritePhyUshort(sc, 0x14, 0xffff);
         MP_WritePhyUshort(sc, 0x13, 0xb832);
-        MP_WritePhyUshort(sc, 0x14, 0x000f);
+        MP_WritePhyUshort(sc, 0x14, 0x001f);
+
 
         MP_WritePhyUshort(sc, 0x1F, 0x0A43);
         MP_WritePhyUshort(sc, 0x13, 0x0000);
@@ -20781,6 +20804,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0x0000);
 
         re_clear_phy_mcu_patch_request(sc);
+
         if (sc->RequiredSecLanDonglePatch) {
                 MP_WritePhyUshort(sc, 0x1F, 0x0A43);
                 PhyRegValue = MP_ReadPhyUshort(sc, 0x11);
@@ -29401,15 +29425,6 @@ static void re_hw_phy_config(struct re_softc *sc)
                         u_int16_t rg_lpf_cap_p2;
                         u_int16_t rg_lpf_cap_p3;
 
-                        //	GPHY OCP 0xD068 bit[2:0] = 0x1 ([2:1]:subadc,[0]:offset)
-                        //	GPHY OCP 0xD068 bit[4:3] = 0x0 (p0)
-                        //	adccal_offset_p0 = GPHY OCP 0xD06A bit[10:0]
-                        //	GPHY OCP 0xD068 bit[4:3] = 0x1 (p1)
-                        //	adccal_offset_p1 = GPHY OCP 0xD06A bit[10:0]
-                        //	GPHY OCP 0xD068 bit[4:3] = 0x2 (p2)
-                        //	adccal_offset_p2 = GPHY OCP 0xD06A bit[10:0]
-                        //	GPHY OCP 0xD068 bit[4:3] = 0x3 (p3)
-                        //	adccal_offset_p3 = GPHY OCP 0xD06A bit[10:0]
                         ClearAndSetEthPhyOcpBit(sc,
                                                 0xD068,
                                                 0x0007,
@@ -29445,14 +29460,6 @@ static void re_hw_phy_config(struct re_softc *sc)
                         adccal_offset_p3 &= 0x07FF;
 
 
-                        //	GPHY OCP 0xD068 bit[4:3] = 0x0 (p0)
-                        //	GPHY OCP 0xD06A bit[10:0] = adccal_offset_p3
-                        //	GPHY OCP 0xD068 bit[4:3] = 0x1 (p1)
-                        //	GPHY OCP 0xD06A bit[10:0] = adccal_offset_p2
-                        //	GPHY OCP 0xD068 bit[4:3] = 0x2 (p2)
-                        //	GPHY OCP 0xD06A bit[10:0] = adccal_offset_p1
-                        //	GPHY OCP 0xD068 bit[4:3] = 0x3 (p3)
-                        //	GPHY OCP 0xD06A bit[10:0] = adccal_offset_p0
                         ClearAndSetEthPhyOcpBit(sc,
                                                 0xD068,
                                                 0x0018,
@@ -29493,14 +29500,7 @@ static void re_hw_phy_config(struct re_softc *sc)
                                                 0x07FF,
                                                 adccal_offset_p0
                                                );
-                        //	rg_lpf_cap_xg_p0 = GPHY OCP 0xBD5A bit[4:0]
-                        //	rg_lpf_cap_xg_p1 = GPHY OCP 0xBD5A bit[12:8]
-                        //	rg_lpf_cap_xg_p2 = GPHY OCP 0xBD5C bit[4:0]
-                        //	rg_lpf_cap_xg_p3 = GPHY OCP 0xBD5C bit[12:8]
-                        //	rg_lpf_cap_p0 = GPHY OCP 0xBC18 bit[4:0]
-                        //	rg_lpf_cap_p1 = GPHY OCP 0xBC18 bit[12:8]
-                        //	rg_lpf_cap_p2 = GPHY OCP 0xBC1A bit[4:0]
-                        //	rg_lpf_cap_p3 = GPHY OCP 0xBC1A bit[12:8]
+
                         rg_lpf_cap_xg_p0 = MP_RealReadPhyOcpRegWord(sc, 0xBD5A);
                         rg_lpf_cap_xg_p0 &= 0x001F;
                         rg_lpf_cap_xg_p1 = MP_RealReadPhyOcpRegWord(sc, 0xBD5A);
@@ -29518,14 +29518,6 @@ static void re_hw_phy_config(struct re_softc *sc)
                         rg_lpf_cap_p3 = MP_RealReadPhyOcpRegWord(sc, 0xBC1A);
                         rg_lpf_cap_p3 &= 0x1F00;
 
-                        //	GPHY OCP 0xBD5A bit[4:0] = rg_lpf_cap_xg_p3
-                        //	GPHY OCP 0xBD5A bit[12:8] = rg_lpf_cap_xg_p2
-                        //	GPHY OCP 0xBD5C bit[4:0] = rg_lpf_cap_xg_p1
-                        //	GPHY OCP 0xBD5C bit[12:8] = rg_lpf_cap_xg_p0
-                        //	GPHY OCP 0xBC18 bit[4:0] = rg_lpf_cap_p3
-                        //	GPHY OCP 0xBC18 bit[12:8] = rg_lpf_cap_p2
-                        //	GPHY OCP 0xBC1A bit[4:0] = rg_lpf_cap_p1
-                        //	GPHY OCP 0xBC1A bit[12:8] = rg_lpf_cap_p0
                         ClearAndSetEthPhyOcpBit(sc,
                                                 0xBD5A,
                                                 0x001F,
@@ -29567,6 +29559,9 @@ static void re_hw_phy_config(struct re_softc *sc)
                                                 rg_lpf_cap_p0 << 8
                                                );
                 }
+
+
+                SetEthPhyOcpBit(sc, 0xA424, BIT_3);
 
 
                 if (phy_power_saving == 1) {
@@ -29930,6 +29925,10 @@ static void re_hw_phy_config(struct re_softc *sc)
                                         BIT_15 | BIT_14 | BIT_12 | BIT_11
                                        );
 
+
+                SetEthPhyOcpBit(sc, 0xA424, BIT_3);
+
+
                 /*
                 MP_RealWritePhyOcpRegWord(sc, 0xBFA0, 0xD70D);
                 MP_RealWritePhyOcpRegWord(sc, 0xBFA2, 0x4100);
@@ -30226,13 +30225,12 @@ u_int16_t MP_ReadEPhyUshort(struct re_softc *sc, u_int8_t RegAddr)
 
 static u_int8_t re_calc_efuse_dummy_bit(u_int16_t reg)
 {
-        int s,a,b;
+        int s,a;
         u_int8_t dummyBitPos = 0;
 
 
         s=reg% 32;
         a=s % 16;
-        b=s/16;
 
         if (s/16) {
                 dummyBitPos = (u_int8_t)(16-a);
@@ -30840,19 +30838,16 @@ static void OOB_mutex_lock(struct re_softc *sc)
 static void OOB_mutex_unlock(struct re_softc *sc)
 {
         u_int16_t ocp_reg_mutex_ib;
-        u_int16_t ocp_reg_mutex_oob;
         u_int16_t ocp_reg_mutex_prio;
 
         switch (sc->re_type) {
         case MACFG_63:
         case MACFG_64:
         case MACFG_65:
-                ocp_reg_mutex_oob = 0x16;
                 ocp_reg_mutex_ib = 0x17;
                 ocp_reg_mutex_prio = 0x9C;
                 break;
         case MACFG_66:
-                ocp_reg_mutex_oob = 0x06;
                 ocp_reg_mutex_ib = 0x07;
                 ocp_reg_mutex_prio = 0x9C;
                 break;
@@ -30864,7 +30859,6 @@ static void OOB_mutex_unlock(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         default:
-                ocp_reg_mutex_oob = 0x110;
                 ocp_reg_mutex_ib = 0x114;
                 ocp_reg_mutex_prio = 0x11C;
                 break;
