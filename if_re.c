@@ -608,8 +608,7 @@ static void re_wait_phy_ups_resume(struct re_softc *sc, u_int16_t PhyState)
         };
 }
 
-static void re_phy_power_up(dev)
-device_t		dev;
+static void re_phy_power_up(device_t dev)
 {
         struct re_softc		*sc;
         u_int8_t Data8;
@@ -698,8 +697,7 @@ static u_int16_t re_get_phy_lp_ability(struct re_softc *sc)
         return anlpar;
 }
 
-static void re_phy_power_down(dev)
-device_t		dev;
+static void re_phy_power_down(device_t dev)
 {
         struct re_softc		*sc;
         u_int8_t Data8;
@@ -849,8 +847,7 @@ static void re_dma_map_txdesc(void *arg, bus_dma_segment_t *segs, int nseg, int 
  * Probe for a RealTek 8129/8139 chip. Check the PCI vendor and device
  * IDs against our list and return a device name if we find a match.
  */
-static int re_probe(dev)	/* Search for Realtek NIC chip */
-device_t		dev;
+static int re_probe(device_t dev)	/* Search for Realtek NIC chip */
 {
         struct re_type		*t;
         t = re_devs;
@@ -5392,8 +5389,7 @@ re_set_offset79(struct re_softc *sc, u_int8_t setting)
  * Stop all chip I/O so that the kernel's probe routines don't
  * get confused by errant DMAs when rebooting.
  */
-static int re_shutdown(dev)	/* The same with re_stop(sc) */
-device_t		dev;
+static int re_shutdown(device_t dev)	/* The same with re_stop(sc) */
 {
         struct re_softc		*sc;
 
@@ -8374,8 +8370,7 @@ re_drain_soft_lro(struct re_softc *sc)
  * bytes of space preceecing it so that it will be safe for us to do the
  * 2-byte backstep even if reading from the ring at offset 0.
  */
-static int re_rxeof(sc)	/* Receive Data OK/ERR handler */
-struct re_softc		*sc;
+static int re_rxeof(struct re_softc *sc)	/* Receive Data OK/ERR handler */
 {
         struct mbuf		*m;
         struct ifnet		*ifp;
@@ -8851,10 +8846,7 @@ static void re_int_task_8125(void *arg, int npending)
         CSR_WRITE_4(sc, RE_IMR0_8125, RE_INTRS);
 }
 
-static void re_set_multicast_reg(sc, mask0, mask4)
-struct re_softc		*sc;
-u_int32_t		mask0;
-u_int32_t		mask4;
+static void re_set_multicast_reg(struct re_softc *sc, u_int32_t mask0, u_int32_t mask4)
 {
         u_int8_t  enable_cfg_reg_write = 0;
 
@@ -8871,8 +8863,7 @@ u_int32_t		mask4;
         return;
 }
 
-static void re_set_rx_packet_filter_in_sleep_state(sc)
-struct re_softc		*sc;
+static void re_set_rx_packet_filter_in_sleep_state(struct re_softc *sc)
 {
         u_int32_t		rxfilt;
 
@@ -8888,8 +8879,7 @@ struct re_softc		*sc;
         return;
 }
 
-static void re_set_rx_packet_filter(sc)
-struct re_softc		*sc;
+static void re_set_rx_packet_filter(struct re_softc *sc)
 {
         struct ifnet		*ifp;
         u_int32_t		rxfilt;
@@ -8944,8 +8934,7 @@ re_hash_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
 /*
  * Program the 64-bit multicast hash filter.
  */
-static void re_setmulti(sc)
-struct re_softc		*sc;
+static void re_setmulti(struct re_softc *sc)
 {
         struct ifnet		*ifp;
         int			h = 0;
@@ -9019,10 +9008,7 @@ struct re_softc		*sc;
         return;
 }
 
-static int re_ioctl(ifp, command, data)
-struct ifnet		*ifp;
-u_long			command;
-caddr_t			data;
+static int re_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 {
         struct re_softc		*sc = ifp->if_softc;
         struct ifreq		*ifr = (struct ifreq *) data;
@@ -9381,8 +9367,7 @@ static void re_start_timer(struct re_softc *sc)
 #endif
 }
 
-static void re_tick(xsc)
-void			*xsc;
+static void re_tick(void *xsc)
 {
         /*called per second*/
         struct re_softc		*sc;
@@ -9410,8 +9395,7 @@ void			*xsc;
 }
 
 #if OS_VER < VERSION(7,0)
-static void re_watchdog(ifp)
-struct ifnet		*ifp;
+static void re_watchdog(struct ifnet *ifp)
 {
         struct re_softc		*sc;
 
@@ -9613,9 +9597,7 @@ static int re_ifmedia_upd_8125(struct ifnet *ifp)
 /*
  * Report current media status.
  */
-static void re_ifmedia_sts(ifp, ifmr)
-struct ifnet		*ifp;
-struct ifmediareq	*ifmr;
+static void re_ifmedia_sts(struct ifnet *ifp, struct ifmediareq *ifmr)
 {
         struct re_softc		*sc;
 
@@ -9650,9 +9632,7 @@ struct ifmediareq	*ifmr;
         return;
 }
 
-static void re_ifmedia_sts_8125(ifp, ifmr)
-struct ifnet		*ifp;
-struct ifmediareq	*ifmr;
+static void re_ifmedia_sts_8125(struct ifnet *ifp, struct ifmediareq *ifmr)
 {
         struct re_softc		*sc;
 
@@ -35873,10 +35853,7 @@ void re_driver_stop(struct re_softc *sc)
 /*
  * Shift out bit(s) to the EEPROM.
  */
-static void re_eeprom_ShiftOutBits(sc, data, count)
-struct re_softc		*sc;
-int			data;
-int 			count;
+static void re_eeprom_ShiftOutBits(struct re_softc *sc, int data, int count)
 {
         u_int16_t x, mask;
 
@@ -35904,8 +35881,7 @@ int 			count;
 /*
  * Shift in bit(s) from the EEPROM.
  */
-static u_int16_t re_eeprom_ShiftInBits(sc)
-struct re_softc		*sc;
+static u_int16_t re_eeprom_ShiftInBits(struct re_softc *sc)
 {
         u_int16_t x,d,i;
         x = CSR_READ_1(sc, RE_EECMD);
@@ -35932,8 +35908,7 @@ struct re_softc		*sc;
 /*
  * Clean up EEprom read/write setting
  */
-static void re_eeprom_EEpromCleanup(sc)
-struct re_softc		*sc;
+static void re_eeprom_EEpromCleanup(struct re_softc *sc)
 {
         u_int16_t x;
         x = CSR_READ_1(sc, RE_EECMD);
@@ -35948,10 +35923,7 @@ struct re_softc		*sc;
 /*
  * Read a word of data stored in the EEPROM at address 'addr.'
  */
-static void re_eeprom_getword(sc, addr, dest)
-struct re_softc		*sc;
-int			addr;
-u_int16_t		*dest;
+static void re_eeprom_getword(struct re_softc *sc, int addr, u_int16_t *dest)
 {
         u_int16_t x;
 
@@ -35981,12 +35953,7 @@ u_int16_t		*dest;
 /*
  * Read a sequence of words from the EEPROM.
  */
-static void re_read_eeprom(sc, dest, off, cnt, swap)
-struct re_softc		*sc;
-caddr_t			dest;
-int			off;
-int			cnt;
-int			swap;
+static void re_read_eeprom(struct re_softc *sc, caddr_t dest, int off, int cnt, int swap)
 {
         int			i;
         u_int16_t		word = 0, *ptr;
