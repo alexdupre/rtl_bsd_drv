@@ -5014,16 +5014,6 @@ static int re_attach(device_t dev)
         TASK_INIT(&sc->re_inttask_poll, 0, sc->int_task_poll, sc);
 #endif
 
-        /*
-         * Call MI attach routine.
-         */
-        /*#if OS_VER < VERSION(5, 1)*/
-#if OS_VER < VERSION(4,9)
-        ether_ifattach(ifp, ETHER_BPF_SUPPORTED);
-#else
-        ether_ifattach(ifp, eaddr);
-#endif
-
 #if OS_VER < VERSION(7,0)
         error = bus_setup_intr(dev, sc->re_irq, INTR_TYPE_NET,
                                sc->intr, sc, &sc->re_intrhand);
@@ -5080,6 +5070,16 @@ static int re_attach(device_t dev)
         ifmedia_set(&sc->media, IFM_ETHER | IFM_AUTO);
         sc->media.ifm_media = IFM_ETHER | IFM_AUTO;
         sc->ifmedia_upd(ifp);
+
+        /*
+         * Call MI attach routine.
+         */
+        /*#if OS_VER < VERSION(5, 1)*/
+#if OS_VER < VERSION(4,9)
+        ether_ifattach(ifp, ETHER_BPF_SUPPORTED);
+#else
+        ether_ifattach(ifp, eaddr);
+#endif
 
 fail:
         if (error)
