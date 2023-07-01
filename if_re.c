@@ -3895,16 +3895,6 @@ static int re_attach(device_t dev)
 #endif
 #endif
 
-        /*
-         * Call MI attach routine.
-         */
-        /*#if OS_VER < VERSION(5, 1)*/
-#if OS_VER < VERSION(4,9)
-        ether_ifattach(ifp, ETHER_BPF_SUPPORTED);
-#else
-        ether_ifattach(ifp, eaddr);
-#endif
-
 #if OS_VER>=VERSION(7,0)
         sc->re_tq = taskqueue_create_fast("re_taskq", M_WAITOK,
                                           taskqueue_thread_enqueue, &sc->re_tq);
@@ -3960,6 +3950,16 @@ static int re_attach(device_t dev)
         ifmedia_set(&sc->media, IFM_ETHER | IFM_AUTO);
         sc->media.ifm_media = IFM_ETHER | IFM_AUTO;
         sc->ifmedia_upd(ifp);
+
+        /*
+         * Call MI attach routine.
+         */
+        /*#if OS_VER < VERSION(5, 1)*/
+#if OS_VER < VERSION(4,9)
+        ether_ifattach(ifp, ETHER_BPF_SUPPORTED);
+#else
+        ether_ifattach(ifp, eaddr);
+#endif
 
 fail_intr:
         if (error) {
