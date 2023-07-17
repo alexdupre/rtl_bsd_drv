@@ -3689,24 +3689,7 @@ static int re_attach(device_t dev)
         re_reset(sc);
         RE_UNLOCK(sc);
 
-        /* Get station address. */
-        RE_LOCK(sc);
-        re_get_hw_mac_address(sc, eaddr);
-        RE_UNLOCK(sc);
-
-        /*
-         * A RealTek chip was detected. Inform the world.
-         */
-        device_printf(dev,"version:%s\n", RE_VERSION);
-        device_printf(dev,"Ethernet address: %6D\n", eaddr, ":");
-        printf("\nThis product is covered by one or more of the following patents: \
-           \nUS6,570,884, US6,115,776, and US6,327,625.\n");
-
         sc->re_unit = unit;
-
-#if OS_VER < VERSION(6,0)
-        bcopy(eaddr, (char *)&sc->arpcom.ac_enaddr, ETHER_ADDR_LEN);
-#endif
 
         if (sc->re_type == MACFG_3) {	/* Change PCI Latency time*/
                 pci_write_config(dev, RE_PCI_LATENCY_TIMER, 0x40, 1);
@@ -3829,6 +3812,23 @@ static int re_attach(device_t dev)
                 ifp->if_capabilities |= IFCAP_WOL;
         ifp->if_capenable = ifp->if_capabilities;
         ifp->if_capenable &= ~(IFCAP_WOL_UCAST | IFCAP_WOL_MCAST);
+
+        /* Get station address. */
+        RE_LOCK(sc);
+        re_get_hw_mac_address(sc, eaddr);
+        RE_UNLOCK(sc);
+
+        /*
+         * A RealTek chip was detected. Inform the world.
+         */
+        device_printf(dev,"version:%s\n", RE_VERSION);
+        device_printf(dev,"Ethernet address: %6D\n", eaddr, ":");
+        printf("\nThis product is covered by one or more of the following patents: \
+           \nUS6,570,884, US6,115,776, and US6,327,625.\n");
+
+#if OS_VER < VERSION(6,0)
+        bcopy(eaddr, (char *)&sc->arpcom.ac_enaddr, ETHER_ADDR_LEN);
+#endif
 
         RE_LOCK(sc);
         re_phy_power_up(dev);
