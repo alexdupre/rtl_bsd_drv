@@ -47,12 +47,12 @@
 #else
 #define FIBER_SUFFIX ""
 #endif
-#define RE_VERSION "1.98.00" FIBER_SUFFIX
+#define RE_VERSION "1.99.04" FIBER_SUFFIX
 
 __FBSDID("$FreeBSD: src/sys/dev/re/if_re.c,v " RE_VERSION __DATE__ " " __TIME__ "  wpaul Exp $");
 
 /*
-* This driver also support Realtek RTL8110/RTL8169, RTL8111/RTL8168, RTL8125, and RTL8136/RTL810x.
+* This driver also support Realtek RTL8110/RTL8169, RTL8111/RTL8168, RTL8125, RTL8126, and RTL8136/RTL810x.
 */
 
 #include <sys/param.h>
@@ -62,6 +62,7 @@ __FBSDID("$FreeBSD: src/sys/dev/re/if_re.c,v " RE_VERSION __DATE__ " " __TIME__ 
 #include <sys/malloc.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 #include <sys/random.h>
 
@@ -114,6 +115,9 @@ __FBSDID("$FreeBSD: src/sys/dev/re/if_re.c,v " RE_VERSION __DATE__ " " __TIME__ 
 
 #include <machine/in_cksum.h>
 
+#include "opt_inet.h"
+#include "opt_inet6.h"
+
 #define EE_SET(x)					\
 	CSR_WRITE_1(sc, RE_EECMD,			\
 		CSR_READ_1(sc, RE_EECMD) | x)
@@ -121,6 +125,14 @@ __FBSDID("$FreeBSD: src/sys/dev/re/if_re.c,v " RE_VERSION __DATE__ " " __TIME__ 
 #define EE_CLR(x)					\
 	CSR_WRITE_1(sc, RE_EECMD,			\
 		CSR_READ_1(sc, RE_EECMD) & ~x)
+
+struct bus_dma_tag {
+        struct bus_dma_tag_common common;
+        int                     map_count;
+        int                     bounce_flags;
+        bus_dma_segment_t       *segments;
+        struct bounce_zone      *bounce_zone;
+};
 
 /*
  * Various supported device vendors/types and their names.
@@ -157,6 +169,10 @@ static struct re_type re_devs[] = {
         {
                 RT_VENDORID, RT_DEVICEID_8125,
                 "Realtek PCIe 2.5GbE Family Controller"
+        },
+        {
+                RT_VENDORID, RT_DEVICEID_8126,
+                "Realtek PCIe 5GbE Family Controller"
         },
         { 0, 0, NULL }
 };
@@ -202,17 +218,19 @@ static void re_clrwol			__P((struct re_softc *));
 static void re_set_wol_linkspeed 	__P((struct re_softc *));
 
 static void re_start				__P((struct ifnet *));
-static int re_encap				__P((struct re_softc *, struct mbuf *));
+static void re_start_locked			__P((struct ifnet *));
+static int re_encap				__P((struct re_softc *, struct mbuf **));
 static int re_8125_pad				__P((struct re_softc *, struct mbuf *));
-static void WritePacket				__P((struct re_softc *, caddr_t, int, int, int, uint32_t, uint32_t));
-static int CountFreeTxDescNum			__P((struct re_descriptor));
-static int CountMbufNum				__P((struct mbuf *));
+static void WritePacket				__P((struct re_softc *, bus_dma_segment_t*, int, int, uint32_t, uint32_t, uint32_t));
+static void re_start_tx				__P((struct re_softc *));
+static uint32_t CountFreeTxDescNum			__P((struct re_descriptor));
+//static int CountMbufNum				__P((struct mbuf *));
 #ifdef RE_FIXUP_RX
 static __inline void re_fixup_rx		__P((struct mbuf *));
 #endif
 static void re_txeof				__P((struct re_softc *));
 
-static void re_rxeof				__P((struct re_softc *));
+static int re_rxeof				__P((struct re_softc *));
 
 #if OS_VER < VERSION(7,0)
 static void re_intr				__P((void *));
@@ -251,7 +269,9 @@ static u_int16_t re_eeprom_ShiftInBits		__P((struct re_softc *));
 static void re_eeprom_EEpromCleanup		__P((struct re_softc *));
 static void re_eeprom_getword			__P((struct re_softc *, int, u_int16_t *));
 static void re_read_eeprom			__P((struct re_softc *, caddr_t, int, int, int));
+static void re_int_task_poll		(void *, int);
 static void re_int_task				(void *, int);
+static void re_int_task_8125_poll	(void *, int);
 static void re_int_task_8125		(void *, int);
 
 static void re_phy_power_up(device_t dev);
@@ -268,6 +288,18 @@ static void OOB_mutex_unlock(struct re_softc *);
 static void re_hw_start_unlock(struct re_softc *sc);
 static void re_hw_start_unlock_8125(struct re_softc *sc);
 
+static void re_add_sysctls      (struct re_softc *);
+static int re_sysctl_driver_variable      (SYSCTL_HANDLER_ARGS);
+static int re_sysctl_stats      (SYSCTL_HANDLER_ARGS);
+static int re_sysctl_registers  (SYSCTL_HANDLER_ARGS);
+static int re_sysctl_eth_phy    (SYSCTL_HANDLER_ARGS);
+static int re_sysctl_dump_rx_desc    (SYSCTL_HANDLER_ARGS);
+static int re_sysctl_dump_tx_desc    (SYSCTL_HANDLER_ARGS);
+static int re_sysctl_pcie_phy   (SYSCTL_HANDLER_ARGS);
+static int re_sysctl_extended_registers   (SYSCTL_HANDLER_ARGS);
+static int re_sysctl_pci_registers        (SYSCTL_HANDLER_ARGS);
+static int re_sysctl_msix_tbl             (SYSCTL_HANDLER_ARGS);
+
 /* Tunables. */
 static int msi_disable = 1;
 TUNABLE_INT("hw.re.msi_disable", &msi_disable);
@@ -275,6 +307,10 @@ static int msix_disable = 0;
 TUNABLE_INT("hw.re.msix_disable", &msix_disable);
 static int prefer_iomap = 0;
 TUNABLE_INT("hw.re.prefer_iomap", &prefer_iomap);
+static int re_lro_entry_count = 128;
+TUNABLE_INT("hw.re.lro_entry_count", &re_lro_entry_count);
+static int re_lro_mbufq_depth = RE_RX_BUF_NUM;
+TUNABLE_INT("hw.re.lro_mbufq_depth", &re_lro_mbufq_depth);
 #ifdef ENABLE_EEE
 static int eee_enable = 1;
 #else
@@ -297,8 +333,22 @@ static int s0_magic_packet = 1;
 static int s0_magic_packet = 0;
 #endif
 TUNABLE_INT("hw.re.s0_magic_packet", &s0_magic_packet);
+#ifdef CONFIG_SOC_LAN
+static int config_soc_lan = 1;
+#else
+static int config_soc_lan = 0;
+#endif
+TUNABLE_INT("hw.re.config_soc_lan", &config_soc_lan);
+#ifdef ENABLE_INTERRUPT_MITIGATIN
+static int interrupt_mitigation = 1;
+#else
+static int interrupt_mitigation = 0;
+#endif
+TUNABLE_INT("hw.re.interrupt_mitigation", &interrupt_mitigation);
 
-#define RE_CSUM_FEATURES    (CSUM_IP | CSUM_TCP | CSUM_UDP)
+#define RE_CSUM_FEATURES_IPV4    (CSUM_IP | CSUM_TCP | CSUM_UDP)
+#define RE_CSUM_FEATURES_IPV6    (CSUM_TCP_IPV6 | CSUM_UDP_IPV6)
+#define RE_CSUM_FEATURES    (RE_CSUM_FEATURES_IPV4 | RE_CSUM_FEATURES_IPV6)
 
 static device_method_t re_methods[] = {
         /* Device interface */
@@ -457,13 +507,15 @@ SetMcuAccessRegBit(
 static void re_clear_phy_ups_reg(struct re_softc *sc)
 {
         switch(sc->re_type) {
-        case MACFG_80:
-        case MACFG_81:
         case MACFG_82:
         case MACFG_83:
-                if (sc->re_type == MACFG_82 || sc->re_type == MACFG_83)
-                        ClearEthPhyOcpBit(sc, 0xA466, BIT_0);
-
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
+                ClearEthPhyOcpBit(sc, 0xA466, BIT_0);
+        /*	FALLTHROUGH */
+        case MACFG_80:
+        case MACFG_81:
                 ClearEthPhyOcpBit(sc, 0xA468, BIT_3 | BIT_1);
                 break;
         };
@@ -476,6 +528,9 @@ static int re_is_ups_resume(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 return (MP_ReadMcuAccessRegWord(sc, 0xD42C) & BIT_8);
         default:
                 return (MP_ReadMcuAccessRegWord(sc, 0xD408) & BIT_0);
@@ -489,7 +544,10 @@ static void re_clear_ups_resume_bit(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
-                MP_WriteMcuAccessRegWord(sc, 0xD408, MP_ReadMcuAccessRegWord(sc, 0xD408) & ~(BIT_8));
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
+                MP_WriteMcuAccessRegWord(sc, 0xD42C, MP_ReadMcuAccessRegWord(sc, 0xD42C) & ~(BIT_8));
                 break;
         default:
                 MP_WriteMcuAccessRegWord(sc, 0xD408, MP_ReadMcuAccessRegWord(sc, 0xD408) & ~(BIT_0));
@@ -507,6 +565,9 @@ static void re_wait_phy_ups_resume(struct re_softc *sc, u_int16_t PhyState)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 do {
                         TmpPhyState = MP_RealReadPhyOcpRegWord(sc, 0xA420);
                         TmpPhyState &= 0x7;
@@ -592,10 +653,14 @@ device_t		dev;
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 re_wait_phy_ups_resume(sc, 3);
                 break;
         };
@@ -694,6 +759,7 @@ device_t		dev;
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
                 CSR_WRITE_1(sc, 0xD0, CSR_READ_1(sc, 0xD0) & ~BIT_6);
                 CSR_WRITE_1(sc, 0xF2, CSR_READ_1(sc, 0xF2) & ~BIT_6);
                 break;
@@ -703,20 +769,20 @@ device_t		dev;
                 CSR_WRITE_1(sc, RE_PMCH, CSR_READ_1(sc, RE_PMCH) & ~(BIT_6|BIT_7));
 }
 
+/*
 static void re_tx_dma_map_buf(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 {
         union TxDesc *txptr = arg;
 
         if (error) {
                 txptr->ul[0] &= ~htole32(RL_TDESC_CMD_BUFLEN);
-                txptr->so1.TxBuffL = 0;
-                txptr->so1.TxBuffH = 0;
+                txptr->so1.TxBuff = 0;
                 return;
         }
 
-        txptr->so1.TxBuffL = htole32(RL_ADDR_LO(segs->ds_addr));
-        txptr->so1.TxBuffH = htole32(RL_ADDR_HI(segs->ds_addr));
+        txptr->so1.TxBuff = htole64(segs->ds_addr);
 }
+*/
 
 static void re_rx_dma_map_buf(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 {
@@ -724,13 +790,13 @@ static void re_rx_dma_map_buf(void *arg, bus_dma_segment_t *segs, int nseg, int 
 
         if (error) {
                 rxptr->ul[0] &= ~htole32(RL_RDESC_CMD_BUFLEN);
-                rxptr->so0.RxBuffL = 0;
-                rxptr->so0.RxBuffH = 0;
+                /* make sure desc is releasing before change buffer address */
+                wmb();
+                rxptr->so0.RxBuff = 0;
                 return;
         }
 
-        rxptr->so0.RxBuffL = htole32(RL_ADDR_LO(segs->ds_addr));
-        rxptr->so0.RxBuffH = htole32(RL_ADDR_HI(segs->ds_addr));
+        rxptr->so0.RxBuff = htole64(segs->ds_addr);
 }
 
 static void re_dma_map_rxdesc(void *arg, bus_dma_segment_t *segs, int nseg, int error)
@@ -887,6 +953,55 @@ static int re_eri_write(struct re_softc *sc, int addr, int len, u_int32_t value,
         return re_eri_write_with_oob_base_address(sc, addr, len, value, type, 0);
 }
 
+static void
+re_dma_map_addr(void *arg, bus_dma_segment_t *segs, int nseg, int error)
+{
+        bus_addr_t              *addr;
+
+        if (error)
+                return;
+
+        KASSERT(nseg == 1, ("too many DMA segments, %d should be 1", nseg));
+        addr = arg;
+        *addr = segs->ds_addr;
+}
+
+static int re_alloc_stats(device_t dev, struct re_softc *sc)
+{
+        int                     error;
+
+        /* Create DMA map for statistics. */
+        error = bus_dma_tag_create(sc->re_parent_tag, RE_DUMP_ALIGN, 0,
+                                   BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL,
+                                   sizeof(struct re_stats), 1, sizeof(struct re_stats), 0, NULL, NULL,
+                                   &sc->re_tally.re_stag);
+        if (error) {
+                device_printf(dev, "could not create statistics DMA tag\n");
+                return (error);
+        }
+        /* Allocate DMA'able memory for statistics. */
+        error = bus_dmamem_alloc(sc->re_tally.re_stag,
+                                 (void **)&sc->re_tally.re_stats,
+                                 BUS_DMA_WAITOK | BUS_DMA_COHERENT | BUS_DMA_ZERO,
+                                 &sc->re_tally.re_smap);
+        if (error) {
+                device_printf(dev,
+                              "could not allocate statistics DMA memory\n");
+                return (error);
+        }
+        /* Load the map for statistics. */
+        sc->re_tally.re_stats_addr = 0;
+        error = bus_dmamap_load(sc->re_tally.re_stag, sc->re_tally.re_smap,
+                                sc->re_tally.re_stats, sizeof(struct re_stats), re_dma_map_addr,
+                                &sc->re_tally.re_stats_addr, BUS_DMA_NOWAIT);
+        if (error != 0 || sc->re_tally.re_stats_addr == 0) {
+                device_printf(dev, "could not load statistics DMA memory\n");
+                return (ENOMEM);
+        }
+
+        return (0);
+}
+
 static void re_release_rx_buf(struct re_softc *sc)
 {
         int i;
@@ -928,22 +1043,80 @@ static void re_release_tx_buf(struct re_softc *sc)
 
 
 }
+
+static void
+re_free_soft_lro(struct re_softc *sc)
+{
+#if defined(INET) || defined(INET6)
+        if (sc->re_lro.ifp) {
+                tcp_lro_free(&sc->re_lro);
+                sc->re_lro.ifp = NULL;
+        }
+#endif
+}
+
+static int
+re_config_soft_lro(struct re_softc *sc)
+{
+        struct lro_ctrl *lro;
+
+        lro = &sc->re_lro;
+        bzero(lro, sizeof(struct lro_ctrl));
+
+#if defined(INET) || defined(INET6)
+#if OS_VER >= VERSION(11,0)
+        if (tcp_lro_init_args(lro, sc->re_ifp,
+                              max(TCP_LRO_ENTRIES, re_lro_entry_count),
+                              min(1024, re_lro_mbufq_depth)) != 0) {
+                device_printf(sc->dev,
+                              "%s: tcp_lro_init_args failed\n",
+                              __func__);
+                return (ENOMEM);
+        }
+#else
+        if (tcp_lro_init(lro)) {
+                device_printf(sc->dev,
+                              "%s: tcp_lro_init failed\n",
+                              __func__);
+                return (-1);
+        }
+#endif //OS_VER >= VERSION(11,0)
+#endif
+        lro->ifp = sc->re_ifp;
+
+        return (0);
+}
+
 static void re_release_buf(struct re_softc *sc)
 {
         re_release_rx_buf(sc);
         re_release_tx_buf(sc);
 }
-
-
-
 static int re_alloc_buf(struct re_softc *sc)
 {
         int error =0;
         int i,size;
 
+        switch(sc->re_type) {
+        case MACFG_3:
+        case MACFG_4:
+        case MACFG_5:
+        case MACFG_6:
+        case MACFG_11:
+        case MACFG_12:
+        case MACFG_13:
+        case MACFG_21:
+        case MACFG_22:
+        case MACFG_23:
+                size = RE_TX_MAXSIZE_32K;
+                break;
+        default:
+                size = RE_TX_MAXSIZE_64K;
+                break;
+        }
         error = bus_dma_tag_create(sc->re_parent_tag, 1, 0,
                                    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL,
-                                   NULL, MCLBYTES* RE_NTXSEGS, RE_NTXSEGS, 4096, 0,
+                                   NULL, size, RE_NTXSEGS, size, 0,
                                    NULL, NULL, &sc->re_desc.re_tx_mtag);
 
         if (error) {
@@ -1027,7 +1200,12 @@ static void set_rxbufsize(struct re_softc *sc)
         struct ifnet		*ifp;
         ifp = RE_GET_IFNET(sc);
         sc->re_rx_desc_buf_sz = (ifp->if_mtu > ETHERMTU) ? ifp->if_mtu: ETHERMTU;
-        sc->re_rx_desc_buf_sz += (ETHER_VLAN_ENCAP_LEN + ETHER_HDR_LEN + ETHER_CRC_LEN + 1);
+        sc->re_rx_desc_buf_sz += (ETHER_VLAN_ENCAP_LEN + ETHER_HDR_LEN + ETHER_CRC_LEN);
+        if (!(sc->re_if_flags & RL_FLAG_8168G_PLUS) ||
+            sc->re_type == MACFG_56 || sc->re_type == MACFG_57 ||
+            sc->re_type == MACFG_58 || sc->re_type == MACFG_59 ||
+            sc->re_type == MACFG_60)
+                sc->re_rx_desc_buf_sz += 1;
         CSR_WRITE_2(sc, RE_RxMaxSize, sc->re_rx_desc_buf_sz);
 }
 
@@ -1039,6 +1217,46 @@ static void re_enable_cfg9346_write(struct re_softc *sc)
 static void re_disable_cfg9346_write(struct re_softc *sc)
 {
         EE_CLR(RE_EEMODE_WRITECFG);
+}
+
+static void re_enable_force_clkreq(struct re_softc *sc, bool enable)
+{
+        if (enable)
+                CSR_WRITE_1(sc, 0xF1, CSR_READ_1(sc, 0xF1) | BIT_7);
+        else
+                CSR_WRITE_1(sc, 0xF1, CSR_READ_1(sc, 0xF1) & ~BIT_7);
+}
+
+static void _re_enable_aspm_clkreq_lock(struct re_softc *sc, bool enable)
+{
+        switch(sc->re_type) {
+        case MACFG_91:
+        case MACFG_92:
+                if (enable) {
+                        CSR_WRITE_1(sc, RE_INT_CFG0_8125, CSR_READ_1(sc, RE_INT_CFG0_8125) | BIT_3);
+                        CSR_WRITE_1(sc, RE_CFG5, CSR_READ_1(sc, RE_CFG5) | BIT_0);
+                } else {
+                        CSR_WRITE_1(sc, RE_INT_CFG0_8125, CSR_READ_1(sc, RE_INT_CFG0_8125) & ~BIT_3);
+                        CSR_WRITE_1(sc, RE_CFG5, CSR_READ_1(sc, RE_CFG5) & ~BIT_0);
+                }
+                break;
+        default:
+                if (enable) {
+                        CSR_WRITE_1(sc, RE_CFG5, CSR_READ_1(sc, RE_CFG5) | BIT_0);
+                        CSR_WRITE_1(sc, RE_CFG2, CSR_READ_1(sc, RE_CFG2) | BIT_7);
+                } else {
+                        CSR_WRITE_1(sc, RE_CFG5, CSR_READ_1(sc, RE_CFG5) & ~BIT_0);
+                        CSR_WRITE_1(sc, RE_CFG2, CSR_READ_1(sc, RE_CFG2) & ~BIT_7);
+                }
+                break;
+        }
+}
+
+static void re_enable_aspm_clkreq_lock(struct re_softc *sc, bool enable)
+{
+        re_enable_cfg9346_write(sc);
+        _re_enable_aspm_clkreq_lock(sc, enable);
+        re_disable_cfg9346_write(sc);
 }
 
 static void DisableMcuBPs(struct re_softc *sc)
@@ -1061,14 +1279,16 @@ static void DisableMcuBPs(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
-                re_enable_cfg9346_write(sc);
-                CSR_WRITE_1(sc, RE_CFG5, CSR_READ_1(sc, RE_CFG5) & ~BIT_0);
-                CSR_WRITE_1(sc, RE_CFG2, CSR_READ_1(sc, RE_CFG2) & ~BIT_7);
-                re_disable_cfg9346_write(sc);
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
+                re_enable_aspm_clkreq_lock(sc, 0);
                 break;
         }
 
@@ -1080,12 +1300,17 @@ static void DisableMcuBPs(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 MP_WriteMcuAccessRegWord(sc, 0xFC38, 0x0000);
                 break;
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 MP_WriteMcuAccessRegWord(sc, 0xFC48, 0x0000);
                 break;
         }
@@ -1106,6 +1331,8 @@ static void DisableMcuBPs(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 MP_WriteMcuAccessRegWord(sc, 0xFC28, 0x0000);
                 MP_WriteMcuAccessRegWord(sc, 0xFC2A, 0x0000);
                 MP_WriteMcuAccessRegWord(sc, 0xFC2C, 0x0000);
@@ -1123,6 +1350,9 @@ static void DisableMcuBPs(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 for (regAddr = 0xFC28; regAddr < 0xFC48; regAddr += 2) {
                         MP_WriteMcuAccessRegWord(sc, regAddr, 0x0000);
                 }
@@ -1459,7 +1689,7 @@ static void re_set_mac_mcu_8168h_1(struct re_softc *sc)
 
 static void re_set_mac_mcu_8168h_2(struct re_softc *sc)
 {
-        static const uint16_t mcu_patch_code_8168h_1[] = {
+        static const uint16_t mcu_patch_code_8168h_2[] = {
                 0xE008, 0xE00F, 0xE011, 0xE047, 0xE049, 0xE073, 0xE075, 0xE07A, 0xC707,
                 0x1D00, 0x8DE2, 0x48C1, 0xC502, 0xBD00, 0x00E4, 0xE0C0, 0xC502, 0xBD00,
                 0x0216, 0xC634, 0x75C0, 0x49D3, 0xF027, 0xC631, 0x75C0, 0x49D3, 0xF123,
@@ -1479,7 +1709,7 @@ static void re_set_mac_mcu_8168h_2(struct re_softc *sc)
 
         DisableMcuBPs(sc);
 
-        re_write_mac_mcu_ram_code(sc, mcu_patch_code_8168h_1, ARRAY_SIZE(mcu_patch_code_8168h_1));
+        re_write_mac_mcu_ram_code(sc, mcu_patch_code_8168h_2, ARRAY_SIZE(mcu_patch_code_8168h_2));
 
         MP_WriteMcuAccessRegWord(sc, 0xFC26, 0x8000);
 
@@ -1498,6 +1728,79 @@ static void re_set_mac_mcu_8168h_2(struct re_softc *sc)
 }
 
 static void re_set_mac_mcu_8168h_3(struct re_softc *sc)
+{
+        static const uint16_t mcu_patch_code_8168h_3[] = {
+                0xE008, 0xE00A, 0xE00C, 0xE00E, 0xE010, 0xE03E, 0xE040, 0xE069, 0xC602,
+                0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC002, 0xB800, 0x0000, 0xC602,
+                0xBE00, 0x0000, 0xC72B, 0x76E2, 0x49EE, 0xF1FD, 0x1E00, 0x9EE0, 0x1E1C,
+                0x9EE2, 0x76E2, 0x49EE, 0xF1FE, 0xC621, 0x9EE0, 0x1E1D, 0x486F, 0x9EE2,
+                0x76E2, 0x49EE, 0xF1FE, 0xC71A, 0x76E0, 0x48E8, 0x48E9, 0x48EA, 0x48EB,
+                0x48EC, 0x9EE0, 0xC70D, 0xC60D, 0x9EF4, 0xC60C, 0x9EF6, 0xC70E, 0x76E0,
+                0x4863, 0x9EE0, 0xB007, 0xC602, 0xBE00, 0x0ACC, 0xE000, 0x03BF, 0x07FF,
+                0xDE24, 0x3200, 0xE096, 0xD438, 0xC602, 0xBE00, 0x0000, 0x8EE6, 0xC726,
+                0x76E2, 0x49EE, 0xF1FD, 0x1E00, 0x8EE0, 0x1E1C, 0x8EE2, 0x76E2, 0x49EE,
+                0xF1FE, 0xC61C, 0x8EE0, 0x1E1D, 0x486F, 0x8EE2, 0x76E2, 0x49EE, 0xF1FE,
+                0xC715, 0x76E0, 0x48E8, 0x48E9, 0x48EA, 0x48EB, 0x48EC, 0x9EE0, 0xC708,
+                0xC608, 0x9EF4, 0xC607, 0x9EF6, 0xC602, 0xBE00, 0x0ABE, 0xE000, 0x03BF,
+                0x07FF, 0xDE24, 0x3200, 0xE096, 0xC602, 0xBE00, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                0x0000, 0x0000, 0x0000, 0x0000, 0x6838, 0x0A17, 0x0613, 0x0D26
+        };
+
+        DisableMcuBPs(sc);
+
+        re_write_mac_mcu_ram_code(sc, mcu_patch_code_8168h_3, ARRAY_SIZE(mcu_patch_code_8168h_3));
+
+        MP_WriteMcuAccessRegWord(sc, 0xFC26, 0x8000);
+
+        MP_WriteMcuAccessRegWord(sc, 0xFC30, 0x0ACA);
+
+        MP_WriteMcuAccessRegWord(sc, 0xFC38, 0x0010);
+}
+
+static void re_set_mac_mcu_8168h_4(struct re_softc *sc)
 {
         DisableMcuBPs(sc);
 }
@@ -1888,6 +2191,40 @@ static void re_set_mac_mcu_8125b_2(struct re_softc *sc)
         MP_WriteMcuAccessRegWord(sc, 0xFC48, 0x003F);
 }
 
+static void re_set_mac_mcu_8126a_1(struct re_softc *sc)
+{
+        static const u_int16_t mcu_patch_code_8126a_1[] =  {
+                0xE010, 0xE019, 0xE01B, 0xE01D, 0xE01F, 0xE021, 0xE023, 0xE025, 0xE027,
+                0xE029, 0xE02B, 0xE02D, 0xE02F, 0xE031, 0xE033, 0xE035, 0x48C0, 0x9C66,
+                0x7446, 0x4840, 0x48C1, 0x48C2, 0x9C46, 0xC402, 0xBC00, 0x0AD6, 0xC602,
+                0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602,
+                0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602,
+                0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602,
+                0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602,
+                0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000, 0xC602, 0xBE00, 0x0000
+        };
+
+        DisableMcuBPs(sc);
+
+        re_write_mac_mcu_ram_code(sc, mcu_patch_code_8126a_1, ARRAY_SIZE(mcu_patch_code_8126a_1));
+
+        MP_WriteMcuAccessRegWord(sc, 0xFC26, 0x8000);
+
+        MP_WriteMcuAccessRegWord(sc, 0xFC28, 0x0AAA);
+
+        MP_WriteMcuAccessRegWord(sc, 0xFC48, 0x0001);
+}
+
+static void re_set_mac_mcu_8126a_2(struct re_softc *sc)
+{
+        DisableMcuBPs(sc);
+}
+
+static void re_set_mac_mcu_8126a_3(struct re_softc *sc)
+{
+        DisableMcuBPs(sc);
+}
+
 static void re_hw_mac_mcu_config(struct re_softc *sc)
 {
         switch(sc->re_type) {
@@ -1913,6 +2250,7 @@ static void re_hw_mac_mcu_config(struct re_softc *sc)
                 re_set_mac_mcu_8168h_1(sc);
                 break;
         case MACFG_69:
+        case MACFG_76:
                 re_set_mac_mcu_8168h_2(sc);
                 break;
         case MACFG_70:
@@ -1930,6 +2268,9 @@ static void re_hw_mac_mcu_config(struct re_softc *sc)
         case MACFG_74:
                 re_set_mac_mcu_8168h_3(sc);
                 break;
+        case MACFG_75:
+                re_set_mac_mcu_8168h_4(sc);
+                break;
         case MACFG_80:
                 re_set_mac_mcu_8125a_1(sc);
                 break;
@@ -1941,6 +2282,15 @@ static void re_hw_mac_mcu_config(struct re_softc *sc)
                 break;
         case MACFG_83:
                 re_set_mac_mcu_8125b_2(sc);
+                break;
+        case MACFG_90:
+                re_set_mac_mcu_8126a_1(sc);
+                break;
+        case MACFG_91:
+                re_set_mac_mcu_8126a_2(sc);
+                break;
+        case MACFG_92:
+                re_set_mac_mcu_8126a_3(sc);
                 break;
         }
 }
@@ -2117,6 +2467,8 @@ static void re_exit_oob(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 CSR_WRITE_1(sc, 0xF2, CSR_READ_1(sc, 0xF2) | BIT_3);
                 DELAY(2000);
 
@@ -2155,6 +2507,9 @@ static void re_exit_oob(struct re_softc *sc)
                 break;
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 CSR_WRITE_1(sc, 0xF2, CSR_READ_1(sc, 0xF2) | BIT_3);
                 DELAY(2000);
 
@@ -2240,6 +2595,8 @@ static void re_exit_oob(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 data16 = MP_ReadMcuAccessRegWord(sc, 0xE8DE) & ~BIT_14;
                 MP_WriteMcuAccessRegWord(sc, 0xE8DE, data16);
                 for (i = 0; i < 10; i++) {
@@ -2261,6 +2618,9 @@ static void re_exit_oob(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 data16 = MP_ReadMcuAccessRegWord(sc, 0xE8DE) & ~BIT_14;
                 MP_WriteMcuAccessRegWord(sc, 0xE8DE, data16);
                 for (i = 0; i < 10; i++) {
@@ -2290,10 +2650,14 @@ static void re_exit_oob(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 if (re_is_ups_resume(sc)) {
                         re_wait_phy_ups_resume(sc, 2);
                         re_clear_ups_resume_bit(sc);
@@ -2397,14 +2761,18 @@ static void re_hw_init(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
+                re_enable_force_clkreq(sc, 0);
+                re_enable_aspm_clkreq_lock(sc, 0);
                 re_enable_cfg9346_write(sc);
-                CSR_WRITE_1(sc, RE_CFG5, CSR_READ_1(sc, RE_CFG5) & ~BIT_0);
-                CSR_WRITE_1(sc, RE_CFG2, CSR_READ_1(sc, RE_CFG2) & ~BIT_7);
-                CSR_WRITE_1(sc, 0xF1, CSR_READ_1(sc, 0xF1) & ~BIT_7);
                 CSR_WRITE_1(sc, RE_CFG2, CSR_READ_1(sc, RE_CFG2) | BIT_5);
                 re_disable_cfg9346_write(sc);
                 break;
@@ -2482,6 +2850,8 @@ static void re_get_hw_mac_address(struct re_softc *sc, u_int8_t *eaddr)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 *(u_int32_t *)&eaddr[0] = re_eri_read(sc, 0xE0, 4, ERIAR_ExGMAC);
                 *(u_int16_t *)&eaddr[4] = (u_int16_t)re_eri_read(sc, 0xE4, 4, ERIAR_ExGMAC);
                 break;
@@ -2489,6 +2859,9 @@ static void re_get_hw_mac_address(struct re_softc *sc, u_int8_t *eaddr)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 *(u_int32_t *)&eaddr[0] = CSR_READ_4(sc, RE_BACKUP_ADDR0_8125);
                 *(u_int16_t *)&eaddr[4] = CSR_READ_2(sc, RE_BACKUP_ADDR4_8125);
                 break;
@@ -2508,6 +2881,7 @@ static void re_get_hw_mac_address(struct re_softc *sc, u_int8_t *eaddr)
                 device_printf(dev,"Invalid ether addr: %6D\n", eaddr, ":");
                 random_ether_addr(eaddr);
                 device_printf(dev,"Random ether addr: %6D\n", eaddr, ":");
+                sc->random_mac = 1;
         }
 
         re_rar_set(sc, eaddr);
@@ -2749,50 +3123,58 @@ static int re_check_mac_version(struct re_softc *sc)
         case 0x4C000000:
                 sc->re_type = MACFG_56;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x4C100000:
                 sc->re_type = MACFG_57;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x50800000:
                 sc->re_type = MACFG_58;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x50900000:
                 sc->re_type = MACFG_59;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x5C800000:
                 sc->re_type = MACFG_60;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x50000000:
                 sc->re_type = MACFG_61;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x50100000:
                 sc->re_type = MACFG_62;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x50200000:
                 sc->re_type = MACFG_67;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x28800000:
                 sc->re_type = MACFG_63;
@@ -2821,64 +3203,104 @@ static int re_check_mac_version(struct re_softc *sc)
         case 0x54000000:
                 sc->re_type = MACFG_68;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x54100000:
                 sc->re_type = MACFG_69;
                 if ((MP_ReadMcuAccessRegWord(sc, 0xD006) & 0xFF00) == 0x0100)
                         sc->re_type = MACFG_74;
+                else if ((MP_ReadMcuAccessRegWord(sc, 0xD006) & 0xFF00) == 0x0300)
+                        sc->re_type = MACFG_75;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
+                break;
+        case 0x6C000000:
+                sc->re_type = MACFG_76;
+                sc->max_jumbo_frame_size = Jumbo_Frame_9k;
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_8168G_PLUS |
+                                   RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x54900000:
                 sc->re_type = MACFG_70;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x54A00000:
                 sc->re_type = MACFG_71;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x54B00000:
                 sc->re_type = MACFG_72;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x54C00000:
                 sc->re_type = MACFG_73;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V2;
-                CSR_WRITE_4(sc, RE_RXCFG, 0xCF00);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V2;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x8F00);
                 break;
         case 0x60800000:
                 sc->re_type = MACFG_80;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V3;
-                CSR_WRITE_4(sc, RE_RXCFG, 0x40C00000);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V3;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x40C00700);
                 break;
         case 0x60900000:
                 sc->re_type = MACFG_81;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V3;
-                CSR_WRITE_4(sc, RE_RXCFG, 0x40C00000);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V3;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x40C00700);
                 break;
         case 0x64000000:
                 sc->re_type = MACFG_82;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V3;
-                CSR_WRITE_4(sc, RE_RXCFG, 0x40C00800);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V3;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x40C00F00);
                 break;
         case 0x64100000:
                 sc->re_type = MACFG_83;
                 sc->max_jumbo_frame_size = Jumbo_Frame_9k;
-                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM | RL_FLAG_MAGIC_PACKET_V3;
-                CSR_WRITE_4(sc, RE_RXCFG, 0x40C00800);
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V3;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x40C00F00);
+                break;
+        case 0x64800000:
+                sc->re_type = MACFG_90;
+                sc->max_jumbo_frame_size = Jumbo_Frame_9k;
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V3;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x40C00F00);
+                break;
+        case 0x64900000:
+                sc->re_type = MACFG_91;
+                sc->max_jumbo_frame_size = Jumbo_Frame_9k;
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V3;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x40C00D00);
+                break;
+        case 0x64A00000:
+                sc->re_type = MACFG_92;
+                sc->max_jumbo_frame_size = Jumbo_Frame_9k;
+                sc->re_if_flags |= RL_FLAG_DESCV2 | RL_FLAG_PHYWAKE_PM |
+                                   RL_FLAG_8168G_PLUS | RL_FLAG_MAGIC_PACKET_V3;
+                CSR_WRITE_4(sc, RE_RXCFG, 0x40C00D00);
                 break;
         default:
                 device_printf(dev,"unknown device\n");
@@ -2894,6 +3316,7 @@ static int re_check_mac_version(struct re_softc *sc)
         case RT_DEVICEID_8161:
         case RT_DEVICEID_8162:
         case RT_DEVICEID_8125:
+        case RT_DEVICEID_8126:
                 //do nothing
                 break;
         default:
@@ -2912,6 +3335,7 @@ static void re_init_software_variable(struct re_softc *sc)
         case RT_DEVICEID_8162:
         case RT_DEVICEID_8136:
         case RT_DEVICEID_8125:
+        case RT_DEVICEID_8126:
                 sc->re_if_flags |= RL_FLAG_PCIE;
                 break;
         }
@@ -3068,12 +3492,17 @@ static void re_init_software_variable(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 sc->re_efuse_ver = EFUSE_SUPPORT_V3;
                 break;
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 sc->re_efuse_ver = EFUSE_SUPPORT_V4;
                 break;
         default:
@@ -3082,7 +3511,8 @@ static void re_init_software_variable(struct re_softc *sc)
         }
 
         switch(sc->re_type) {
-        case MACFG_69: {
+        case MACFG_69:
+        case MACFG_76: {
                 u_int16_t ioffset_p3, ioffset_p2, ioffset_p1, ioffset_p0;
                 u_int16_t TmpUshort;
 
@@ -3118,7 +3548,9 @@ static void re_init_software_variable(struct re_softc *sc)
         case MACFG_70:
         case MACFG_71:
         case MACFG_72:
-        case MACFG_73: {
+        case MACFG_73:
+        case MACFG_75:
+        case MACFG_76: {
                 u_int16_t rg_saw_cnt;
 
                 MP_WritePhyUshort(sc, 0x1F, 0x0C42);
@@ -3142,6 +3574,7 @@ static void re_init_software_variable(struct re_softc *sc)
 
         switch (sc->re_type) {
         case MACFG_74:
+        case MACFG_75:
                 sc->RequiredSecLanDonglePatch = FALSE;
                 break;
         }
@@ -3181,10 +3614,15 @@ static void re_init_software_variable(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 sc->re_hw_enable_msi_msix = TRUE;
                 break;
         }
@@ -3242,10 +3680,15 @@ static void re_init_software_variable(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 sc->re_hw_supp_now_is_oob_ver = 1;
                 break;
         }
@@ -3284,6 +3727,7 @@ static void re_init_software_variable(struct re_softc *sc)
                 break;
         case MACFG_68:
         case MACFG_69:
+        case MACFG_76:
                 sc->re_sw_ram_code_ver = NIC_RAMCODE_VERSION_8168H;
                 break;
         case MACFG_70:
@@ -3294,6 +3738,9 @@ static void re_init_software_variable(struct re_softc *sc)
                 break;
         case MACFG_74:
                 sc->re_sw_ram_code_ver = NIC_RAMCODE_VERSION_8168H_6838;
+                break;
+        case MACFG_75:
+                sc->re_sw_ram_code_ver = NIC_RAMCODE_VERSION_8168H_6878B;
                 break;
         case MACFG_80:
                 sc->re_sw_ram_code_ver = NIC_RAMCODE_VERSION_8125A_REV_A;
@@ -3307,6 +3754,16 @@ static void re_init_software_variable(struct re_softc *sc)
         case MACFG_83:
                 sc->re_sw_ram_code_ver = NIC_RAMCODE_VERSION_8125B_REV_B;
                 break;
+        case MACFG_90:
+                sc->re_sw_ram_code_ver = NIC_RAMCODE_VERSION_8126A_REV_A;
+                break;
+        case MACFG_91:
+                sc->re_sw_ram_code_ver = NIC_RAMCODE_VERSION_8126A_REV_B;
+                break;
+        case MACFG_92:
+                sc->re_sw_ram_code_ver = NIC_RAMCODE_VERSION_8126A_REV_C;
+                break;
+
         }
 
         switch (sc->re_type) {
@@ -3316,6 +3773,18 @@ static void re_init_software_variable(struct re_softc *sc)
                    ) {
                         sc->RequirePhyMdiSwapPatch = TRUE;
                 }
+                break;
+        }
+
+        switch (sc->re_type) {
+        case MACFG_80:
+        case MACFG_81:
+        case MACFG_82:
+        case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
+                sc->HwSuppExtendTallyCounterVer = 1;
                 break;
         }
 
@@ -3340,12 +3809,17 @@ static void re_init_software_variable(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 sc->HwSuppMacMcuVer = 1;
                 break;
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 sc->HwSuppMacMcuVer = 2;
                 break;
         }
@@ -3355,6 +3829,9 @@ static void re_init_software_variable(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 sc->MacMcuPageSize = RTL8125_MAC_MCU_PAGE_SIZE;
                 break;
         }
@@ -3388,7 +3865,8 @@ static void re_enable_ocp_phy_power_saving(struct re_softc *sc)
             sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
             sc->re_type == MACFG_70 || sc->re_type == MACFG_71 ||
             sc->re_type == MACFG_72 || sc->re_type == MACFG_73 ||
-            sc->re_type == MACFG_74) {
+            sc->re_type == MACFG_74 || sc->re_type == MACFG_75 ||
+            sc->re_type == MACFG_76) {
                 val = MP_ReadPhyOcpRegWord(sc, 0x0C41, 0x13);
                 if (val != 0x0050) {
                         re_set_phy_mcu_patch_request(sc);
@@ -3417,7 +3895,8 @@ static void re_disable_ocp_phy_power_saving(struct re_softc *sc)
             sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
             sc->re_type == MACFG_70 || sc->re_type == MACFG_71 ||
             sc->re_type == MACFG_72 || sc->re_type == MACFG_73 ||
-            sc->re_type == MACFG_74) {
+            sc->re_type == MACFG_74 || sc->re_type == MACFG_75 ||
+            sc->re_type == MACFG_76) {
                 val = MP_ReadPhyOcpRegWord(sc, 0x0C41, 0x13);
                 if (val != 0x0500) {
                         re_set_phy_mcu_patch_request(sc);
@@ -3451,6 +3930,8 @@ static void re_hw_d3_para(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
@@ -3460,6 +3941,608 @@ static void re_hw_d3_para(struct re_softc *sc)
         }
 }
 
+static void
+re_add_sysctls(struct re_softc *sc)
+{
+        struct sysctl_ctx_list  *ctx;
+        struct sysctl_oid_list  *children;
+
+        ctx = device_get_sysctl_ctx(sc->dev);
+        children = SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev));
+
+        SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "driver_var",
+                        CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
+                        re_sysctl_driver_variable, "I", "Driver Variables Information");
+
+        SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "stats",
+                        CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
+                        re_sysctl_stats, "I", "Statistics Information");
+
+        SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "registers",
+                        CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
+                        re_sysctl_registers, "I", "MAC IO Information");
+
+        SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "eth_phy",
+                        CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
+                        re_sysctl_eth_phy, "I", "Ethernet PHY Information");
+
+        SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "rx_desc",
+                        CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
+                        re_sysctl_dump_rx_desc, "I", "RX Descriptor Information");
+
+        SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "tx_desc",
+                        CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
+                        re_sysctl_dump_tx_desc, "I", "TX Descriptor Information");
+
+        if ((sc->re_if_flags & RL_FLAG_PCIE) != 0) {
+                SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "pcie_phy",
+                                CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
+                                re_sysctl_pcie_phy, "I", "PCIE PHY Information");
+
+                SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "ext_regs",
+                                CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
+                                re_sysctl_extended_registers, "I", "Extended Registers Information");
+
+                SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "pci_regs",
+                                CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
+                                re_sysctl_pci_registers, "I", "PCI Configuration Information");
+
+                SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "msix_tbl",
+                                CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
+                                re_sysctl_msix_tbl, "I", "MSIX Table Information");
+        }
+}
+
+static int
+re_sysctl_driver_variable(SYSCTL_HANDLER_ARGS)
+{
+        struct re_softc         *sc;
+        int                     error, result;
+
+        result = -1;
+        error = sysctl_handle_int(oidp, &result, 0, req);
+        if (error || req->newptr == NULL)
+                return (error);
+
+        if (result == 1) {
+                sc = (struct re_softc *)arg1;
+                RE_LOCK(sc);
+
+                printf("%s Driver Variables:\n", device_get_nameunit(sc->dev));
+
+                printf("driver version\t%s\n", RE_VERSION);
+                printf("if_drv_flags\t0x%08x\n", sc->re_ifp->if_drv_flags);
+                printf("re_type\t%d\n", sc->re_type);
+                printf("re_res_id\t%d\n", sc->re_res_id);
+                printf("re_res_type\t%d\n", sc->re_res_type);
+                printf("re_8169_MacVersion\t%d\n", sc->re_8169_MacVersion);
+                printf("re_8169_PhyVersion\t%d\n", sc->re_8169_PhyVersion);
+                printf("tx buffer numer\t%d\n", RE_TX_BUF_NUM);
+                printf("rx buffer numer\t%d\n", RE_RX_BUF_NUM);
+                printf("rx_cur_index\t%d\n", sc->re_desc.rx_cur_index);
+                printf("tx_cur_index\t%d\n", sc->re_desc.tx_cur_index);
+                printf("tx_last_index\t%d\n", sc->re_desc.tx_last_index);
+                printf("rx_fifo_overflow\t%d\n", sc->rx_fifo_overflow);
+                printf("driver_detach\t%d\n", sc->driver_detach);
+                printf("interface name\tre%d\n", sc->re_unit);
+                printf("re_revid\t0x%02x\n", sc->re_revid);
+                printf("re_vendor_id\t0x%04x\n", sc->re_vendor_id);
+                printf("re_device_id\t0x%04x\n", sc->re_device_id);
+                printf("re_subvendor_id\t0x%04x\n", sc->re_subvendor_id);
+                printf("re_subdevice_id\t0x%04x\n", sc->re_subdevice_id);
+                printf("max_jumbo_frame_size\t%d\n", sc->max_jumbo_frame_size);
+                printf("re_rx_mbuf_sz\t%d\n", sc->re_rx_mbuf_sz);
+                printf("re_rx_desc_buf_sz\t%d\n", sc->re_rx_desc_buf_sz);
+                printf("re_if_flags\t0x%08x\n", sc->re_if_flags);
+                printf("re_tx_cstag\t%d\n", sc->re_tx_cstag);
+                printf("re_rx_cstag\t%d\n", sc->re_rx_cstag);
+                printf("RequireAdcBiasPatch\t%d\n", sc->RequireAdcBiasPatch);
+                printf("RequireAdjustUpsTxLinkPulseTiming\t%d\n", sc->RequireAdjustUpsTxLinkPulseTiming);
+                printf("RequiredSecLanDonglePatch\t%d\n", sc->RequiredSecLanDonglePatch);
+                printf("RequirePhyMdiSwapPatch\t%d\n", sc->RequirePhyMdiSwapPatch);
+                printf("re_efuse_ver\t%d\n", sc->re_efuse_ver);
+                printf("re_sw_ram_code_ver\t0x%x\n", sc->re_sw_ram_code_ver);
+                printf("re_hw_ram_code_ver\t0x%x\n", sc->re_hw_ram_code_ver);
+                printf("cur_page\t0x%x\n", sc->cur_page);
+                printf("phy_reg_anlpar\t0x%x\n", sc->phy_reg_anlpar);
+                printf("re_hw_enable_msi_msix\t%d\n", sc->re_hw_enable_msi_msix);
+                printf("re_coalesce_tx_pkt\t%d\n", sc->re_coalesce_tx_pkt);
+                printf("link_state\t%s\n", sc->link_state==2?"up":(sc->link_state==1?"down":"unknown"));
+                printf("prohibit_access_reg\t%d\n", sc->prohibit_access_reg);
+                printf("re_hw_supp_now_is_oob_ver\t%d\n", sc->re_hw_supp_now_is_oob_ver);
+                printf("hw_hw_supp_serdes_phy_ver\t%d\n", sc->hw_hw_supp_serdes_phy_ver);
+                printf("HwSuppDashVer\t%d\n", sc->HwSuppDashVer);
+                printf("re_dash\t%d\n", sc->re_dash);
+                printf("HwPkgDet\t%d\n", sc->HwPkgDet);
+                printf("HwFiberModeVer\t%d\n", sc->HwFiberModeVer);
+                printf("HwFiberStat\t%d\n", sc->HwFiberStat);
+                printf("HwSuppExtendTallyCounterVer\t%d\n", sc->HwSuppExtendTallyCounterVer);
+                printf("HwSuppMacMcuVer\t%d\n", sc->HwSuppMacMcuVer);
+                printf("MacMcuPageSize\t%d\n", sc->MacMcuPageSize);
+                printf("rx_desc_tag maxsize\t%ld\n", sc->re_desc.rx_desc_tag->common.maxsize);
+                printf("tx_desc_tag maxsize\t%ld\n", sc->re_desc.tx_desc_tag->common.maxsize);
+                printf("re_tally maxsize\t%ld\n", sc->re_tally.re_stag->common.maxsize);
+                printf("random_mac\t%d\n", sc->random_mac);
+                printf("org_mac_addr\t%6D\n", sc->org_mac_addr, ":");
+#if OS_VER < VERSION(6,0)
+                printf("dev_addr\t%6D\n", (char *)&sc->arpcom.ac_enaddr, ":");
+#elif OS_VER < VERSION(7,0)
+                printf("dev_addr\t%6D\n", IFP2ENADDR(sc->re_ifp), ":");
+#else
+                printf("dev_addr\t%6D\n", IF_LLADDR(sc->re_ifp), ":");
+#endif
+                printf("msi_disable\t%d\n", msi_disable);
+                printf("msix_disable\t%d\n", msix_disable);
+                printf("eee_enable\t%d\n", eee_enable);
+                printf("prefer_iomap\t%d\n", prefer_iomap);
+                printf("phy_power_saving\t%d\n", phy_power_saving);
+                printf("phy_mdix_mode\t%d\n", phy_mdix_mode);
+                printf("s5wol\t%d\n", s5wol);
+                printf("s0_magic_packet\t%d\n", s0_magic_packet);
+                printf("config_soc_lan\t%d\n", config_soc_lan);
+                printf("interrupt_mitigation\t%d\n", interrupt_mitigation);
+                printf("re_lro_entry_count\t%d\n", re_lro_entry_count);
+                printf("re_lro_mbufq_depth\t%d\n", re_lro_mbufq_depth);
+
+                RE_UNLOCK(sc);
+        }
+
+        return (error);
+}
+
+static int
+re_sysctl_stats(SYSCTL_HANDLER_ARGS)
+{
+        struct re_softc         *sc;
+        struct re_stats         *stats;
+        int                     error, i, result;
+        bool                    extend_stats;
+
+        result = -1;
+        error = sysctl_handle_int(oidp, &result, 0, req);
+        if (error || req->newptr == NULL)
+                return (error);
+
+        if (result == 1) {
+                sc = (struct re_softc *)arg1;
+                RE_LOCK(sc);
+                extend_stats = false;
+                if (sc->HwSuppExtendTallyCounterVer > 0)
+                        extend_stats = true;
+                if ((sc->re_ifp->if_drv_flags & IFF_DRV_RUNNING) == 0) {
+                        RE_UNLOCK(sc);
+                        goto done;
+                }
+
+                if (extend_stats)
+                        SetMcuAccessRegBit(sc, 0xEA84, (BIT_1 | BIT_0));
+
+                bus_dmamap_sync(sc->re_tally.re_stag,
+                                sc->re_tally.re_smap, BUS_DMASYNC_PREREAD);
+                CSR_WRITE_4(sc, RE_DUMPSTATS_HI,
+                            RL_ADDR_HI(sc->re_tally.re_stats_addr));
+                CSR_WRITE_4(sc, RE_DUMPSTATS_LO,
+                            RL_ADDR_LO(sc->re_tally.re_stats_addr));
+                CSR_WRITE_4(sc, RE_DUMPSTATS_LO,
+                            RL_ADDR_LO(sc->re_tally.re_stats_addr |
+                                       RE_DUMPSTATS_START));
+                for (i = RE_TIMEOUT; i > 0; i--) {
+                        if ((CSR_READ_4(sc, RE_DUMPSTATS_LO) &
+                             RE_DUMPSTATS_START) == 0)
+                                break;
+                        DELAY(1000);
+                }
+                bus_dmamap_sync(sc->re_tally.re_stag,
+                                sc->re_tally.re_smap, BUS_DMASYNC_POSTREAD);
+
+                if (extend_stats)
+                        ClearMcuAccessRegBit(sc, 0xEA84, (BIT_1 | BIT_0));
+
+                RE_UNLOCK(sc);
+                if (i == 0) {
+                        device_printf(sc->dev,
+                                      "DUMP statistics request timed out\n");
+                        return (ETIMEDOUT);
+                }
+done:
+                stats = sc->re_tally.re_stats;
+                printf("%s statistics:\n", device_get_nameunit(sc->dev));
+                printf("Tx frames : %ju\n",
+                       (uintmax_t)le64toh(stats->re_tx_pkts));
+                printf("Rx frames : %ju\n",
+                       (uintmax_t)le64toh(stats->re_rx_pkts));
+                printf("Tx errors : %ju\n",
+                       (uintmax_t)le64toh(stats->re_tx_errs));
+                printf("Rx errors : %u\n",
+                       le32toh(stats->re_rx_errs));
+                printf("Rx missed frames : %u\n",
+                       (uint32_t)le16toh(stats->re_missed_pkts));
+                printf("Rx frame alignment errs : %u\n",
+                       (uint32_t)le16toh(stats->re_rx_framealign_errs));
+                printf("Tx single collisions : %u\n",
+                       le32toh(stats->re_tx_onecoll));
+                printf("Tx multiple collisions : %u\n",
+                       le32toh(stats->re_tx_multicolls));
+                printf("Rx unicast frames : %ju\n",
+                       (uintmax_t)le64toh(stats->re_rx_ucasts));
+                printf("Rx broadcast frames : %ju\n",
+                       (uintmax_t)le64toh(stats->re_rx_bcasts));
+                printf("Rx multicast frames : %u\n",
+                       le32toh(stats->re_rx_mcasts));
+                printf("Tx aborts : %u\n",
+                       (uint32_t)le16toh(stats->re_tx_aborts));
+                printf("Tx underruns : %u\n",
+                       (uint32_t)le16toh(stats->re_rx_underruns));
+
+                if (extend_stats) {
+                        printf("%s extend statistics:\n", device_get_nameunit(sc->dev));
+                        printf("Tx octets : %ju\n",
+                               (uintmax_t)le64toh(stats->re_tx_octets));
+                        printf("Rx octets : %ju\n",
+                               (uintmax_t)le64toh(stats->re_rx_octets));
+                        printf("Rx multicast64 : %ju\n",
+                               (uintmax_t)le64toh(stats->re_rx_multicast64));
+                        printf("Rx unicast64 : %ju\n",
+                               (uintmax_t)le64toh(stats->re_tx_unicast64));
+                        printf("Tx broadcast64 : %ju\n",
+                               (uintmax_t)le64toh(stats->re_tx_broadcast64));
+                        printf("Tx multicast64 : %ju\n",
+                               (uintmax_t)le64toh(stats->re_tx_multicast64));
+                        printf("Tx pause on frames : %u\n",
+                               (uint32_t)le32toh(stats->re_tx_pause_on));
+                        printf("TTx pause off frames : %u\n",
+                               (uint32_t)le32toh(stats->re_tx_pause_off));
+                        printf("Tx pause all frames : %u\n",
+                               (uint32_t)le32toh(stats->re_tx_pause_all));
+                        printf("Tx deferred frames : %u\n",
+                               (uint32_t)le32toh(stats->re_tx_deferred));
+                        printf("Tx late collisions : %u\n",
+                               (uint32_t)le32toh(stats->re_tx_late_collision));
+                        printf("Tx all collisions : %u\n",
+                               (uint32_t)le32toh(stats->re_tx_all_collision));
+                        printf("Tx aborts32 : %u\n",
+                               (uint32_t)le32toh(stats->re_tx_aborted32));
+                        printf("Rx alignment errs32 : %u\n",
+                               (uint32_t)le32toh(stats->re_align_errors32));
+                        printf("Rx frame too long : %u\n",
+                               (uint32_t)le32toh(stats->re_rx_frame_too_long));
+                        printf("Rx runt : %u\n",
+                               (uint32_t)le32toh(stats->re_rx_runt));
+                        printf("Rx pause on frames : %u\n",
+                               (uint32_t)le32toh(stats->re_rx_pause_on));
+                        printf("Rx pause off frames : %u\n",
+                               (uint32_t)le32toh(stats->re_rx_pause_off));
+                        printf("Rx pause all frames : %u\n",
+                               (uint32_t)le32toh(stats->re_rx_pause_all));
+                        printf("Rx unknown opcode : %u\n",
+                               (uint32_t)le32toh(stats->re_rx_unknown_opcode));
+                        printf("Rx mac error : %u\n",
+                               (uint32_t)le32toh(stats->re_rx_mac_error));
+                        printf("Tx underruns32 : %u\n",
+                               (uint32_t)le32toh(stats->re_tx_underrun32));
+                        printf("Rx mac missed : %u\n",
+                               (uint32_t)le32toh(stats->re_rx_mac_missed));
+                        printf("Rx tcam drops : %u\n",
+                               (uint32_t)le32toh(stats->re_rx_tcam_dropped));
+                        printf("Tx desc unavailable : %u\n",
+                               (uint32_t)le32toh(stats->re_tdu));
+                        printf("Rx desc unavailable : %u\n",
+                               (uint32_t)le32toh(stats->re_rdu));
+                }
+        }
+
+        return (error);
+}
+
+static int
+re_sysctl_registers(SYSCTL_HANDLER_ARGS)
+{
+        struct re_softc         *sc;
+        int                     error, i, n, max, result;
+
+        result = -1;
+        error = sysctl_handle_int(oidp, &result, 0, req);
+        if (error || req->newptr == NULL)
+                return (error);
+
+        if (result == 1) {
+                sc = (struct re_softc *)arg1;
+                RE_LOCK(sc);
+
+                printf("%s mac io:\n", device_get_nameunit(sc->dev));
+
+                max = 256;
+                for (n=0; n<max;) {
+                        printf("\n0x%02x:\t", n);
+
+                        for (i=0; i<16 && n<max; i++, n++)
+                                printf("%02x ", CSR_READ_1(sc, n));
+                }
+
+                RE_UNLOCK(sc);
+        }
+
+        return (error);
+}
+
+static int
+re_sysctl_eth_phy(SYSCTL_HANDLER_ARGS)
+{
+        struct re_softc         *sc;
+        int                     error, i, n, max, result;
+
+        result = -1;
+        error = sysctl_handle_int(oidp, &result, 0, req);
+        if (error || req->newptr == NULL)
+                return (error);
+
+        if (result == 1) {
+                sc = (struct re_softc *)arg1;
+                RE_LOCK(sc);
+
+                printf("%s ethernet phy:\n", device_get_nameunit(sc->dev));
+
+                max = 16;
+                MP_WritePhyUshort(sc, 0x1F, 0x0000);
+                for (n=0; n<max;) {
+                        printf("\n0x%02x:\t", n);
+
+                        for (i = 0; i < 8 && n < max; i++, n++)
+                                printf("%04x ", MP_ReadPhyUshort(sc, n));
+                }
+
+                RE_UNLOCK(sc);
+        }
+
+        return (error);
+}
+
+static void
+re_dump_desc(void *desc_base, uint32_t alloc_size)
+{
+        uint32_t *pdword;
+        int i;
+
+        if (desc_base == NULL ||
+            alloc_size == 0)
+                return;
+
+        pdword = (uint32_t*)desc_base;
+        for (i=0; i<(alloc_size/4); i++) {
+                if (!(i % 4))
+                        printf("\n%04x ", i);
+                printf("%08x ", pdword[i]);
+        }
+
+        printf("\n");
+        return;
+}
+
+static int
+re_sysctl_dump_rx_desc(SYSCTL_HANDLER_ARGS)
+{
+        struct re_softc         *sc;
+        bus_size_t              rx_list_size;
+        int                     error, result;
+
+        result = -1;
+        error = sysctl_handle_int(oidp, &result, 0, req);
+        if (error || req->newptr == NULL)
+                return (error);
+
+        if (result == 1) {
+                sc = (struct re_softc *)arg1;
+                RE_LOCK(sc);
+
+                printf("%s rx desc:%d\n", device_get_nameunit(sc->dev),
+                       RE_RX_BUF_NUM);
+
+                rx_list_size = sc->re_desc.rx_desc_tag->common.maxsize;
+                re_dump_desc((void*)sc->re_desc.rx_desc, rx_list_size);
+
+                RE_UNLOCK(sc);
+        }
+
+        return (error);
+}
+
+static int
+re_sysctl_dump_tx_desc(SYSCTL_HANDLER_ARGS)
+{
+        struct re_softc         *sc;
+        bus_size_t              tx_list_size;
+        int                     error, result;
+
+        result = -1;
+        error = sysctl_handle_int(oidp, &result, 0, req);
+        if (error || req->newptr == NULL)
+                return (error);
+
+        if (result == 1) {
+                sc = (struct re_softc *)arg1;
+                RE_LOCK(sc);
+
+                printf("%s tx desc:%d\n", device_get_nameunit(sc->dev),
+                       RE_TX_BUF_NUM);
+
+                tx_list_size = sc->re_desc.tx_desc_tag->common.maxsize;
+                re_dump_desc((void*)sc->re_desc.tx_desc, tx_list_size);
+
+                RE_UNLOCK(sc);
+        }
+
+        return (error);
+}
+
+static int
+re_sysctl_pcie_phy(SYSCTL_HANDLER_ARGS)
+{
+        struct re_softc         *sc;
+        int                     error, i, n, max, result;
+
+        result = -1;
+        error = sysctl_handle_int(oidp, &result, 0, req);
+        if (error || req->newptr == NULL)
+                return (error);
+
+        if (result == 1) {
+                sc = (struct re_softc *)arg1;
+                RE_LOCK(sc);
+
+                printf("%s pcie phy:\n", device_get_nameunit(sc->dev));
+
+                max = 31;
+                for (n=0; n<max;) {
+                        printf("\n0x%02x:\t", n);
+
+                        for (i = 0; i < 8 && n < max; i++, n++)
+                                printf("%04x ", MP_ReadEPhyUshort(sc, n));
+                }
+
+                RE_UNLOCK(sc);
+        }
+
+        return (error);
+}
+
+static int
+re_sysctl_extended_registers(SYSCTL_HANDLER_ARGS)
+{
+        struct re_softc         *sc;
+        int                     error, i, n, max, result;
+
+        result = -1;
+        error = sysctl_handle_int(oidp, &result, 0, req);
+        if (error || req->newptr == NULL)
+                return (error);
+
+        if (result == 1) {
+                sc = (struct re_softc *)arg1;
+                RE_LOCK(sc);
+
+                printf("%s extended registers:\n", device_get_nameunit(sc->dev));
+
+                max = 0x100;
+                for (n=0; n<max;) {
+                        printf("\n0x%02x:\t", n);
+
+                        for (i = 0; i < 4 && n < max; i++, n+=4)
+                                printf("%08x ", re_eri_read(sc, n, 4, ERIAR_ExGMAC));
+                }
+
+                RE_UNLOCK(sc);
+        }
+
+        return (error);
+}
+
+static int
+re_sysctl_pci_registers(SYSCTL_HANDLER_ARGS)
+{
+        struct re_softc         *sc;
+        int                     error, i, n, max, result;
+
+        result = -1;
+        error = sysctl_handle_int(oidp, &result, 0, req);
+        if (error || req->newptr == NULL)
+                return (error);
+
+        if (result == 1) {
+                sc = (struct re_softc *)arg1;
+                RE_LOCK(sc);
+
+                printf("%s pci registers:\n", device_get_nameunit(sc->dev));
+
+                max = 0x100;
+                for (n=0; n<max;) {
+                        printf("\n0x%03x:\t", n);
+
+                        for (i = 0; i < 4 && n < max; i++, n+=4)
+                                printf("%08x ", MP_ReadPciEConfigSpace(sc, n | 0xF000));
+                }
+
+                n = 0x108;
+                printf("\n0x%03x:\t%08x ", n, MP_ReadPciEConfigSpace(sc, n | 0xF000));
+
+                n = 0x110;
+                printf("\n0x%03x:\t%08x ", n, MP_ReadPciEConfigSpace(sc, n | 0xF000));
+
+                switch(sc->re_type) {
+                case MACFG_62:
+                case MACFG_67:
+                case MACFG_68:
+                case MACFG_69:
+                case MACFG_74:
+                case MACFG_75:
+                case MACFG_76:
+                        n = 0x180;
+                        break;
+                case MACFG_70:
+                case MACFG_71:
+                case MACFG_72:
+                case MACFG_73:
+                case MACFG_82:
+                case MACFG_83:
+                        n = 0x214;
+                        break;
+                case MACFG_80:
+                case MACFG_81:
+                        n = 0x264;
+                        break;
+                case MACFG_90:
+                case MACFG_91:
+                case MACFG_92:
+                        n = 0x22C;
+                        break;
+                default:
+                        n =  0;
+                        break;
+                }
+                if (n > 0)
+                        printf("\n0x%03x:\t%08x ", n, MP_ReadOtherFunPciEConfigSpace(sc, 0, n | 0xF000));
+
+                n = 0x70c;
+                printf("\n0x%03x:\t%08x ", n, MP_ReadPciEConfigSpace(sc, n | 0xF000));
+
+                RE_UNLOCK(sc);
+        }
+
+        return (error);
+}
+
+static int
+re_sysctl_msix_tbl(SYSCTL_HANDLER_ARGS)
+{
+        struct re_softc         *sc;
+        int                     error, i, j, result;
+
+        result = -1;
+        error = sysctl_handle_int(oidp, &result, 0, req);
+        if (error || req->newptr == NULL)
+                return (error);
+
+        if (result == 1) {
+                sc = (struct re_softc *)arg1;
+                RE_LOCK(sc);
+
+                printf("%s msix table:\n", device_get_nameunit(sc->dev));
+
+                for (i=0; i<4; i++) {
+                        printf("\n0x%04x:\t", i);
+
+                        for (j=0; j<4; j++)
+                                printf("%08x ",
+                                       re_eri_read(
+                                               sc, i*0x10 + 4 * j, 4,
+                                               ERIAR_MSIX));
+                }
+
+                RE_UNLOCK(sc);
+        }
+
+        return (error);
+}
+
 /*
 * Attach the interface. Allocate softc structures, do ifmedia
 * setup and ethernet/BPF attach.
@@ -3467,14 +4550,12 @@ static void re_hw_d3_para(struct re_softc *sc)
 static int re_attach(device_t dev)
 {
         /*int			s;*/
+        bus_size_t		rx_list_size, tx_list_size;
         u_char			eaddr[ETHER_ADDR_LEN];
         u_int32_t		command;
         struct re_softc		*sc;
         struct ifnet		*ifp;
-        int			unit, error = 0, rid, i;
-//	int			mac_version;
-//	int			mode;
-//	u_int8_t		data8;
+        int			unit, error = 0, rid;
         int     reg;
         int		msic=0, msixc=0;
 
@@ -3687,6 +4768,7 @@ static int re_attach(device_t dev)
 #if OS_VER < VERSION(6,0)
         bcopy(eaddr, (char *)&sc->arpcom.ac_enaddr, ETHER_ADDR_LEN);
 #endif
+        bcopy(eaddr, (char *)&sc->org_mac_addr, ETHER_ADDR_LEN);
 
         if (sc->re_type == MACFG_3) {	/* Change PCI Latency time*/
                 pci_write_config(dev, RE_PCI_LATENCY_TIMER, 0x40, 1);
@@ -3709,16 +4791,16 @@ static int re_attach(device_t dev)
                         NULL, NULL,			/* lockfunc, lockarg */
                         &sc->re_parent_tag);
 
-        i = roundup2(sizeof(union RxDesc)*RE_RX_BUF_NUM, RE_DESC_ALIGN);
+        rx_list_size = sizeof(union RxDesc) * (RE_RX_BUF_NUM + 1);
         error = bus_dma_tag_create(
                         sc->re_parent_tag,
                         RE_DESC_ALIGN, 0,		/* alignment, boundary */
                         BUS_SPACE_MAXADDR,		/* lowaddr */
                         BUS_SPACE_MAXADDR,		/* highaddr */
                         NULL, NULL,			/* filter, filterarg */
-                        i,				/* maxsize */
+                        rx_list_size,				/* maxsize */
                         1,				/* nsegments */
-                        i,				/* maxsegsize */
+                        rx_list_size,				/* maxsegsize */
                         0,				/* flags */
                         NULL, NULL,			/* lockfunc, lockarg */
                         &sc->re_desc.rx_desc_tag);
@@ -3736,16 +4818,16 @@ static int re_attach(device_t dev)
                 goto fail;
         }
 
-        i = roundup2(sizeof(union TxDesc)*RE_TX_BUF_NUM, RE_DESC_ALIGN);
+        tx_list_size = sizeof(union TxDesc) * (RE_TX_BUF_NUM + 1);
         error = bus_dma_tag_create(
                         sc->re_parent_tag,
                         RE_DESC_ALIGN, 0,		/* alignment, boundary */
                         BUS_SPACE_MAXADDR,		/* lowaddr */
                         BUS_SPACE_MAXADDR,		/* highaddr */
                         NULL, NULL,			/* filter, filterarg */
-                        i,				/* maxsize */
+                        tx_list_size,				/* maxsize */
                         1,				/* nsegments */
-                        i,				/* maxsegsize */
+                        tx_list_size,				/* maxsegsize */
                         0,				/* flags */
                         NULL, NULL,			/* lockfunc, lockarg */
                         &sc->re_desc.tx_desc_tag);
@@ -3766,6 +4848,11 @@ static int re_attach(device_t dev)
 
         sc->re_tx_cstag =1;
         sc->re_rx_cstag =1;
+
+        error = re_alloc_stats(dev, sc);
+        if (error)
+                goto fail;
+        re_add_sysctls(sc);
 
 #if OS_VER < VERSION(6,0)
         ifp = &sc->arpcom.ac_if;
@@ -3796,19 +4883,40 @@ static int re_attach(device_t dev)
                 ifp->if_hwassist |= CSUM_TCP | CSUM_UDP;
         else
                 ifp->if_hwassist |= RE_CSUM_FEATURES;
-
-        ifp->if_capabilities = IFCAP_HWCSUM;
-        ifp->if_capenable = ifp->if_capabilities;
+        ifp->if_capabilities = IFCAP_HWCSUM | IFCAP_HWCSUM_IPV6;
+        /* TSO capability setup */
+        if (sc->re_if_flags & RL_FLAG_8168G_PLUS) {
+                ifp->if_hwassist |= CSUM_TSO;
+                ifp->if_capabilities |= IFCAP_TSO;
+        }
+        /* RTL8169/RTL8101E/RTL8168B not support TSO v6 */
+        if (!(sc->re_if_flags & RL_FLAG_DESCV2)) {
+                ifp->if_hwassist &= ~(CSUM_IP6_TSO |
+                                      CSUM_TCP_IPV6 |
+                                      CSUM_UDP_IPV6);
+                ifp->if_capabilities &= ~(IFCAP_TSO6 | IFCAP_HWCSUM_IPV6);
+        }
         ifp->if_init = re_init;
         /* VLAN capability setup */
         ifp->if_capabilities |= IFCAP_VLAN_MTU | IFCAP_VLAN_HWTAGGING;
-        ifp->if_capenable = ifp->if_capabilities;
+        /* LRO capability setup */
+        ifp->if_capabilities |= IFCAP_LRO;
 
         /* Enable WOL if PM is supported. */
         if (pci_find_cap(sc->dev, PCIY_PMG, &reg) == 0)
                 ifp->if_capabilities |= IFCAP_WOL;
         ifp->if_capenable = ifp->if_capabilities;
         ifp->if_capenable &= ~(IFCAP_WOL_UCAST | IFCAP_WOL_MCAST);
+        /*
+         * Default disable ipv6 tso.
+         */
+        ifp->if_hwassist &= ~CSUM_IP6_TSO;
+        ifp->if_capenable &= ~IFCAP_TSO6;
+
+        /* Not enable LRO for OS version lower than 11.0 */
+#if OS_VER < VERSION(11,0)
+        ifp->if_capenable &= ~IFCAP_LRO;
+#endif
 
         RE_LOCK(sc);
         re_phy_power_up(dev);
@@ -3822,12 +4930,16 @@ static int re_attach(device_t dev)
                 RE_UNLOCK(sc);
                 goto fail;
         }
+
         /* Init descriptors. */
         re_var_init(sc);
 
         RE_UNLOCK(sc);
 
         switch(sc->re_device_id) {
+        case RT_DEVICEID_8126:
+                ifp->if_baudrate = 50000000000;
+                break;
         case RT_DEVICEID_8125:
                 ifp->if_baudrate = 25000000000;
                 break;
@@ -3851,10 +4963,14 @@ static int re_attach(device_t dev)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 sc->ifmedia_upd = re_ifmedia_upd_8125;
                 sc->ifmedia_sts = re_ifmedia_sts_8125;
                 sc->intr = re_intr_8125;
                 sc->int_task = re_int_task_8125;
+                sc->int_task_poll = re_int_task_8125_poll;
                 sc->hw_start_unlock = re_hw_start_unlock_8125;
                 break;
         default:
@@ -3862,12 +4978,19 @@ static int re_attach(device_t dev)
                 sc->ifmedia_sts = re_ifmedia_sts;
                 sc->intr = re_intr;
                 sc->int_task = re_int_task;
+                sc->int_task_poll = re_int_task_poll;
                 sc->hw_start_unlock = re_hw_start_unlock;
                 break;
         }
 
+        error = re_config_soft_lro(sc);
+
+        if (error)
+                goto fail;
+
 #if OS_VER>=VERSION(7,0)
         TASK_INIT(&sc->re_inttask, 0, sc->int_task, sc);
+        TASK_INIT(&sc->re_inttask_poll, 0, sc->int_task_poll, sc);
 #endif
 
         /*
@@ -3909,18 +5032,21 @@ static int re_attach(device_t dev)
         ifmedia_add(&sc->media, IFM_ETHER | IFM_100_TX | IFM_FDX, 0, NULL);
         switch(sc->re_device_id) {
         case RT_DEVICEID_8125:
+        case RT_DEVICEID_8126:
         case RT_DEVICEID_8169:
         case RT_DEVICEID_8169SC:
         case RT_DEVICEID_8168:
         case RT_DEVICEID_8161:
         case RT_DEVICEID_8162:
                 ifmedia_add(&sc->media, IFM_ETHER | IFM_1000_T | IFM_FDX, 0, NULL);
-                //ifmedia_add(&sc->media, IFM_ETHER | IFM_1000_T, 0, NULL);
                 break;
         default:
                 break;
         }
         switch(sc->re_device_id) {
+        case RT_DEVICEID_8126:
+                ifmedia_add(&sc->media, IFM_ETHER | IFM_5000_T | IFM_FDX, 0, NULL);
+        /*	FALLTHROUGH */
         case RT_DEVICEID_8125:
                 ifmedia_add(&sc->media, IFM_ETHER | IFM_2500_T | IFM_FDX, 0, NULL);
                 break;
@@ -3953,6 +5079,8 @@ static int re_detach(device_t dev)
 
         ifp = RE_GET_IFNET(sc);
 
+        re_free_soft_lro(sc);
+
         /* These should only be active if attach succeeded */
         if (device_is_attached(dev)) {
                 RE_LOCK(sc);
@@ -3960,6 +5088,7 @@ static int re_detach(device_t dev)
                 RE_UNLOCK(sc);
 #if OS_VER>=VERSION(7,0)
                 taskqueue_drain(taskqueue_fast, &sc->re_inttask);
+                taskqueue_drain(taskqueue_fast, &sc->re_inttask_poll);
 #endif
 #if OS_VER < VERSION(4,9)
                 ether_ifdetach(ifp, ETHER_BPF_SUPPORTED);
@@ -4049,6 +5178,18 @@ static int re_detach(device_t dev)
                                 sc->re_desc.tx_desc,
                                 sc->re_desc.tx_desc_dmamap);
                 bus_dma_tag_destroy(sc->re_desc.tx_desc_tag);
+        }
+
+        /* Unload and free the stats buffer and map */
+
+        if (sc->re_tally.re_stag) {
+                if (sc->re_tally.re_stats_addr)
+                        bus_dmamap_unload(sc->re_tally.re_stag,
+                                          sc->re_tally.re_smap);
+                if (sc->re_tally.re_stats)
+                        bus_dmamem_free(sc->re_tally.re_stag,
+                                        sc->re_tally.re_stats, sc->re_tally.re_smap);
+                bus_dma_tag_destroy(sc->re_tally.re_stag);
         }
 
         if (sc->re_parent_tag) {
@@ -4193,6 +5334,34 @@ SetPCIePhyBit(
                              );
 }
 
+static void
+re_set_offset70f(struct re_softc *sc, u_int8_t setting)
+{
+        //Set PCI configuration space offset 0x79 to setting
+        u_int32_t data32;
+
+        data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
+        data32 &= 0x00FFFFFF;
+        data32 |= (setting << 24);
+        MP_WritePciEConfigSpace(sc, 0x870c, data32);
+}
+
+static void
+re_set_offset79(struct re_softc *sc, u_int8_t setting)
+{
+        //Set PCI configuration space offset 0x79 to setting
+        u_int8_t data8;
+
+        if (config_soc_lan)
+                return;
+
+        setting &= 0x70;
+        data8 = pci_read_config(sc->dev, 0x79, 1);
+        data8 &= ~0x70;
+        data8 |= setting;
+        pci_write_config(sc->dev, 0x79, data8, 1);
+}
+
 /*
  * Stop all chip I/O so that the kernel's probe routines don't
  * get confused by errant DMAs when rebooting.
@@ -4226,6 +5395,34 @@ device_t		dev;
         RE_UNLOCK(sc);
 
         return 0;
+}
+
+static void re_set_eee_lpi_timer(struct re_softc *sc)
+{
+        struct ifnet		*ifp;
+
+        ifp = RE_GET_IFNET(sc);
+
+        switch (sc->re_type) {
+        case MACFG_68:
+        case MACFG_69:
+        case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
+                MP_WriteMcuAccessRegWord(sc, RE_EEE_TXIDLE_TIMER_8168, ifp->if_mtu + ETHER_HDR_LEN + 0x20);
+                break;
+        case MACFG_80:
+        case MACFG_81:
+        case MACFG_82:
+        case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
+                CSR_WRITE_2(sc, RE_EEE_TXIDLE_TIMER_8125, ifp->if_mtu + ETHER_HDR_LEN + 0x20);
+                break;
+        default:
+                break;
+        }
 }
 
 static void re_hw_start_unlock(struct re_softc *sc)
@@ -4271,9 +5468,10 @@ static void re_hw_start_unlock(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
-                CSR_WRITE_1(sc, RE_CFG5, CSR_READ_1(sc, RE_CFG5) & ~BIT_0);
-                CSR_WRITE_1(sc, RE_CFG2, CSR_READ_1(sc, RE_CFG2) & ~BIT_7);
-                CSR_WRITE_1(sc, 0xF1, CSR_READ_1(sc, 0xF1) & ~BIT_7);
+        case MACFG_75:
+        case MACFG_76:
+                _re_enable_aspm_clkreq_lock(sc, 0);
+                re_enable_force_clkreq(sc, 0);;
                 break;
         }
 
@@ -4281,9 +5479,13 @@ static void re_hw_start_unlock(struct re_softc *sc)
         /*CSR_WRITE_1(sc, RE_LDPS, 0x05);*/
         /*ldps= CSR_READ_1(sc, RE_LDPS);*/
 
-        CSR_WRITE_2(sc, RE_CPlusCmd, 0x2060);
+        re_set_eee_lpi_timer(sc);
 
-        CSR_WRITE_2(sc, RE_IM, 0x5151);
+        CSR_WRITE_2(sc, RE_CPlusCmd, 0x2060);
+        if (interrupt_mitigation)
+                CSR_WRITE_2(sc, RE_IntrMitigate, 0x5f51);
+        else
+                CSR_WRITE_2(sc, RE_IntrMitigate, 0x0000);
 
         CSR_WRITE_1(sc, RE_MTPS, 0x3f);
 
@@ -4342,16 +5544,10 @@ static void re_hw_start_unlock(struct re_softc *sc)
                         pci_write_config(sc->dev, 0x81, 1, 1);
                 }
 
-                data8 = pci_read_config(sc->dev, 0x79, 1);
-                data8 &= ~0x70;
-                data8 |= 0x50;
-                pci_write_config(sc->dev, 0x79, data8, 1);
+                re_set_offset79(sc, 0x40);
 
                 /*set configuration space offset 0x70f to 0x3f*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x3F << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x3F);
 
                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_0);
 
@@ -4389,10 +5585,7 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 pci_write_config(sc->dev, 0x81, 0, 1);
 
                 /*set configuration space offset 0x70f to 0x27*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x27);
 
                 CSR_WRITE_1(sc, RE_CFG1, CSR_READ_1(sc, RE_CFG1)|0x10);
                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_0);
@@ -4416,21 +5609,14 @@ static void re_hw_start_unlock(struct re_softc *sc)
                                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) | BIT_2); //Jumbo_en0
                                 CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) | (1 << 1)); //Jumbo_en1
 
-                                data8 = pci_read_config(sc->dev, 0x79, 1);
-                                data8 &= ~0x70;
-                                data8 |= 0x20;
-                                pci_write_config(sc->dev, 0x79, data8, 1);
+                                re_set_offset79(sc, 0x20);
                                 ifp->if_capenable &= ~IFCAP_HWCSUM;
                                 CSR_WRITE_2 (sc, RE_CPlusCmd,CSR_READ_2(sc, RE_CPlusCmd) & ~RL_RxChkSum);
                                 ifp->if_hwassist &= ~RE_CSUM_FEATURES;
-
                         } else {
                                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_2); //Jumbo_en0
                                 CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) & ~(1 << 1)); //Jumbo_en1
-                                data8 = pci_read_config(sc->dev, 0x79, 1);
-                                data8 &= ~0x70;
-                                data8 |= 0x50;
-                                pci_write_config(sc->dev, 0x79, data8, 1);
+                                re_set_offset79(sc, 0x40);
                                 if (sc->re_tx_cstag) {
                                         ifp->if_capenable |= IFCAP_TXCSUM;
                                         if ((sc->re_type == MACFG_24) || (sc->re_type == MACFG_25) || (sc->re_type == MACFG_26))
@@ -4455,21 +5641,14 @@ static void re_hw_start_unlock(struct re_softc *sc)
                                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) | BIT_2); //Jumbo_en0
                                 CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) | (1<<1)); //Jumbo_en1
 
-                                data8 = pci_read_config(sc->dev, 0x79, 1);
-                                data8 &= ~0x70;
-                                data8 |= 0x20;
-                                pci_write_config(sc->dev, 0x79, data8, 1);
+                                re_set_offset79(sc, 0x20);
                                 ifp->if_capenable &= ~IFCAP_HWCSUM;
                                 CSR_WRITE_2 (sc, RE_CPlusCmd,CSR_READ_2(sc, RE_CPlusCmd) & ~RL_RxChkSum);
                                 ifp->if_hwassist &= ~RE_CSUM_FEATURES;
-
                         } else {
                                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_2); //Jumbo_en0
                                 CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) & ~(1<<1)); //Jumbo_en1
-                                data8 = pci_read_config(sc->dev, 0x79, 1);
-                                data8 &= ~0x70;
-                                data8 |= 0x50;
-                                pci_write_config(sc->dev, 0x79, data8, 1);
+                                re_set_offset79(sc, 0x40);
                                 if (sc->re_tx_cstag) {
                                         ifp->if_capenable |= IFCAP_TXCSUM;
                                         if ((sc->re_type == MACFG_24) || (sc->re_type == MACFG_25) || (sc->re_type == MACFG_26))
@@ -4481,28 +5660,20 @@ static void re_hw_start_unlock(struct re_softc *sc)
                                         ifp->if_capenable |= IFCAP_RXCSUM;
                                         CSR_WRITE_2 (sc, RE_CPlusCmd,CSR_READ_2(sc, RE_CPlusCmd) |RL_RxChkSum);
                                 }
-
-
                         }
                 } else if (sc->re_type == MACFG_26) {
                         if (ifp->if_mtu > ETHERMTU) {
                                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) | BIT_2); //Jumbo_en0
                                 CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) | (1<<1)); //Jumbo_en1
 
-                                data8 = pci_read_config(sc->dev, 0x79, 1);
-                                data8 &= ~0x70;
-                                data8 |= 0x20;
-                                pci_write_config(sc->dev, 0x79, data8, 1);
+                                re_set_offset79(sc, 0x20);
                                 ifp->if_capenable &= ~IFCAP_HWCSUM;
                                 CSR_WRITE_2 (sc, RE_CPlusCmd,CSR_READ_2(sc, RE_CPlusCmd) & ~RL_RxChkSum);
                                 ifp->if_hwassist &= ~RE_CSUM_FEATURES;
                         } else {
                                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_2); //Jumbo_en0
                                 CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) & ~(1<<1)); //Jumbo_en1
-                                data8 = pci_read_config(sc->dev, 0x79, 1);
-                                data8 &= ~0x70;
-                                data8 |= 0x50;
-                                pci_write_config(sc->dev, 0x79, data8, 1);
+                                re_set_offset79(sc, 0x40);
                                 if (sc->re_tx_cstag) {
                                         ifp->if_capenable |= IFCAP_TXCSUM;
                                         if ((sc->re_type == MACFG_24) || (sc->re_type == MACFG_25) || (sc->re_type == MACFG_26))
@@ -4521,10 +5692,7 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 pci_write_config(sc->dev, 0x81, 0x00, 1);
 
                 /*set configuration space offset 0x70f to 0x27*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x27);
 
                 re_eri_write(sc, 0x1EC, 1, 0x07, ERIAR_ASF);
 
@@ -4537,20 +5705,14 @@ static void re_hw_start_unlock(struct re_softc *sc)
                         CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) | BIT_2); //Jumbo_en0
                         CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) | (1<<1)); //Jumbo_en1
 
-                        data8 = pci_read_config(sc->dev, 0x79, 1);
-                        data8 &= ~0x70;
-                        data8 |= 0x20;
-                        pci_write_config(sc->dev, 0x79, data8, 1);
+                        re_set_offset79(sc, 0x20);
                         ifp->if_capenable &= ~IFCAP_HWCSUM;
                         CSR_WRITE_2 (sc, RE_CPlusCmd,CSR_READ_2(sc, RE_CPlusCmd) & ~RL_RxChkSum);
                         ifp->if_hwassist &= ~RE_CSUM_FEATURES;
                 } else {
                         CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_2); //Jumbo_en0
                         CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) & ~(1<<1)); //Jumbo_en1
-                        data8 = pci_read_config(sc->dev, 0x79, 1);
-                        data8 &= ~0x70;
-                        data8 |= 0x50;
-                        pci_write_config(sc->dev, 0x79, data8, 1);
+                        re_set_offset79(sc, 0x40);
                         if (sc->re_tx_cstag) {
                                 ifp->if_capenable |= IFCAP_TXCSUM;
                                 ifp->if_hwassist |= RE_CSUM_FEATURES;
@@ -4565,10 +5727,7 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 pci_write_config(sc->dev, 0x81, 0x00, 1);
 
                 /*set configuration space offset 0x70f to 0x13*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x27);
 
                 CSR_WRITE_1(sc, RE_TDFNR, 0x8);
 
@@ -4583,21 +5742,14 @@ static void re_hw_start_unlock(struct re_softc *sc)
                         CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) | BIT_2); //Jumbo_en0
                         CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) | (1<<1)); //Jumbo_en1
 
-                        data8 = pci_read_config(sc->dev, 0x79, 1);
-                        data8 &= ~0x70;
-                        data8 |= 0x20;
-                        pci_write_config(sc->dev, 0x79, data8, 1);
+                        re_set_offset79(sc, 0x20);
                         ifp->if_capenable &= ~IFCAP_HWCSUM;
                         CSR_WRITE_2 (sc, RE_CPlusCmd,CSR_READ_2(sc, RE_CPlusCmd) & ~RL_RxChkSum);
                         ifp->if_hwassist &= ~RE_CSUM_FEATURES;
-
                 } else {
                         CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_2); //Jumbo_en0
                         CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) & ~(1<<1)); //Jumbo_en1
-                        data8 = pci_read_config(sc->dev, 0x79, 1);
-                        data8 &= ~0x70;
-                        data8 |= 0x50;
-                        pci_write_config(sc->dev, 0x79, data8, 1);
+                        re_set_offset79(sc, 0x40);
                         if (sc->re_tx_cstag) {
                                 ifp->if_capenable |= IFCAP_TXCSUM;
                                 ifp->if_hwassist |= RE_CSUM_FEATURES;
@@ -4642,10 +5794,7 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 pci_write_config(sc->dev, 0x81, 0x00, 1);
 
                 /*set configuration space offset 0x70f to 0x17*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x27);
 
                 CSR_WRITE_1(sc, RE_TDFNR, 0x8);
                 if (sc->re_dash &&
@@ -4661,21 +5810,14 @@ static void re_hw_start_unlock(struct re_softc *sc)
                         CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) | BIT_2); //Jumbo_en0
                         CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) | (1<<1)); //Jumbo_en1
 
-                        data8 = pci_read_config(sc->dev, 0x79, 1);
-                        data8 &= ~0x70;
-                        data8 |= 0x20;
-                        pci_write_config(sc->dev, 0x79, data8, 1);
+                        re_set_offset79(sc, 0x20);
                         ifp->if_capenable &= ~IFCAP_HWCSUM;
                         CSR_WRITE_2 (sc, RE_CPlusCmd,CSR_READ_2(sc, RE_CPlusCmd) & ~RL_RxChkSum);
                         ifp->if_hwassist &= ~RE_CSUM_FEATURES;
-
                 } else {
                         CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_2); //Jumbo_en0
                         CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) & ~(1<<1)); //Jumbo_en1
-                        data8 = pci_read_config(sc->dev, 0x79, 1);
-                        data8 &= ~0x70;
-                        data8 |= 0x50;
-                        pci_write_config(sc->dev, 0x79, data8, 1);
+                        re_set_offset79(sc, 0x40);
                         if (sc->re_tx_cstag) {
                                 ifp->if_capenable |= IFCAP_TXCSUM;
                                 ifp->if_hwassist |= RE_CSUM_FEATURES;
@@ -4708,10 +5850,7 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 pci_write_config(sc->dev, 0x81, 0x00, 1);
 
                 /*set configuration space offset 0x70f to 0x20*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x27);
 
                 CSR_WRITE_1(sc, 0xF3, CSR_READ_1(sc, 0xF3)|0x20);
                 CSR_WRITE_1(sc, 0xF3, CSR_READ_1(sc, 0xF3)& ~0x20);
@@ -4779,10 +5918,7 @@ static void re_hw_start_unlock(struct re_softc *sc)
                                 CSR_WRITE_1 (sc, RE_MTPS, 0x24);
                                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) | BIT_2);
                                 CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) |0x01);
-                                data8 = pci_read_config(sc->dev, 0x79, 1);
-                                data8 &= ~0x70;
-                                data8 |= 0x20;
-                                pci_write_config(sc->dev, 0x79, data8, 1);
+                                re_set_offset79(sc, 0x20);
                                 ifp->if_capenable &= ~IFCAP_HWCSUM;
                                 CSR_WRITE_2 (sc, RE_CPlusCmd,CSR_READ_2(sc, RE_CPlusCmd) & ~RL_RxChkSum);
                                 ifp->if_hwassist &= ~RE_CSUM_FEATURES;
@@ -4790,10 +5926,7 @@ static void re_hw_start_unlock(struct re_softc *sc)
                                 CSR_WRITE_1 (sc, RE_MTPS, 0x0c);
                                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_2);
                                 CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) & ~0x01);
-                                data8 = pci_read_config(sc->dev, 0x79, 1);
-                                data8 &= ~0x70;
-                                data8 |= 0x50;
-                                pci_write_config(sc->dev, 0x79, data8, 1);
+                                re_set_offset79(sc, 0x40);
 
                                 if (sc->re_tx_cstag) {
                                         ifp->if_capenable |= IFCAP_TXCSUM;
@@ -4810,15 +5943,9 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 pci_write_config(sc->dev, 0x81, 0x00, 1);
 
                 /*set configuration space offset 0x70f to 0x27*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x27);
 
-                data8 = pci_read_config(sc->dev, 0x79, 1);
-                data8 &= ~0x70;
-                data8 |= 0x50;
-                pci_write_config(sc->dev, 0x79, data8, 1);
+                re_set_offset79(sc, 0x40);
 
                 CSR_WRITE_1(sc, RE_TDFNR, 0x8);
 
@@ -4885,7 +6012,8 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 CSR_WRITE_1(sc, 0xD0, CSR_READ_1(sc, 0xD0) | BIT_6);
                 CSR_WRITE_1(sc, 0xF2, CSR_READ_1(sc, 0xF2) | BIT_6);
 
-                CSR_WRITE_1 (sc, RE_MTPS, 0x27);
+                if (ifp->if_mtu > ETHERMTU)
+                        CSR_WRITE_1 (sc, RE_MTPS, 0x27);
                 ifp->if_capenable &= ~IFCAP_HWCSUM;
                 ifp->if_hwassist &= ~RE_CSUM_FEATURES;
         } else if (macver == 0x24000000) {
@@ -4895,16 +6023,10 @@ static void re_hw_start_unlock(struct re_softc *sc)
                         CSR_WRITE_1(sc, RE_CFG4, CSR_READ_1(sc, RE_CFG4) | 0x04);
                         pci_write_config(sc->dev, 0x81, 1, 1);
                 }
-                data8 = pci_read_config(sc->dev, 0x79, 1);
-                data8 &= ~0x70;
-                data8 |= 0x50;
-                pci_write_config(sc->dev, 0x79, data8, 1);
+                re_set_offset79(sc, 0x40);
 
                 /*set configuration space offset 0x70f to 0x3F*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x3F << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x3F);
 
                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_0);
 
@@ -4963,18 +6085,13 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 /* set EPHY registers */
                 MP_WriteEPhyUshort(sc, 0x19, 0xFF64);
 
-                CSR_WRITE_1 (sc, RE_MTPS, 0x27);
+                if (ifp->if_mtu > ETHERMTU)
+                        CSR_WRITE_1 (sc, RE_MTPS, 0x27);
         } else if (macver == 0x48000000) {
                 /*set configuration space offset 0x70f to 0x27*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x27);
 
-                data8 = pci_read_config(sc->dev, 0x79, 1);
-                data8 &= ~0x70;
-                data8 |= 0x50;
-                pci_write_config(sc->dev, 0x79, data8, 1);
+                re_set_offset79(sc, 0x40);
 
                 CSR_WRITE_1(sc, RE_TDFNR, 0x8);
 
@@ -5037,7 +6154,8 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 CSR_WRITE_1(sc, 0xD0, CSR_READ_1(sc, 0xD0) | BIT_6);
                 CSR_WRITE_1(sc, 0xF2, CSR_READ_1(sc, 0xF2) | BIT_6);
 
-                CSR_WRITE_1 (sc, RE_MTPS, 0x27);
+                if (ifp->if_mtu > ETHERMTU)
+                        CSR_WRITE_1 (sc, RE_MTPS, 0x27);
 
                 if (ifp->if_mtu > ETHERMTU) {
                         ifp->if_capenable &= ~IFCAP_HWCSUM;
@@ -5053,15 +6171,9 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 }
         } else if (macver == 0x48800000) {
                 /*set configuration space offset 0x70f to 0x27*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x27);
 
-                data8 = pci_read_config(sc->dev, 0x79, 1);
-                data8 &= ~0x70;
-                data8 |= 0x50;
-                pci_write_config(sc->dev, 0x79, data8, 1);
+                re_set_offset79(sc, 0x40);
 
                 CSR_WRITE_1(sc, RE_TDFNR, 0x8);
 
@@ -5119,7 +6231,8 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 CSR_WRITE_1(sc, 0xD0, CSR_READ_1(sc, 0xD0) | BIT_6);
                 CSR_WRITE_1(sc, 0xF2, CSR_READ_1(sc, 0xF2) | BIT_6);
 
-                CSR_WRITE_1 (sc, RE_MTPS, 0x27);
+                if (ifp->if_mtu > ETHERMTU)
+                        CSR_WRITE_1 (sc, RE_MTPS, 0x27);
 
                 if (ifp->if_mtu > ETHERMTU) {
                         ifp->if_capenable &= ~IFCAP_HWCSUM;
@@ -5143,7 +6256,8 @@ static void re_hw_start_unlock(struct re_softc *sc)
 
                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_0);
         } else if (macver == 0x4C000000 || macver == 0x50800000 ||
-                   macver == 0x5C800000 || macver == 0x54000000) {
+                   macver == 0x5C800000 || macver == 0x54000000 ||
+                   macver == 0x6C000000) {
                 CSR_WRITE_1(sc, RE_CFG2, CSR_READ_1(sc, RE_CFG2) | BIT_5);
 
                 if (sc->re_type == MACFG_59) {
@@ -5152,7 +6266,8 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 }
 
                 if (sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
-                    sc->re_type == MACFG_74) {
+                    sc->re_type == MACFG_74 || sc->re_type == MACFG_75 ||
+                    sc->re_type == MACFG_76) {
                         MP_WriteMcuAccessRegWord(sc, 0xD400, MP_ReadMcuAccessRegWord(sc, 0xD400) & ~(BIT_0));
 
                         data16 = MP_ReadMcuAccessRegWord(sc, 0xE63E);
@@ -5169,15 +6284,9 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 }
 
                 /*set configuration space offset 0x70f to 0x17*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x27);
 
-                data8 = pci_read_config(sc->dev, 0x79, 1);
-                data8 &= ~0x70;
-                data8 |= 0x50;
-                pci_write_config(sc->dev, 0x79, data8, 1);
+                re_set_offset79(sc, 0x40);
 
                 CSR_WRITE_1(sc, RE_TDFNR, 0x4);
 
@@ -5193,7 +6302,8 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 re_eri_write(sc, 0xD4, 4, Data32, ERIAR_ExGMAC);
 
                 if (sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
-                    sc->re_type == MACFG_74) {
+                    sc->re_type == MACFG_74 || sc->re_type == MACFG_75 ||
+                    sc->re_type == MACFG_76) {
                         Data32 = re_eri_read(sc, 0xDC, 4, ERIAR_ExGMAC);
                         Data32 |= (BIT_2| BIT_3 | BIT_4);
                         re_eri_write(sc, 0xDC, 4, Data32, ERIAR_ExGMAC);
@@ -5205,7 +6315,8 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 re_eri_write(sc, 0xE8, 4, 0x00100006, ERIAR_ExGMAC);
 
                 if (sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
-                    sc->re_type == MACFG_74) {
+                    sc->re_type == MACFG_74 || sc->re_type == MACFG_75 ||
+                    sc->re_type == MACFG_76) {
                         MP_WriteMcuAccessRegWord(sc, 0xE054, 0x0000);
 
                         Data32 = re_eri_read(sc, 0x5F0, 4, ERIAR_ExGMAC);
@@ -5221,7 +6332,7 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 Data32 |= BIT_0;
                 re_eri_write(sc, 0xdc, 1, Data32, ERIAR_ExGMAC);
 
-                if (sc->re_type == MACFG_74)
+                if (sc->re_type == MACFG_74 || sc->re_type == MACFG_75)
                         SetMcuAccessRegBit(sc, 0xD438, (BIT_1 | BIT_0));
 
                 Data32 = re_eri_read(sc, 0x2FC, 4, ERIAR_ExGMAC);
@@ -5295,7 +6406,8 @@ static void re_hw_start_unlock(struct re_softc *sc)
 
                         SetPCIePhyBit(sc, 0x04, BIT_4);
                         SetPCIePhyBit(sc, 0x1D, BIT_14);
-                } else if (sc->re_type == MACFG_68 || sc->re_type == MACFG_69) {
+                } else if (sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
+                           sc->re_type == MACFG_76) {
                         ClearPCIePhyBit(sc, 0x1E, BIT_11);
 
                         SetPCIePhyBit(sc, 0x1E, BIT_0);
@@ -5307,9 +6419,18 @@ static void re_hw_start_unlock(struct re_softc *sc)
                         MP_WriteEPhyUshort(sc, 0x04, 0x854A);
                         MP_WriteEPhyUshort(sc, 0x01, 0x068B);
                 } else if (sc->re_type == MACFG_74) {
+                        ClearMcuAccessRegBit(sc, 0xD438, BIT_2);
+
+                        ClearPCIePhyBit(sc, 0x24, BIT_9);
                         ClearMcuAccessRegBit(sc, 0xDE28, (BIT_1 | BIT_0));
 
-                        SetMcuAccessRegBit(sc, 0xDE38, (BIT_2));
+                        SetMcuAccessRegBit(sc, 0xD438, BIT_2);
+                } else if (sc->re_type == MACFG_75) {
+                        ClearMcuAccessRegBit(sc, 0xD438, BIT_2);
+
+                        ClearMcuAccessRegBit(sc, 0xDE28, (BIT_1 | BIT_0));
+
+                        SetMcuAccessRegBit(sc, 0xD438, BIT_2);
                 }
 
                 if (sc->re_type == MACFG_60) {
@@ -5325,7 +6446,8 @@ static void re_hw_start_unlock(struct re_softc *sc)
                         data16 = MP_ReadMcuAccessRegWord(sc, 0xD3C4);
                         data16 |= (BIT_0);
                         MP_WriteMcuAccessRegWord(sc, 0xD3C4, data16);
-                } else if (sc->re_type == MACFG_68 || sc->re_type == MACFG_69) {
+                } else if (sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
+                           sc->re_type == MACFG_76) {
                         if (sc->RequireAdjustUpsTxLinkPulseTiming) {
                                 data16 = MP_ReadMcuAccessRegWord(sc, 0xD412);
                                 data16 &= ~(0x0FFF);
@@ -5360,13 +6482,15 @@ static void re_hw_start_unlock(struct re_softc *sc)
 
                 CSR_WRITE_1(sc, 0xF2, CSR_READ_1(sc, 0xF2) & ~BIT_3);
 
-                CSR_WRITE_1 (sc, RE_MTPS, 0x27);
+                if (ifp->if_mtu > ETHERMTU)
+                        CSR_WRITE_1 (sc, RE_MTPS, 0x27);
 
                 if (sc->re_type == MACFG_56 || sc->re_type == MACFG_57 ||
                     sc->re_type == MACFG_58 || sc->re_type == MACFG_59) {
                         MP_WriteMcuAccessRegWord(sc, 0xC140, 0xFFFF);
                 } else if (sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
-                           sc->re_type == MACFG_74) {
+                           sc->re_type == MACFG_74 || sc->re_type == MACFG_75 ||
+                           sc->re_type == MACFG_76) {
                         MP_WriteMcuAccessRegWord(sc, 0xC140, 0xFFFF);
                         MP_WriteMcuAccessRegWord(sc, 0xC142, 0xFFFF);
                 }
@@ -5385,15 +6509,9 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 }
         } else if (macver == 0x50000000) {
                 /*set configuration space offset 0x70f to 0x17*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x27);
 
-                data8 = pci_read_config(sc->dev, 0x79, 1);
-                data8 &= ~0x70;
-                data8 |= 0x50;
-                pci_write_config(sc->dev, 0x79, data8, 1);
+                re_set_offset79(sc, 0x40);
 
                 Data32 = re_eri_read(sc, 0xD4, 4, ERIAR_ExGMAC);
                 Data32 |= BIT_7 | BIT_8 | BIT_9 | BIT_10 | BIT_11 | BIT_12;
@@ -5462,7 +6580,8 @@ static void re_hw_start_unlock(struct re_softc *sc)
 
                 CSR_WRITE_1(sc, 0xF2, CSR_READ_1(sc, 0xF2) & ~BIT_3);
 
-                CSR_WRITE_1 (sc, RE_MTPS, 0x27);
+                if (ifp->if_mtu > ETHERMTU)
+                        CSR_WRITE_1 (sc, RE_MTPS, 0x27);
 
                 if (sc->re_type == MACFG_67) {
                         data16 = MP_ReadMcuAccessRegWord(sc, 0xD3E2);
@@ -5542,15 +6661,9 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 MP_WriteMcuAccessRegWord(sc, 0xC09E, 0x0);
 
                 /*set configuration space offset 0x70f to 0x27*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                re_set_offset70f(sc, 0x27);
 
-                data8 = pci_read_config(sc->dev, 0x79, 1);
-                data8 &= ~0x70;
-                data8 |= 0x50;
-                pci_write_config(sc->dev, 0x79, data8, 1);
+                re_set_offset79(sc, 0x40);
 
                 Data32 = re_eri_read(sc, 0xD4, 4, ERIAR_ExGMAC);
                 Data32 |= BIT_7 | BIT_8 | BIT_9 | BIT_10 | BIT_11 | BIT_12;
@@ -5558,6 +6671,10 @@ static void re_hw_start_unlock(struct re_softc *sc)
                     sc->re_type == MACFG_73)
                         Data32 |= BIT_4;
                 re_eri_write(sc, 0xD4, 4, Data32, ERIAR_ExGMAC);
+
+                Data32 = re_eri_read(sc, 0xDC, 4, ERIAR_ExGMAC);
+                Data32 |= (BIT_2| BIT_3);
+                re_eri_write(sc, 0xDC, 4, Data32, ERIAR_ExGMAC);
 
                 re_eri_write(sc, 0xC8, 4, 0x00080002, ERIAR_ExGMAC);
                 re_eri_write(sc, 0xCC, 1, 0x2F, ERIAR_ExGMAC);
@@ -5647,6 +6764,10 @@ static void re_hw_start_unlock(struct re_softc *sc)
                 }
         }
 
+        if (!((sc->re_if_flags & RL_FLAG_DESCV2) &&
+              (sc->re_if_flags & RL_FLAG_8168G_PLUS)))
+                ifp->if_hwassist &= ~(CSUM_TCP_IPV6 | CSUM_UDP_IPV6);
+
         //clear io_rdy_l23
         switch (sc->re_type) {
         case MACFG_42:
@@ -5670,6 +6791,8 @@ static void re_hw_start_unlock(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_1);
                 break;
         }
@@ -5702,9 +6825,10 @@ static void re_hw_start_unlock(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
-                CSR_WRITE_1(sc, RE_CFG5, CSR_READ_1(sc, RE_CFG5) | BIT_0);
-                CSR_WRITE_1(sc, RE_CFG2, CSR_READ_1(sc, RE_CFG2) | BIT_7);
-                CSR_WRITE_1(sc, 0xF1, CSR_READ_1(sc, 0xF1) & ~BIT_7);
+        case MACFG_75:
+        case MACFG_76:
+                _re_enable_aspm_clkreq_lock(sc, 1);
+                re_enable_force_clkreq(sc, 0);
                 break;
         }
 
@@ -5777,6 +6901,15 @@ static void re_init_unlock(void *xsc)  	/* Software & Hardware Initialize */
          */
         re_stop(sc);
 
+        /*
+        * Disable TSO if interface MTU size is greater than MSS
+        * allowed in controller.
+        */
+        if (ifp->if_mtu > ETHERMTU) {
+                ifp->if_capenable &= ~(IFCAP_TSO | IFCAP_VLAN_HWTSO);
+                ifp->if_hwassist &= ~CSUM_TSO;
+        }
+
         /* Copy MAC address on stack to align. */
 #if OS_VER < VERSION(6,0)
         bcopy((char *)&sc->arpcom.ac_enaddr, eaddr.eaddr, ETHER_ADDR_LEN);
@@ -5815,9 +6948,7 @@ static void re_hw_start_unlock_8125(struct re_softc *sc)
 {
         struct ifnet		*ifp;
         u_int32_t		macver;
-        u_int8_t		data8;
         u_int16_t		data16 = 0;
-        u_int32_t		Data32;
 
         ifp = RE_GET_IFNET(sc);
 
@@ -5826,12 +6957,10 @@ static void re_hw_start_unlock_8125(struct re_softc *sc)
 
         re_enable_cfg9346_write(sc);
 
-        CSR_WRITE_1(sc, RE_CFG5, CSR_READ_1(sc, RE_CFG5) & ~BIT_0);
-        CSR_WRITE_1(sc, RE_CFG2, CSR_READ_1(sc, RE_CFG2) & ~BIT_7);
-        CSR_WRITE_1(sc, 0xF1, CSR_READ_1(sc, 0xF1) & ~BIT_7);
+        _re_enable_aspm_clkreq_lock(sc, 0);
+        re_enable_force_clkreq(sc, 0);;
 
-        //Interrupt Mitigation
-        CSR_WRITE_4(sc, 0x0A00, 0x00630063);
+        re_set_eee_lpi_timer(sc);
 
         CSR_WRITE_2(sc, RE_CPlusCmd, 0x2060);
 
@@ -5839,23 +6968,22 @@ static void re_hw_start_unlock_8125(struct re_softc *sc)
         CSR_WRITE_4(sc, RE_TXCFG, RE_TXCFG_CONFIG);
 
         macver = CSR_READ_4(sc, RE_TXCFG) & 0xFC800000;
-        if (macver == 0x60800000 || macver == 0x64000000) {
+        if (macver == 0x60800000 || macver == 0x64000000 ||
+            macver == 0x64800000) {
                 CSR_WRITE_1(sc, RE_CFG2, CSR_READ_1(sc, RE_CFG2) | BIT_5);
 
                 MP_WriteMcuAccessRegWord(sc, 0xE098, 0xC302);
 
                 /*set configuration space offset 0x70f to 0x17*/
-                Data32 = MP_ReadPciEConfigSpace(sc, 0x870c);
-                Data32 &=0xC0FFFFFF;
-                Data32 |= (0x27 << 24);
-                MP_WritePciEConfigSpace(sc, 0x870c, Data32);
+                if (macver == 0x64800000)
+                        re_set_offset70f(sc, 0x17);
+                else
+                        re_set_offset70f(sc, 0x27);
 
-                data8 = pci_read_config(sc->dev, 0x79, 1);
-                data8 &= ~0x70;
-                data8 |= 0x50;
-                pci_write_config(sc->dev, 0x79, data8, 1);
+                re_set_offset79(sc, 0x40);
 
-                CSR_WRITE_2(sc, 0x382, 0x221B);
+                if (macver == 0x60800000 || macver == 0x64000000)
+                        CSR_WRITE_2(sc, 0x382, 0x221B);
 
                 CSR_WRITE_1(sc, 0x4500, 0x00);
                 CSR_WRITE_2(sc, 0x4800, 0x0000);
@@ -5977,13 +7105,22 @@ static void re_hw_start_unlock_8125(struct re_softc *sc)
 
                 //old tx desc format
                 data16 = MP_ReadMcuAccessRegWord(sc, 0xEB58);
-                data16 &= ~(BIT_0);
+                if (sc->re_type == MACFG_91 || sc->re_type == MACFG_92)
+                        data16 &= ~(BIT_0 | BIT_1);
+                else
+                        data16 &= ~(BIT_0);
                 MP_WriteMcuAccessRegWord(sc, 0xEB58, data16);
+
+                if (sc->re_type == MACFG_91 || sc->re_type == MACFG_92)
+                        CSR_WRITE_1(sc, 0xD8, CSR_READ_1(sc, 0xD8) & ~BIT_1);
 
                 data16 = MP_ReadMcuAccessRegWord(sc, 0xE614);
                 data16 &= ~( BIT_10 | BIT_9 | BIT_8);
                 if (sc->re_type == MACFG_82 || sc->re_type == MACFG_83)
                         data16 |= (2 << 8);
+                else if (sc->re_type == MACFG_90 || sc->re_type == MACFG_91 ||
+                         sc->re_type == MACFG_92)
+                        data16 |= (4 << 8);
                 else
                         data16 |= (3 << 8);
                 MP_WriteMcuAccessRegWord(sc, 0xE614, data16);
@@ -5995,7 +7132,9 @@ static void re_hw_start_unlock_8125(struct re_softc *sc)
 
                 data16 = MP_ReadMcuAccessRegWord(sc, 0xE63E);
                 data16 &= ~(BIT_5 | BIT_4);
-                if (sc->re_type == MACFG_80 || sc->re_type == MACFG_81)
+                if (sc->re_type == MACFG_80 || sc->re_type == MACFG_81 ||
+                    sc->re_type == MACFG_90 || sc->re_type == MACFG_91 ||
+                    sc->re_type == MACFG_92)
                         data16 |= ((0x02 & 0x03) << 4);
                 MP_WriteMcuAccessRegWord(sc, 0xE63E, data16);
 
@@ -6054,13 +7193,41 @@ static void re_hw_start_unlock_8125(struct re_softc *sc)
                 MP_WriteMcuAccessRegWord(sc, 0xE080, MP_ReadMcuAccessRegWord(sc, 0xE080)&~BIT_1);
 
                 data16 = MP_ReadMcuAccessRegWord(sc, 0xEA1C);
-                data16 &= ~(BIT_2);
+                if (sc->re_type == MACFG_91 || sc->re_type == MACFG_92)
+                        data16 &= ~(BIT_9 | BIT_8);
+                else
+                        data16 &= ~(BIT_2);
                 MP_WriteMcuAccessRegWord(sc, 0xEA1C, data16);
 
                 SetMcuAccessRegBit(sc, 0xEB54, BIT_0);
                 DELAY(1);
                 ClearMcuAccessRegBit(sc, 0xEB54, BIT_0);
                 CSR_WRITE_2(sc, 0x1880, CSR_READ_2(sc, 0x1880) & ~(BIT_4 | BIT_5));
+
+                if (macver == 0x60800000) {
+                        for (int i=0xA00; i<0xB00; i+=4)
+                                CSR_WRITE_4(sc, i, 0x0000);
+                } else {
+                        for (int i = 0xA00; i < 0xA80; i += 4)
+                                CSR_WRITE_4(sc, i, 0x0000);
+
+                        if (sc->re_type == MACFG_91 || sc->re_type == MACFG_92) {
+                                CSR_WRITE_1(sc, RE_INT_CFG0_8125,
+                                            CSR_READ_1(sc, RE_INT_CFG0_8125) &
+                                            ~(RTL8125_INT_CFG0_ENABLE_8125 |
+                                              RTL8125_INT_CFG0_TIMEOUT0_BYPASS |
+                                              RTL8125_INT_CFG0_MITIGATION_BYPASS |
+                                              RTL8126_INT_CFG0_RDU_BYPASS));
+                        } else {
+                                CSR_WRITE_1(sc, RE_INT_CFG0_8125,
+                                            CSR_READ_1(sc, RE_INT_CFG0_8125) &
+                                            ~(RTL8125_INT_CFG0_ENABLE_8125 |
+                                              RTL8125_INT_CFG0_TIMEOUT0_BYPASS |
+                                              RTL8125_INT_CFG0_MITIGATION_BYPASS));
+                        }
+
+                        CSR_WRITE_2(sc, RE_INT_CFG1_8125, 0x0000);
+                }
 
                 if (sc->re_tx_cstag) {
                         ifp->if_capenable |= IFCAP_TXCSUM;
@@ -6074,12 +7241,14 @@ static void re_hw_start_unlock_8125(struct re_softc *sc)
         //clear io_rdy_l23
         CSR_WRITE_1(sc, RE_CFG3, CSR_READ_1(sc, RE_CFG3) & ~BIT_1);
 
-        CSR_WRITE_1(sc, RE_CFG5, CSR_READ_1(sc, RE_CFG5) | BIT_0);
-        CSR_WRITE_1(sc, RE_CFG2, CSR_READ_1(sc, RE_CFG2) | BIT_7);
-        CSR_WRITE_1(sc, 0xF1, CSR_READ_1(sc, 0xF1) & ~BIT_7);
+        _re_enable_aspm_clkreq_lock(sc, 1);
+        re_enable_force_clkreq(sc, 0);;
 
         //clear wol
         re_clrwol(sc);
+
+        //Interrupt Mitigation
+        CSR_WRITE_4(sc, 0x0A00, 0x00630063);
 
         if ((ifp->if_capenable & IFCAP_VLAN_HWTAGGING) != 0)
                 CSR_WRITE_4(sc, RE_RXCFG, CSR_READ_4(sc, RE_RXCFG) | (BIT_22 | BIT_23));
@@ -6123,7 +7292,6 @@ static int re_var_init(struct re_softc *sc)
         union TxDesc *txptr;
 
         sc->re_desc.rx_cur_index = 0;
-        sc->re_desc.rx_last_index = 0;
         rxptr = sc->re_desc.rx_desc;
         for (i = 0; i < RE_RX_BUF_NUM; i++) {
                 memset(&rxptr[i], 0, sizeof(union RxDesc));
@@ -6168,7 +7336,7 @@ static int re_var_init(struct re_softc *sc)
         bus_dmamap_load(sc->re_desc.tx_desc_tag,
                         sc->re_desc.tx_desc_dmamap,
                         sc->re_desc.tx_desc,
-                        sizeof(union RxDesc) * RE_TX_BUF_NUM,
+                        sizeof(union TxDesc) * RE_TX_BUF_NUM,
                         re_dma_map_txdesc,
                         sc,
                         0);
@@ -6249,10 +7417,15 @@ static void re_reset(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 DELAY(2000);
                 break;
         default:
@@ -6287,7 +7460,6 @@ static void
 re_set_wol_linkspeed(struct re_softc *sc)
 {
         u_int8_t wol_link_speed;
-        u_int16_t anar;
 
         if (HW_SUPP_SERDES_PHY(sc)) return;
 
@@ -6311,34 +7483,42 @@ re_set_wol_linkspeed(struct re_softc *sc)
                 }
         }
 
-        anar = MP_ReadPhyUshort(sc,MII_ANAR);
-
-        if (wol_link_speed == RE_WOL_LINK_SPEED_10M_FIRST)
-                anar &= ~(ANAR_TX_FD | ANAR_TX);
-        if (sc->re_device_id==RT_DEVICEID_8125 || sc->re_device_id==RT_DEVICEID_8162) {
-                u_int16_t gbcr;
-
+        switch(sc->re_device_id) {
+        case RT_DEVICEID_8126:
+                ClearEthPhyOcpBit(sc, 0xA5D4, RTK_ADVERTISE_5000FULL);
+        /*	FALLTHROUGH */
+        case RT_DEVICEID_8125:
+        case RT_DEVICEID_8162:
                 ClearEthPhyOcpBit(sc, 0xA5D4, RTK_ADVERTISE_2500FULL);
-                gbcr = MP_ReadPhyUshort(sc,MII_100T2CR);
-                gbcr &= ~(GTCR_ADV_1000TFDX|GTCR_ADV_1000THDX);
-                MP_WritePhyUshort(sc, MII_100T2CR, gbcr);
-                MP_WritePhyUshort(sc, MII_ANAR, anar);
-                MP_WritePhyUshort(sc, MII_BMCR, BMCR_RESET | BMCR_AUTOEN | BMCR_STARTNEG);
-        } else if (sc->re_device_id==RT_DEVICEID_8169 || sc->re_device_id==RT_DEVICEID_8169SC ||
-                   sc->re_device_id==RT_DEVICEID_8168 || sc->re_device_id==RT_DEVICEID_8161) {
-                u_int16_t gbcr;
+        /*	FALLTHROUGH */
+        case RT_DEVICEID_8169:
+        case RT_DEVICEID_8169SC:
+        case RT_DEVICEID_8168:
+        case RT_DEVICEID_8161:
+                MP_WritePhyUshort(sc, MII_100T2CR, MP_ReadPhyUshort(sc,MII_100T2CR) & ~(GTCR_ADV_1000TFDX|GTCR_ADV_1000THDX));
+        /*	FALLTHROUGH */
+        default:
+                if (wol_link_speed == RE_WOL_LINK_SPEED_10M_FIRST)
+                        MP_WritePhyUshort(sc, MII_ANAR, MP_ReadPhyUshort(sc,MII_ANAR) & ~(ANAR_TX_FD | ANAR_TX));
+                break;
+        }
 
-                gbcr = MP_ReadPhyUshort(sc,MII_100T2CR);
-                gbcr &= ~(GTCR_ADV_1000TFDX|GTCR_ADV_1000THDX);
-                MP_WritePhyUshort(sc, MII_100T2CR, gbcr);
-                MP_WritePhyUshort(sc, MII_ANAR, anar);
+        switch(sc->re_device_id) {
+        case RT_DEVICEID_8126:
+        case RT_DEVICEID_8125:
+        case RT_DEVICEID_8162:
+        case RT_DEVICEID_8169:
+        case RT_DEVICEID_8169SC:
+        case RT_DEVICEID_8168:
+        case RT_DEVICEID_8161:
                 MP_WritePhyUshort(sc, MII_BMCR, BMCR_RESET | BMCR_AUTOEN | BMCR_STARTNEG);
-        } else if (sc->re_type == MACFG_36) {
-                MP_WritePhyUshort(sc, MII_ANAR, anar);
-                MP_WritePhyUshort(sc, MII_BMCR, BMCR_RESET | BMCR_AUTOEN | BMCR_STARTNEG);
-        } else {
-                MP_WritePhyUshort(sc, MII_ANAR, anar);
-                MP_WritePhyUshort(sc, MII_BMCR, BMCR_AUTOEN | BMCR_STARTNEG);
+                break;
+        default:
+                if (sc->re_type == MACFG_36)
+                        MP_WritePhyUshort(sc, MII_BMCR, BMCR_RESET | BMCR_AUTOEN | BMCR_STARTNEG);
+                else
+                        MP_WritePhyUshort(sc, MII_BMCR, BMCR_AUTOEN | BMCR_STARTNEG);
+                break;
         }
 }
 
@@ -6474,6 +7654,9 @@ static void re_stop(struct re_softc *sc)  	/* Stop Driver */
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 CSR_WRITE_4(sc, RE_IMR0_8125, 0x00000000);
                 CSR_WRITE_4(sc, RE_ISR0_8125, 0xffffffff);
                 break;
@@ -6498,8 +7681,9 @@ static void re_stop(struct re_softc *sc)  	/* Stop Driver */
 
         switch (sc->re_type) {
         case MACFG_74:
+        case MACFG_75:
                 SetMcuAccessRegBit(sc, 0xD438, BIT_3);
-                SetMcuAccessRegBit(sc, 0xDE38, BIT_2);
+                SetMcuAccessRegBit(sc, 0xD438, BIT_2);
                 ClearMcuAccessRegBit(sc, 0xDE28, (BIT_1 | BIT_0));
                 SetMcuAccessRegBit(sc, 0xD438, (BIT_1 | BIT_0));
                 break;
@@ -6511,19 +7695,20 @@ static void re_stop(struct re_softc *sc)  	/* Stop Driver */
          * Free the TX list buffers.
          */
         while (sc->re_desc.tx_last_index!=sc->re_desc.tx_cur_index) {
+                u_int32_t entry = sc->re_desc.tx_last_index % RE_TX_BUF_NUM;
                 if (sc->re_desc.re_tx_mtag) {
                         bus_dmamap_sync(sc->re_desc.re_tx_mtag,
-                                        sc->re_desc.re_tx_dmamap[sc->re_desc.tx_last_index],
+                                        sc->re_desc.re_tx_dmamap[entry],
                                         BUS_DMASYNC_POSTWRITE);
                         bus_dmamap_unload(sc->re_desc.re_tx_mtag,
-                                          sc->re_desc.re_tx_dmamap[sc->re_desc.tx_last_index]);
+                                          sc->re_desc.re_tx_dmamap[entry]);
                 }
 
-                if (sc->re_desc.tx_buf[sc->re_desc.tx_last_index]!=NULL) {
-                        m_freem(sc->re_desc.tx_buf[sc->re_desc.tx_last_index]);
-                        sc->re_desc.tx_buf[sc->re_desc.tx_last_index] = NULL;
+                if (sc->re_desc.tx_buf[entry]!=NULL) {
+                        m_freem(sc->re_desc.tx_buf[entry]);
+                        sc->re_desc.tx_buf[entry] = NULL;
                 }
-                sc->re_desc.tx_last_index = (sc->re_desc.tx_last_index+1)%RE_TX_BUF_NUM;
+                sc->re_desc.tx_last_index++;
         }
 
         ifp->if_drv_flags &= ~(IFF_DRV_RUNNING | IFF_DRV_OACTIVE);
@@ -6537,24 +7722,112 @@ static void re_stop(struct re_softc *sc)  	/* Stop Driver */
 static void re_start(struct ifnet *ifp)  	/* Transmit Packet*/
 {
         struct re_softc		*sc;
-        struct mbuf		*m_head = NULL;
+
+        sc = ifp->if_softc;	/* Paste to ifp in function re_attach(dev) */
+        RE_LOCK(sc);
+        re_start_locked(ifp);
+        RE_UNLOCK(sc);
+}
+
+static uint16_t
+re_get_eth_type(struct mbuf *mb)
+{
+        struct ether_vlan_header *eh;
+        uint16_t eth_type;
+
+        eh = mtod(mb, struct ether_vlan_header *);
+        if (mb->m_len < ETHER_HDR_LEN)
+                return (0);
+        if (eh->evl_encap_proto == htons(ETHERTYPE_VLAN))
+                eth_type = ntohs(eh->evl_proto);
+        else
+                eth_type = ntohs(eh->evl_encap_proto);
+        return (eth_type);
+}
+
+static int
+re_get_l4hdr_offset(struct mbuf *mb)
+{
+        struct ether_vlan_header *eh;
+        //struct tcphdr *th;
+        struct ip *ip;
+        int ip_hlen;
+        struct ip6_hdr *ip6;
+        uint16_t eth_type;
+        int eth_hdr_len;
+
+        eh = mtod(mb, struct ether_vlan_header *);
+        if (mb->m_len < ETHER_HDR_LEN)
+                return (0);
+        if (eh->evl_encap_proto == htons(ETHERTYPE_VLAN)) {
+                eth_type = ntohs(eh->evl_proto);
+                eth_hdr_len = ETHER_HDR_LEN + ETHER_VLAN_ENCAP_LEN;
+        } else {
+                eth_type = ntohs(eh->evl_encap_proto);
+                eth_hdr_len = ETHER_HDR_LEN;
+        }
+        if (mb->m_len < eth_hdr_len)
+                return (0);
+        switch (eth_type) {
+        case ETHERTYPE_IP:
+                ip = (struct ip *)(mb->m_data + eth_hdr_len);
+                if (mb->m_len < eth_hdr_len + sizeof(*ip))
+                        return (0);
+                if (ip->ip_p != IPPROTO_TCP)
+                        return (0);
+                ip_hlen = ip->ip_hl << 2;
+                eth_hdr_len += ip_hlen;
+                break;
+        case ETHERTYPE_IPV6:
+                ip6 = (struct ip6_hdr *)(mb->m_data + eth_hdr_len);
+                if (mb->m_len < eth_hdr_len + sizeof(*ip6))
+                        return (0);
+                if (ip6->ip6_nxt != IPPROTO_TCP)
+                        return (0);
+                eth_hdr_len += sizeof(*ip6);
+                break;
+        default:
+                return (0);
+        }
+        /*
+        if (mb->m_len < eth_hdr_len + sizeof(*th))
+        return (0);
+        th = (struct tcphdr *)(mb->m_data + eth_hdr_len);
+        tcp_hlen = th->th_off << 2;
+        eth_hdr_len += tcp_hlen;
+        if (mb->m_len < eth_hdr_len)
+        return (0);
+        */
+        return (eth_hdr_len);
+}
+
+static void re_start_locked(struct ifnet *ifp)
+{
+        bus_dma_segment_t	segs[RE_NTXSEGS];
+        bus_dmamap_t		map;
+        struct re_softc		*sc;
+        struct mbuf		*m_head;
+        struct mbuf		*m_new;
+        uint32_t tx_cur_index;
+        uint32_t entry;
+        uint32_t first_entry;
+        int		queued;
+        int		nsegs;
+        int		error;
+        int		i;
 
         sc = ifp->if_softc;	/* Paste to ifp in function re_attach(dev) */
 
-        RE_LOCK(sc);
-
         /*	RE_LOCK_ASSERT(sc);*/
 
-        if ((sc->driver_detach == 1) || (sc->rx_fifo_overflow != 0)) {
-                RE_UNLOCK(sc);
+        if ((sc->driver_detach == 1) || (sc->rx_fifo_overflow != 0))
                 return;
-        }
 
-        while (1) {
-                int fs = 1, ls = 0, TxLen = 0, PktLen;
-                struct mbuf *ptr;
-                uint32_t  opts1 =0;
-                uint32_t  opts2 =0;
+        tx_cur_index = sc->re_desc.tx_cur_index;
+        for (queued = 0; !IFQ_DRV_IS_EMPTY(&ifp->if_snd);) {
+                int fs = 1, ls = 0;
+                uint32_t  opts1;
+                uint32_t  opts2;
                 IFQ_DRV_DEQUEUE(&ifp->if_snd, m_head);	/* Remove(get) data from system transmit queue */
                 if (m_head == NULL) {
                         break;
@@ -6569,21 +7842,59 @@ static void re_start(struct ifnet *ifp)  	/* Transmit Packet*/
                         }
                 }
 
+                entry = tx_cur_index % RE_TX_BUF_NUM;
                 if (sc->re_coalesce_tx_pkt) {
-                        if (re_encap(sc, m_head)) {
+                        if (re_encap(sc, &m_head)) {
                                 IFQ_DRV_PREPEND(&ifp->if_snd, m_head);
                                 ifp->if_drv_flags |= IFF_DRV_OACTIVE;
                                 break;
                         }
-
-                        m_head = sc->re_desc.tx_buf[sc->re_desc.tx_cur_index];
                 }
 
-                if (CountMbufNum(m_head) > CountFreeTxDescNum(sc->re_desc)) {	/* No enough descriptor */
+                error = bus_dmamap_load_mbuf_sg(sc->re_desc.re_tx_mtag, sc->re_desc.re_tx_dmamap[entry],
+                                                m_head, segs, &nsegs, BUS_DMA_NOWAIT);
+                if (error == EFBIG) {
+                        m_new = m_collapse(m_head, M_NOWAIT, RE_NTXSEGS);
+                        if (m_new == NULL) {
+                                m_freem(m_head);
+                                m_head = NULL;
+                                //return (ENOBUFS);
+                                break;
+                        }
+                        m_head = m_new;
+                        error = bus_dmamap_load_mbuf_sg(sc->re_desc.re_tx_mtag,
+                                                        sc->re_desc.re_tx_dmamap[entry], m_head, segs, &nsegs, BUS_DMA_NOWAIT);
+                        if (error != 0) {
+                                m_freem(m_head);
+                                m_head = NULL;
+                                //return (error);
+                                break;
+                        }
+                } else if (error != 0) {
+                        //return (error);
                         IFQ_DRV_PREPEND(&ifp->if_snd, m_head);
                         ifp->if_drv_flags |= IFF_DRV_OACTIVE;
                         break;
                 }
+                if (nsegs == 0) {
+                        m_freem(m_head);
+                        m_head = NULL;
+                        //return (EIO);
+                        break;
+                }
+
+                /* Check for number of available descriptors. */
+                if (CountFreeTxDescNum(sc->re_desc) < nsegs) {	/* No enough descriptor */
+                        bus_dmamap_unload(sc->re_desc.re_tx_mtag, sc->re_desc.re_tx_dmamap[entry]);
+                        IFQ_DRV_PREPEND(&ifp->if_snd, m_head);
+                        ifp->if_drv_flags |= IFF_DRV_OACTIVE;
+                        break;
+                }
+
+                bus_dmamap_sync(sc->re_desc.re_tx_mtag, sc->re_desc.re_tx_dmamap[entry],
+                                BUS_DMASYNC_PREWRITE);
+
+                first_entry = entry;
 
                 if (ifp->if_bpf) {		/* If there's a BPF listener, bounce a copy of this frame to him. */
                         //printf("If there's a BPF listener, bounce a copy of this frame to him. \n");
@@ -6596,96 +7907,172 @@ static void re_start(struct ifnet *ifp)  	/* Transmit Packet*/
 #endif
                 }
 
+                opts1 = opts2 = 0;
+                //hw tso
+                if ((m_head->m_pkthdr.csum_flags & CSUM_TSO) != 0) {
+                        if ((sc->re_if_flags & RL_FLAG_DESCV2) == 0) {
+                                opts2 |= RL_TDESC_CMD_LGSEND |
+                                         ((uint32_t)m_head->m_pkthdr.tso_segsz <<
+                                          RL_TDESC_CMD_MSSVAL_SHIFT);
+                        } else {
+                                /*
+                                 * RTL8168C/RTL816CP/RTL8111C/RTL8111CP
+                                 */
+                                const uint16_t l4hoffset =
+                                        re_get_l4hdr_offset(m_head);
+
+                                if (re_get_eth_type(m_head) == ETHERTYPE_IPV6)
+                                        opts1 |= RL_TDESC_CMD_GTSENDV6;
+                                else
+                                        opts1 |= RL_TDESC_CMD_GTSENDV4;
+                                opts1 |= (l4hoffset << RL_TDESC_CMD_GTSEND_TCPHO_SHIFT);
+                                opts2 |= ((uint32_t)m_head->m_pkthdr.tso_segsz <<
+                                          RL_TDESC_CMD_MSSVALV2_SHIFT);
+                        }
+                        goto process_vlan;
+                }
                 //hw checksum
-                if (ifp->if_capenable & IFCAP_TXCSUM) {
-                        if ((m_head->m_pkthdr.csum_flags & RE_CSUM_FEATURES) !=0) 	{
-                                if (!(sc->re_if_flags & RL_FLAG_DESCV2)) {
-                                        opts1 |= RL_IPV4CS1;
-                                        if ((m_head->m_pkthdr.csum_flags & CSUM_TCP)!=0)
-                                                opts1 |=RL_TCPCS1;
-                                        if ((m_head->m_pkthdr.csum_flags & CSUM_UDP)!=0)
-                                                opts1 |=RL_UDPCS1;
-                                } else {
-                                        opts2 |=  RL_IPV4CS;
-                                        if ((m_head->m_pkthdr.csum_flags & CSUM_TCP)!=0)
-                                                opts2 |= RL_TCPCS;
-                                        else if ((m_head->m_pkthdr.csum_flags & CSUM_UDP)!=0)
-                                                opts2 |= RL_UDPCS;
+                if ((m_head->m_pkthdr.csum_flags & RE_CSUM_FEATURES) != 0) {
+                        if ((sc->re_if_flags & RL_FLAG_DESCV2) == 0) {
+                                opts1 |= RL_IPV4CS1;
+                                if (m_head->m_pkthdr.csum_flags & CSUM_TCP)
+                                        opts1 |= RL_TCPCS1;
+                                if (m_head->m_pkthdr.csum_flags & CSUM_UDP)
+                                        opts1 |= RL_UDPCS1;
+                        } else {
+                                /*
+                                 * RTL8168C/RTL816CP/RTL8111C/RTL8111CP
+                                 */
+                                if (re_get_eth_type(m_head) == ETHERTYPE_IP)
+                                        opts2 |= RL_IPV4CS;
+                                if (m_head->m_pkthdr.csum_flags &
+                                    (CSUM_TCP | CSUM_TCP_IPV6))
+                                        opts2 |= RL_TCPCS;
+                                else if (m_head->m_pkthdr.csum_flags &
+                                         (CSUM_UDP | CSUM_UDP_IPV6))
+                                        opts2 |= RL_UDPCS;
+                                if (m_head->m_pkthdr.csum_flags &
+                                    (CSUM_TCP_IPV6 | CSUM_UDP_IPV6)) {
+                                        const uint16_t l4hoffset =
+                                                re_get_l4hdr_offset(m_head);
+
+                                        opts2 |= RL_CS_V6F |
+                                                 (l4hoffset << RL_TDESC_CMD_CSUM_TCPHO_SHIFT);
                                 }
                         }
+                        goto process_vlan;
                 }
-
+process_vlan:
                 //vlan
                 if (m_head->m_flags & M_VLANTAG)
                         opts2 |= bswap16(m_head->m_pkthdr.ether_vtag) | RL_TDESC_VLANCTL_TAG;
-                ptr = m_head;
-                PktLen = ptr->m_pkthdr.len;
 #ifdef _DEBUG_
-                printf("PktLen=%d",PktLen);
+                printf("PktLen=%d \n", m_head->m_pkthdr.len);
 #endif
-                while (ptr!=NULL) {
-                        if (ptr->m_len >0) {
-#ifdef _DEBUG_
-                                printf(", len=%d T=%d F=%d",ptr->m_len,ptr->m_type,ptr->m_flags);
-#endif
-                                TxLen += ptr->m_len;
-                                if (TxLen >= PktLen) {
-                                        ls=1;
-                                        sc->re_desc.tx_buf[sc->re_desc.tx_cur_index] = m_head;
-                                } else
-                                        sc->re_desc.tx_buf[sc->re_desc.tx_cur_index] = NULL;
+                for (i = 0; i < nsegs; i++) {
+                        if (segs[i].ds_len == 0)
+                                continue;
 
-                                //vlan
-                                WritePacket(sc,ptr->m_data,ptr->m_len,fs,ls,opts2,opts1);
+                        if (i == (nsegs - 1)) {
+                                ls=1;
 
-                                fs=0;
-                        }
-                        ptr = ptr->m_next;
+                                /*
+                                * Insure that the map for this transmission
+                                * is placed at the array index of the last descriptor
+                                * in this chain.  (Swap last and first dmamaps.)
+                                */
+                                map = sc->re_desc.re_tx_dmamap[first_entry];
+                                sc->re_desc.re_tx_dmamap[first_entry] = sc->re_desc.re_tx_dmamap[entry];
+                                sc->re_desc.re_tx_dmamap[entry] = map;
+                                sc->re_desc.tx_buf[entry] = m_head;
+                        } else
+                                sc->re_desc.tx_buf[entry] = NULL;
+
+                        WritePacket(sc,&segs[i],fs,ls,opts2,opts1, entry);
+
+                        fs=0;
+
+                        tx_cur_index++;
+                        entry = tx_cur_index % RE_TX_BUF_NUM;
                 }
+                sc->re_desc.tx_cur_index = tx_cur_index;
 #ifdef _DEBUG_
                 printf("\n");
 #endif
+                queued++;
         }
+
+        sc->re_desc.tx_cur_index = tx_cur_index;
+
+        if (queued == 0)
+                return;
+
+        re_start_tx(sc);
+
 #if OS_VER < VERSION(9,0)
         ifp->if_timer = 5;
 #endif
 
-        RE_UNLOCK(sc);
-
         return;
+}
+
+static void _re_start_tx(struct re_softc	*sc)
+{
+        switch (sc->re_type) {
+        case MACFG_80:
+        case MACFG_81:
+        case MACFG_82:
+        case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
+                CSR_WRITE_2(sc, RE_TPPOLL_8125, RE_NPQ_8125);
+                break;
+        default:
+                CSR_WRITE_1(sc, RE_TPPOLL, RE_NPQ);
+                break;
+        }
+}
+
+static void re_start_tx(struct re_softc	*sc)
+{
+        bus_dmamap_sync(sc->re_desc.tx_desc_tag,
+                        sc->re_desc.tx_desc_dmamap,
+                        BUS_DMASYNC_PREREAD|BUS_DMASYNC_PREWRITE);
+
+        _re_start_tx(sc);
 }
 
 /*
  * Encapsulate an mbuf chain in a descriptor by coupling the mbuf data
  * pointers to the fragment pointers.
  */
-static int re_encap(struct re_softc *sc,struct mbuf *m_head)
+static int re_encap(struct re_softc *sc,struct mbuf **m_head)
 {
         struct mbuf		*m_new = NULL;
 
-        m_new = m_defrag(m_head, M_DONTWAIT);
+        m_new = m_defrag(*m_head, M_DONTWAIT);
 
         if (m_new == NULL) {
                 printf("re%d: no memory for tx list", sc->re_unit);
                 return (1);
         }
-        m_head = m_new;
 
         /* Pad frames to at least 60 bytes. */
-        if (m_head->m_pkthdr.len < RE_MIN_FRAMELEN) {	/* Case length < 60 bytes */
+        if (m_new->m_pkthdr.len < RE_MIN_FRAMELEN) {	/* Case length < 60 bytes */
                 /*
                  * Make security concious people happy: zero out the
                  * bytes in the pad area, since we don't know what
                  * this mbuf cluster buffer's previous user might
                  * have left in it.
                  */
-                bzero(mtod(m_head, char *) + m_head->m_pkthdr.len,
-                      RE_MIN_FRAMELEN - m_head->m_pkthdr.len);
-                m_head->m_pkthdr.len = RE_MIN_FRAMELEN;
-                m_head->m_len = m_head->m_pkthdr.len;
+                bzero(mtod(m_new, char *) + m_new->m_pkthdr.len,
+                      RE_MIN_FRAMELEN - m_new->m_pkthdr.len);
+                m_new->m_pkthdr.len = RE_MIN_FRAMELEN;
+                m_new->m_len = m_new->m_pkthdr.len;
         }
 
-        sc->re_desc.tx_buf[sc->re_desc.tx_cur_index] = m_head;
+        *m_head = m_new;
 
         return(0);
 }
@@ -6694,13 +8081,13 @@ static int re_encap(struct re_softc *sc,struct mbuf *m_head)
 #define MIN_IPV6_PATCH_PKT_LEN (147)
 static int re_8125_pad(struct re_softc *sc,struct mbuf *m_head)
 {
-        struct ether_header *eh = mtod(m_head, struct ether_header *);
         uint32_t min_pkt_len;
-        uint16_t ether_type = ntohs(eh->ether_type);
+        uint16_t ether_type;
 
         if ((m_head->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_UDP)) != 0)
                 goto out;
 
+        ether_type = re_get_eth_type(m_head);
         min_pkt_len = RE_MIN_FRAMELEN;
         if (ether_type == ETHERTYPE_IP) {
                 struct ip *ip = (struct ip *)mtodo(m_head, ETHER_HDR_LEN);
@@ -6733,67 +8120,38 @@ out:
         return(0);
 }
 
-static void WritePacket(struct re_softc	*sc, caddr_t addr, int len,int fs_flag,int ls_flag, uint32_t opts2,uint32_t opts1)
+static void WritePacket(struct re_softc	*sc, bus_dma_segment_t *segs, int fs, int ls, uint32_t opts2, uint32_t opts1, uint32_t entry)
 {
         union TxDesc *txptr;
         uint32_t status;
-        uint32_t tx_cur_index = sc->re_desc.tx_cur_index;
 
-        txptr =&(sc->re_desc.tx_desc[tx_cur_index]);
+        txptr = &(sc->re_desc.tx_desc[entry]);
 
-        status = RL_TDESC_CMD_OWN | opts1 | len;
+        status = RL_TDESC_CMD_OWN | opts1 | segs->ds_len;
 
-        if (fs_flag)
+        if (fs)
                 status |= RL_TDESC_CMD_SOF;
-        if (ls_flag)
+        if (ls)
                 status |= RL_TDESC_CMD_EOF;
-        if (tx_cur_index == (RE_TX_BUF_NUM - 1))
+        if (entry == (RE_TX_BUF_NUM - 1))
                 status |= RL_TDESC_CMD_EOR;
 
-        bus_dmamap_load(sc->re_desc.re_tx_mtag,
-                        sc->re_desc.re_tx_dmamap[tx_cur_index],
-                        addr,
-                        len,
-                        re_tx_dma_map_buf, txptr,
-                        0);
-        bus_dmamap_sync(sc->re_desc.re_tx_mtag,
-                        sc->re_desc.re_tx_dmamap[tx_cur_index],
-                        BUS_DMASYNC_PREWRITE);
+        txptr->so1.TxBuff = htole64(segs->ds_addr);
+
         txptr->ul[1] = htole32(opts2);
+        /* make sure opts2 is set before opts1 */
+        wmb();
         txptr->ul[0] = htole32(status);
-
-        bus_dmamap_sync(sc->re_desc.tx_desc_tag,
-                        sc->re_desc.tx_desc_dmamap,
-                        BUS_DMASYNC_PREREAD|BUS_DMASYNC_PREWRITE);
-
-        if (ls_flag) {
-                switch (sc->re_type) {
-                case MACFG_80:
-                case MACFG_81:
-                case MACFG_82:
-                case MACFG_83:
-                        CSR_WRITE_2(sc, RE_TPPOLL_8125, RE_NPQ_8125);
-                        CSR_WRITE_2(sc, RE_TPPOLL_8125, RE_NPQ_8125);
-                        break;
-                default:
-                        CSR_WRITE_1(sc, RE_TPPOLL, RE_NPQ);
-                        CSR_WRITE_1(sc, RE_TPPOLL, RE_NPQ);
-                        break;
-                }
-        }
-
-        sc->re_desc.tx_cur_index = (tx_cur_index+1)%RE_TX_BUF_NUM;
 }
 
-static int CountFreeTxDescNum(struct re_descriptor desc)
+static uint32_t CountFreeTxDescNum(struct re_descriptor desc)
 {
-        int ret=desc.tx_last_index-desc.tx_cur_index;
-        if (ret<=0)
-                ret+=RE_TX_BUF_NUM;
-        ret--;
+        uint32_t ret=desc.tx_last_index + RE_TX_BUF_NUM - desc.tx_cur_index;
+
         return ret;
 }
 
+/*
 static int CountMbufNum(struct mbuf *m_head)
 {
         int ret=0;
@@ -6807,6 +8165,7 @@ static int CountMbufNum(struct mbuf *m_head)
 
         return ret;
 }
+*/
 
 #ifdef RE_FIXUP_RX
 static __inline void re_fixup_rx(struct mbuf *m)
@@ -6833,6 +8192,9 @@ static void re_txeof(struct re_softc *sc)  	/* Transmit OK/ERR handler */
         union TxDesc *txptr;
         struct ifnet		*ifp;
         u_int32_t           txstat;
+        u_int32_t           entry;
+        u_int32_t           tx_cur_index;
+        u_int32_t           tx_last_index;
 
         /*	printf("X");*/
 
@@ -6842,52 +8204,108 @@ static void re_txeof(struct re_softc *sc)  	/* Transmit OK/ERR handler */
         /* Clear the timeout timer. */
         ifp->if_timer = 0;
 #endif
+        tx_cur_index = sc->re_desc.tx_cur_index;
+        tx_last_index = sc->re_desc.tx_last_index;
+        /* No packet to complete. */
+        if (tx_cur_index == tx_last_index)
+                return;
 
         bus_dmamap_sync(sc->re_desc.tx_desc_tag,
                         sc->re_desc.tx_desc_dmamap,
                         BUS_DMASYNC_POSTREAD|BUS_DMASYNC_POSTWRITE);
 
-        while (sc->re_desc.tx_last_index!=sc->re_desc.tx_cur_index) {
-                txptr=&(sc->re_desc.tx_desc[sc->re_desc.tx_last_index]);
+        while (tx_cur_index != tx_last_index) {
+                entry = tx_last_index % RE_TX_BUF_NUM;
+                txptr=&(sc->re_desc.tx_desc[entry]);
                 txstat = le32toh(txptr->ul[0]);
                 if (txstat & RL_TDESC_STAT_OWN)
                         break;
 #ifdef _DEBUG_
                 printf("**** Tx OK  ****\n");
 #endif
-                bus_dmamap_sync(sc->re_desc.re_tx_mtag,
-                                sc->re_desc.re_tx_dmamap[sc->re_desc.tx_last_index],
-                                BUS_DMASYNC_POSTWRITE);
-                bus_dmamap_unload(sc->re_desc.re_tx_mtag,
-                                  sc->re_desc.re_tx_dmamap[sc->re_desc.tx_last_index]);
-
-                if (sc->re_desc.tx_buf[sc->re_desc.tx_last_index]!=NULL) {
-                        m_freem(sc->re_desc.tx_buf[sc->re_desc.tx_last_index]);	/* Free Current MBuf in a Mbuf list*/
-                        sc->re_desc.tx_buf[sc->re_desc.tx_last_index] = NULL;
+                if (sc->re_desc.tx_buf[entry]!=NULL) {
+                        bus_dmamap_sync(sc->re_desc.re_tx_mtag,
+                                        sc->re_desc.re_tx_dmamap[entry],
+                                        BUS_DMASYNC_POSTWRITE);
+                        bus_dmamap_unload(sc->re_desc.re_tx_mtag,
+                                          sc->re_desc.re_tx_dmamap[entry]);
+                        /* Free Current MBuf in a Mbuf list*/
+                        m_freem(sc->re_desc.tx_buf[entry]);
+                        sc->re_desc.tx_buf[entry] = NULL;
                 }
 
-                sc->re_desc.tx_last_index = (sc->re_desc.tx_last_index+1)%RE_TX_BUF_NUM;
-#if OS_VER < VERSION(11,0)
-                if (txstat & (RL_TDESC_STAT_EXCESSCOL|
-                              RL_TDESC_STAT_COLCNT))
-                        ifp->if_collisions++;
-                if (txstat & RL_TDESC_STAT_TXERRSUM)
-                        ifp->if_oerrors++;
-                else
-                        ifp->if_opackets++;
-#else
-                if (txstat & (RL_TDESC_STAT_EXCESSCOL|
-                              RL_TDESC_STAT_COLCNT))
-                        if_inc_counter(ifp, IFCOUNTER_COLLISIONS, 1);
-                if (txstat & RL_TDESC_STAT_TXERRSUM)
-                        if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
-                else
-                        if_inc_counter(ifp, IFCOUNTER_OPACKETS, 1);
-#endif
+                tx_last_index++;
+        }
+
+        if (sc->re_desc.tx_last_index != tx_last_index) {
+                sc->re_desc.tx_last_index = tx_last_index;
                 ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
         }
 
+        /* prevent tx stop. */
+        if (tx_cur_index != tx_last_index)
+                _re_start_tx(sc);
+
         return;
+}
+
+#if defined(INET) || defined(INET6)
+static int
+re_lro_rx(struct re_softc *sc, struct mbuf *m)
+{
+        struct lro_ctrl *lro;
+
+        lro = &sc->re_lro;
+
+        if (lro->lro_mbuf_max != 0) {
+                tcp_lro_queue_mbuf(lro, m);
+                return (0);
+        }
+
+        return (tcp_lro_rx(lro, m, 0));
+}
+#endif
+
+static void
+re_rxq_input(struct re_softc *sc, struct mbuf *m, bool lro_able)
+{
+        struct ifnet		*ifp;
+
+        ifp = RE_GET_IFNET(sc);
+
+#if defined(INET) || defined(INET6)
+        if ((ifp->if_capenable & IFCAP_LRO) && lro_able) {
+                if (re_lro_rx(sc, m) == 0)
+                        return;
+        }
+#endif
+
+        /*#if OS_VER < VERSION(5, 1)*/
+#if OS_VER < VERSION(4,9)
+        /* Remove header from mbuf and pass it on. */
+        m_adj(m, sizeof(struct ether_header));
+        ether_input(ifp, eh, m);
+#else
+        (*ifp->if_input)(ifp, m);
+#endif
+}
+
+static void
+re_drain_soft_lro(struct re_softc *sc)
+{
+#if defined(INET) || defined(INET6)
+#if OS_VER >= VERSION(11,0)
+        tcp_lro_flush_all(&sc->re_lro);
+#else
+        struct lro_entry *queued;
+
+        while ((!SLIST_EMPTY(&lro->lro_active))) {
+                queued = SLIST_FIRST(&lro->lro_active);
+                SLIST_REMOVE_HEAD(&lro->lro_active, next);
+                tcp_lro_flush(lro, queued);
+        }
+#endif //OS_VER >= VERSION(11,0)
+#endif //defined(INET) || defined(INET6)
 }
 
 /*
@@ -6917,20 +8335,22 @@ static void re_txeof(struct re_softc *sc)  	/* Transmit OK/ERR handler */
  * bytes of space preceecing it so that it will be safe for us to do the
  * 2-byte backstep even if reading from the ring at offset 0.
  */
-static void re_rxeof(sc)	/* Receive Data OK/ERR handler */
+static int re_rxeof(sc)	/* Receive Data OK/ERR handler */
 struct re_softc		*sc;
 {
         struct mbuf		*m;
         struct ifnet		*ifp;
         union RxDesc *rxptr;
-        int bError;
         struct mbuf *buf;
         int size;
-        int maxpkt = RE_RX_BUF_NUM;
+        int maxpkt = RE_RX_BUDGET;
+        u_int32_t entry;
+        u_int32_t pkt_size;
         u_int32_t rx_cur_index;
         u_int32_t opts2,opts1,status;
+        bool lro_able;
 
-        /*		RE_LOCK_ASSERT(sc);*/
+        /* RE_LOCK_ASSERT(sc);*/
 
         ifp = RE_GET_IFNET(sc);
 
@@ -6939,23 +8359,27 @@ struct re_softc		*sc;
                         BUS_DMASYNC_POSTREAD|BUS_DMASYNC_POSTWRITE);
 
         rx_cur_index = sc->re_desc.rx_cur_index;
-        rxptr=&(sc->re_desc.rx_desc[rx_cur_index]);
-        opts1 = le32toh(rxptr->ul[0]);
-        while ((opts1&RL_RDESC_STAT_OWN)==0) {	/* Receive OK */
-                bError = 0;
+        while (maxpkt > 0) {
+                entry = rx_cur_index % RE_RX_BUF_NUM;
+                rxptr=&(sc->re_desc.rx_desc[entry]);
+                opts1 = le32toh(rxptr->ul[0]);
+                lro_able = false;
 
-                sc->re_desc.rx_cur_index = (rx_cur_index+1)%RE_RX_BUF_NUM;
+                /* Check Receive OK */
+                if (opts1&RL_RDESC_STAT_OWN)
+                        break;
 
                 /* Check if this packet is received correctly*/
-                if (opts1&0x200000) {	/*Check RES bit*/
-                        bError=1;
-#if OS_VER < VERSION(11,0)
-                        ifp->if_ierrors++;
-#else
-                        if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
-#endif
-                        goto update_desc;
-                }
+                if (opts1&RL_RDESC_RES)	/*Check RES bit*/
+                        goto drop_packet;
+
+                pkt_size = (opts1&RL_RDESC_STAT_GFRAGLEN)-ETHER_CRC_LEN;
+                if (pkt_size > sc->re_rx_mbuf_sz)
+                        goto drop_packet;
+
+                /* Wait other fields is dmaed */
+                rmb();
+
                 opts2 = le32toh(rxptr->ul[1]);
 
                 //buf = m_getcl(M_DONTWAIT, MT_DATA, M_PKTHDR); /* Alloc a new mbuf */
@@ -6968,15 +8392,8 @@ struct re_softc		*sc;
                         size = MJUM9BYTES;
 
                 buf = m_getjcl(M_DONTWAIT, MT_DATA, M_PKTHDR, size);
-                if (buf==NULL) {
-                        bError=1;
-#if OS_VER < VERSION(11,0)
-                        ifp->if_iqdrops++;
-#else
-                        if_inc_counter(ifp, IFCOUNTER_IQDROPS, 1);
-#endif
-                        goto update_desc;
-                }
+                if (buf==NULL)
+                        goto drop_packet;
 
                 buf->m_len = buf->m_pkthdr.len = size;
 #ifdef RE_FIXUP_RX
@@ -6994,14 +8411,14 @@ struct re_softc		*sc;
 #endif
 
                 bus_dmamap_sync(sc->re_desc.re_rx_mtag,
-                                sc->re_desc.re_rx_dmamap[rx_cur_index],
+                                sc->re_desc.re_rx_dmamap[entry],
                                 BUS_DMASYNC_POSTREAD);
                 bus_dmamap_unload(sc->re_desc.re_rx_mtag,
-                                  sc->re_desc.re_rx_dmamap[rx_cur_index]);
+                                  sc->re_desc.re_rx_dmamap[entry]);
 
-                m = sc->re_desc.rx_buf[rx_cur_index];
-                sc->re_desc.rx_buf[rx_cur_index] = buf;
-                m->m_pkthdr.len = m->m_len = (opts1&RL_RDESC_STAT_GFRAGLEN)-ETHER_CRC_LEN;
+                m = sc->re_desc.rx_buf[entry];
+                sc->re_desc.rx_buf[entry] = buf;
+                m->m_pkthdr.len = m->m_len = pkt_size;
                 m->m_pkthdr.rcvif = ifp;
 
 #ifdef RE_FIXUP_RX
@@ -7015,23 +8432,34 @@ struct re_softc		*sc;
                         m->m_flags |= M_VLANTAG;
                 }
                 if (ifp->if_capenable & IFCAP_RXCSUM) {
-                        if (!(sc->re_if_flags & RL_FLAG_DESCV2)) {
-                                if (opts1 & RL_ProtoIP)
+                        if ((sc->re_if_flags & RL_FLAG_DESCV2) == 0) {
+                                u_int32_t proto = opts1 & RL_ProtoMASK;
+
+                                if (proto != 0)
                                         m->m_pkthdr.csum_flags |=  CSUM_IP_CHECKED;
                                 if (!(opts1 & RL_IPF))
                                         m->m_pkthdr.csum_flags |= CSUM_IP_VALID;
-                                if ((((opts1 & RL_ProtoIP)==(1<<17)) && !(opts1 & RL_TCPF))   || (((opts1 & RL_ProtoIP)==(1<<18)) && !(opts1 & RL_UDPF))) {
+                                if (((proto == RL_ProtoTCP) && !(opts1 & RL_TCPF)) ||
+                                    ((proto == RL_ProtoUDP) && !(opts1 & RL_UDPF))) {
                                         m->m_pkthdr.csum_flags |= CSUM_DATA_VALID|CSUM_PSEUDO_HDR;
                                         m->m_pkthdr.csum_data = 0xffff;
+                                        if (proto == RL_ProtoTCP)
+                                                lro_able = true;
                                 }
                         } else {
-                                if ((opts1 & RL_ProtoIP) && (opts2 & RL_V4F))
-                                        m->m_pkthdr.csum_flags |=  CSUM_IP_CHECKED;
-                                if (!(opts1 & RL_IPF) && (opts2 & RL_V4F))
+                                /*
+                                 * RTL8168C/RTL816CP/RTL8111C/RTL8111CP
+                                 */
+                                if (opts2 & RL_V4F)
+                                        m->m_pkthdr.csum_flags |= CSUM_IP_CHECKED;
+                                if ((opts2 & RL_V4F) && !(opts1 & RL_IPF))
                                         m->m_pkthdr.csum_flags |= CSUM_IP_VALID;
-                                if (((opts1 & RL_TCPT) && !(opts2 & RL_TCPF)) || ((opts1 & RL_UDPT) && !(opts2 & RL_UDPF))) {
+                                if (((opts1 & RL_TCPT) && !(opts1 & RL_TCPF)) ||
+                                    ((opts1 & RL_UDPT) && !(opts1 & RL_UDPF))) {
                                         m->m_pkthdr.csum_flags |= CSUM_DATA_VALID|CSUM_PSEUDO_HDR;
                                         m->m_pkthdr.csum_data = 0xffff;
+                                        if (opts1 & RL_TCPT)
+                                                lro_able = true;
                                 }
                         }
                 }
@@ -7047,49 +8475,57 @@ struct re_softc		*sc;
 
                 RE_UNLOCK(sc);
 
-                /*#if OS_VER < VERSION(5, 1)*/
-#if OS_VER < VERSION(4,9)
-                /* Remove header from mbuf and pass it on. */
-                m_adj(m, sizeof(struct ether_header));
-                ether_input(ifp, eh, m);
-#else
-                (*ifp->if_input)(ifp, m);
-#endif
+                re_rxq_input(sc, m, lro_able);
+
                 RE_LOCK(sc);
 
+                /* Load the map for rx buffer. */
+                bus_dmamap_load(sc->re_desc.re_rx_mtag,
+                                sc->re_desc.re_rx_dmamap[entry],
+                                sc->re_desc.rx_buf[entry]->m_data,
+                                sc->re_rx_desc_buf_sz,
+                                re_rx_dma_map_buf, rxptr,
+                                0);
+                bus_dmamap_sync(sc->re_desc.re_rx_mtag,
+                                sc->re_desc.re_rx_dmamap[entry],
+                                BUS_DMASYNC_PREREAD);
 update_desc:
-                //rxptr->ul[0]&=htole32(0x40000000);	/* keep EOR bit */
-                rxptr->ul[1]=0;
-
                 status = RL_RDESC_CMD_OWN | sc->re_rx_desc_buf_sz;
-                if (rx_cur_index == (RE_RX_BUF_NUM - 1))
+                if (entry == (RE_RX_BUF_NUM - 1))
                         status |= RL_RDESC_CMD_EOR;
-                if (!bError) {
-                        bus_dmamap_load(sc->re_desc.re_rx_mtag,
-                                        sc->re_desc.re_rx_dmamap[rx_cur_index],
-                                        sc->re_desc.rx_buf[rx_cur_index]->m_data,
-                                        sc->re_rx_desc_buf_sz,
-                                        re_rx_dma_map_buf, rxptr,
-                                        0);
-                        bus_dmamap_sync(sc->re_desc.re_rx_mtag,
-                                        sc->re_desc.re_rx_dmamap[rx_cur_index],
-                                        BUS_DMASYNC_PREREAD);
-                }
+
+                rxptr->ul[1]=0;
+                /* make sure desc is all set before releasing it */
+                wmb();
                 rxptr->ul[0] = htole32(status);
-                rx_cur_index = sc->re_desc.rx_cur_index;
-                rxptr=&sc->re_desc.rx_desc[rx_cur_index];
-                opts1 = le32toh(rxptr->ul[0]);
+
+                rx_cur_index++;
 
                 maxpkt--;
-                if (maxpkt==0)
-                        break;
+
+                continue;
+drop_packet:
+#if OS_VER < VERSION(11,0)
+                ifp->if_ierrors++;
+#else
+                if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
+#endif
+                goto update_desc;
         }
 
-        bus_dmamap_sync(sc->re_desc.rx_desc_tag,
-                        sc->re_desc.rx_desc_dmamap,
-                        BUS_DMASYNC_PREREAD|BUS_DMASYNC_PREWRITE);
+        if (sc->re_desc.rx_cur_index != rx_cur_index) {
+                if (ifp->if_capenable & IFCAP_LRO) {
+                        RE_UNLOCK(sc);
+                        re_drain_soft_lro(sc);
+                        RE_LOCK(sc);
+                }
+                sc->re_desc.rx_cur_index = rx_cur_index;
+                bus_dmamap_sync(sc->re_desc.rx_desc_tag,
+                                sc->re_desc.rx_desc_dmamap,
+                                BUS_DMASYNC_PREREAD|BUS_DMASYNC_PREWRITE);
+        }
 
-        return;
+        return (RE_RX_BUDGET - maxpkt);
 }
 
 #if OS_VER < VERSION(7,0)
@@ -7162,11 +8598,54 @@ static int re_intr_8125(void *arg)  	/* Interrupt Handler */
 #endif //OS_VER < VERSION(7,0)
 }
 
+static void re_int_task_poll(void *arg, int npending)
+{
+        struct re_softc		*sc;
+        struct ifnet		*ifp;
+        int 				done;
+
+        sc = arg;
+
+        RE_LOCK(sc);
+
+        ifp = RE_GET_IFNET(sc);
+
+        if (sc->suspended ||
+            (ifp->if_drv_flags & IFF_DRV_RUNNING) == 0) {
+                RE_UNLOCK(sc);
+                return;
+        }
+
+        done = re_rxeof(sc);
+
+        re_txeof(sc);
+
+        if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
+                re_start_locked(ifp);
+
+        RE_UNLOCK(sc);
+
+#if OS_VER>=VERSION(7,0)
+        if (done >= RE_RX_BUDGET) {
+#if OS_VER < VERSION(11,0)
+                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask_poll);
+#else ////OS_VER < VERSION(11,0)
+                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask_poll);
+#endif //OS_VER < VERSION(11,0)
+                return;
+        }
+#endif //OS_VER>=VERSION(7,0)
+
+        /* Re-enable interrupts. */
+        CSR_WRITE_2(sc, RE_IMR, RE_INTRS);
+}
+
 static void re_int_task(void *arg, int npending)
 {
         struct re_softc		*sc;
         struct ifnet		*ifp;
-        u_int32_t		status;
+        int 				done;
+        u_int32_t			status;
 
         sc = arg;
 
@@ -7186,7 +8665,7 @@ static void re_int_task(void *arg, int npending)
                 return;
         }
 
-        re_rxeof(sc);
+        done = re_rxeof(sc);
 
         if (sc->re_type == MACFG_21) {
                 if (status & RE_ISR_FIFO_OFLOW) {
@@ -7217,29 +8696,17 @@ static void re_int_task(void *arg, int npending)
                 re_init(sc);
         }
 
-        switch(sc->re_type) {
-        case MACFG_21:
-        case MACFG_22:
-        case MACFG_23:
-        case MACFG_24:
-                CSR_WRITE_1(sc, RE_TPPOLL, RE_NPQ);
-                break;
-
-        default:
-                break;
-        }
+        if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
+                re_start_locked(ifp);
 
         RE_UNLOCK(sc);
 
-        if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
-                re_start(ifp);
-
 #if OS_VER>=VERSION(7,0)
-        if (CSR_READ_2(sc, RE_ISR) & RE_INTRS) {
+        if (done >= RE_RX_BUDGET) {
 #if OS_VER < VERSION(11,0)
-                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask);
+                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask_poll);
 #else ////OS_VER < VERSION(11,0)
-                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask);
+                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask_poll);
 #endif //OS_VER < VERSION(11,0)
                 return;
         }
@@ -7249,11 +8716,54 @@ static void re_int_task(void *arg, int npending)
         CSR_WRITE_2(sc, RE_IMR, RE_INTRS);
 }
 
+static void re_int_task_8125_poll(void *arg, int npending)
+{
+        struct re_softc		*sc;
+        struct ifnet		*ifp;
+        int 				done;
+
+        sc = arg;
+
+        RE_LOCK(sc);
+
+        ifp = RE_GET_IFNET(sc);
+
+        if (sc->suspended ||
+            (ifp->if_drv_flags & IFF_DRV_RUNNING) == 0) {
+                RE_UNLOCK(sc);
+                return;
+        }
+
+        done = re_rxeof(sc);
+
+        re_txeof(sc);
+
+        if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
+                re_start_locked(ifp);
+
+        RE_UNLOCK(sc);
+
+#if OS_VER>=VERSION(7,0)
+        if (done >= RE_RX_BUDGET) {
+#if OS_VER < VERSION(11,0)
+                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask_poll);
+#else ////OS_VER < VERSION(11,0)
+                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask_poll);
+#endif //OS_VER < VERSION(11,0)
+                return;
+        }
+#endif //OS_VER>=VERSION(7,0)
+
+        /* Re-enable interrupts. */
+        CSR_WRITE_4(sc, RE_IMR0_8125, RE_INTRS);
+}
+
 static void re_int_task_8125(void *arg, int npending)
 {
         struct re_softc		*sc;
         struct ifnet		*ifp;
-        u_int32_t		status;
+        int 				done;
+        u_int32_t			status;
 
         sc = arg;
 
@@ -7273,7 +8783,7 @@ static void re_int_task_8125(void *arg, int npending)
                 return;
         }
 
-        re_rxeof(sc);
+        done = re_rxeof(sc);
 
         re_txeof(sc);
 
@@ -7282,17 +8792,17 @@ static void re_int_task_8125(void *arg, int npending)
                 re_init(sc);
         }
 
+        if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
+                re_start_locked(ifp);
+
         RE_UNLOCK(sc);
 
-        if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
-                re_start(ifp);
-
 #if OS_VER>=VERSION(7,0)
-        if (CSR_READ_4(sc, RE_ISR0_8125) & RE_INTRS) {
+        if (done >= RE_RX_BUDGET) {
 #if OS_VER < VERSION(11,0)
-                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask);
+                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask_poll);
 #else ////OS_VER < VERSION(11,0)
-                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask);
+                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask_poll);
 #endif //OS_VER < VERSION(11,0)
                 return;
         }
@@ -7465,16 +8975,16 @@ caddr_t			data;
         case SIOCSIFMTU:
 
                 //printf("before mtu =%d\n",(int)ifp->if_mtu);
-                if (ifr->ifr_mtu > sc->max_jumbo_frame_size)
+                if (ifr->ifr_mtu > sc->max_jumbo_frame_size) {
                         error = EINVAL;
-                else {
+                        break;
+                }
+                RE_LOCK(sc);
+                if (ifp->if_mtu != ifr->ifr_mtu) {
                         ifp->if_mtu = ifr->ifr_mtu;
-
                         //if running
                         if (ifp->if_drv_flags & IFF_DRV_RUNNING) {
                                 //printf("set mtu when running\n");
-
-                                RE_LOCK(sc);
                                 re_stop(sc);
 
                                 re_release_buf(sc);
@@ -7484,23 +8994,26 @@ caddr_t			data;
                                 if (error == 0) {
                                         re_init(sc);
                                 }
-                                RE_UNLOCK(sc);
-
                         } else {
                                 //if not running
-                                RE_LOCK(sc);
                                 re_release_buf(sc);
                                 set_rxbufsize(sc);
-                                error =re_alloc_buf(sc);
+                                error = re_alloc_buf(sc);
                                 if (error == 0) {
                                         /* Init descriptors. */
                                         re_var_init(sc);
                                 }
-                                RE_UNLOCK(sc);
+
                         }
 
+                        if (ifp->if_mtu > ETHERMTU) {
+                                ifp->if_capenable &= ~(IFCAP_TSO |
+                                                       IFCAP_VLAN_HWTSO);
+                                ifp->if_hwassist &= ~CSUM_TSO;
+                        }
+                        //	printf("after mtu =%d\n",(int)ifp->if_mtu);
                 }
-                //	printf("after mtu =%d\n",(int)ifp->if_mtu);
+                RE_UNLOCK(sc);
                 break;
         case SIOCSIFFLAGS:
                 RE_LOCK(sc);
@@ -7533,9 +9046,22 @@ caddr_t			data;
                                 if ((sc->re_type == MACFG_24) || (sc->re_type == MACFG_25) || (sc->re_type == MACFG_26))
                                         ifp->if_hwassist |= CSUM_TCP | CSUM_UDP;
                                 else
-                                        ifp->if_hwassist |= RE_CSUM_FEATURES;
+                                        ifp->if_hwassist |= RE_CSUM_FEATURES_IPV4;
                         } else
-                                ifp->if_hwassist &= ~RE_CSUM_FEATURES;
+                                ifp->if_hwassist &= ~RE_CSUM_FEATURES_IPV4;
+                        reinit = 1;
+                }
+
+                if ((mask & IFCAP_TXCSUM_IPV6) != 0 && (ifp->if_capabilities & IFCAP_TXCSUM_IPV6) != 0) {
+                        ifp->if_capenable ^= IFCAP_TXCSUM_IPV6;
+                        if ((ifp->if_capenable & IFCAP_TXCSUM_IPV6) != 0)  {
+                                ifp->if_hwassist |= RE_CSUM_FEATURES_IPV6;
+                        } else
+                                ifp->if_hwassist &= ~RE_CSUM_FEATURES_IPV6;
+
+                        if (!((sc->re_if_flags & RL_FLAG_DESCV2) &&
+                              (sc->re_if_flags & RL_FLAG_8168G_PLUS)))
+                                ifp->if_hwassist &= ~RE_CSUM_FEATURES_IPV6;
                         reinit = 1;
                 }
 
@@ -7545,17 +9071,57 @@ caddr_t			data;
                         reinit = 1;
                 }
 
+                if ((mask & IFCAP_RXCSUM_IPV6) != 0 &&
+                    (ifp->if_capabilities & IFCAP_RXCSUM_IPV6) != 0) {
+                        ifp->if_capenable ^= IFCAP_RXCSUM_IPV6;
+                        reinit = 1;
+                }
+
                 if ((ifp->if_mtu <= ETHERMTU) || ((sc->re_type>= MACFG_3) &&(sc->re_type <=MACFG_6)) || ((sc->re_type>= MACFG_21) && (sc->re_type <=MACFG_23))) {
                         if (ifp->if_capenable & IFCAP_TXCSUM)
                                 sc->re_tx_cstag = 1;
                         else
                                 sc->re_tx_cstag = 0;
 
-                        if (ifp->if_capenable & IFCAP_RXCSUM)
+                        if (ifp->if_capenable & (IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6))
                                 sc->re_rx_cstag = 1;
                         else
                                 sc->re_rx_cstag = 0;
                 }
+
+                if ((mask & IFCAP_TSO4) != 0 &&
+                    (ifp->if_capabilities & IFCAP_TSO4) != 0) {
+                        ifp->if_capenable ^= IFCAP_TSO4;
+                        if ((IFCAP_TSO4 & ifp->if_capenable) != 0)
+                                ifp->if_hwassist |= CSUM_IP_TSO;
+                        else
+                                ifp->if_hwassist &= ~CSUM_IP_TSO;
+                        if (ifp->if_mtu > ETHERMTU) {
+                                ifp->if_capenable &= ~IFCAP_TSO4;
+                                ifp->if_hwassist &= ~CSUM_IP_TSO;
+                        }
+                }
+                /*
+                if ((mask & IFCAP_TSO6) != 0 &&
+                (ifp->if_capabilities & IFCAP_TSO6) != 0) {
+                ifp->if_capenable ^= IFCAP_TSO6;
+                if ((IFCAP_TSO6 & ifp->if_capenable) != 0)
+                ifp->if_hwassist |= CSUM_IP6_TSO;
+                else
+                ifp->if_hwassist &= ~CSUM_IP6_TSO;
+                if (ifp->if_mtu > ETHERMTU) {
+                ifp->if_capenable &= ~IFCAP_TSO6;
+                ifp->if_hwassist &= ~CSUM_IP6_TSO;
+                }
+                if (ifp->if_mtu > ETHERMTU) {
+                ifp->if_capenable &= ~IFCAP_TSO6;
+                ifp->if_hwassist &= ~CSUM_IP6_TSO;
+                }
+                }
+                */
+                if ((mask & IFCAP_VLAN_HWTSO) != 0 &&
+                    (ifp->if_capabilities & IFCAP_VLAN_HWTSO) != 0)
+                        ifp->if_capenable ^= IFCAP_VLAN_HWTSO;
                 if ((mask & IFCAP_VLAN_HWTAGGING) != 0 &&
                     (ifp->if_capabilities & IFCAP_VLAN_HWTAGGING) != 0) {
                         ifp->if_capenable ^= IFCAP_VLAN_HWTAGGING;
@@ -7564,6 +9130,8 @@ caddr_t			data;
                         //	ifp->if_capenable &= ~IFCAP_VLAN_HWTSO;
                         reinit = 1;
                 }
+                if (mask & IFCAP_LRO)
+                        ifp->if_capenable ^= IFCAP_LRO;
 
                 if ((mask & IFCAP_WOL) != 0 &&
                     (ifp->if_capabilities & IFCAP_WOL) != 0) {
@@ -7645,9 +9213,12 @@ static void re_link_on_patch(struct re_softc *sc)
                     sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
                     sc->re_type == MACFG_70 || sc->re_type == MACFG_71 ||
                     sc->re_type == MACFG_72 || sc->re_type == MACFG_73 ||
-                    sc->re_type == MACFG_73 || sc->re_type == MACFG_80 ||
+                    sc->re_type == MACFG_74 || sc->re_type == MACFG_75 ||
+                    sc->re_type == MACFG_76 || sc->re_type == MACFG_80 ||
                     sc->re_type == MACFG_81 || sc->re_type == MACFG_82 ||
-                    sc->re_type == MACFG_83) && (ifp->if_flags & IFF_UP)) {
+                    sc->re_type == MACFG_83 || sc->re_type == MACFG_90 ||
+                    sc->re_type == MACFG_91 || sc->re_type == MACFG_92) &&
+                   (ifp->if_flags & IFF_UP)) {
                 if (CSR_READ_1(sc, RE_PHY_STATUS) & RL_PHY_STATUS_FULL_DUP)
                         CSR_WRITE_4(sc, RE_TXCFG, (CSR_READ_4(sc, RE_TXCFG) | (BIT_24 | BIT_25)) & ~BIT_19);
                 else
@@ -7659,7 +9230,7 @@ static void re_link_on_patch(struct re_softc *sc)
                 /*half mode*/
                 if (!(CSR_READ_1(sc, RE_PHY_STATUS) & RL_PHY_STATUS_FULL_DUP)) {
                         MP_WritePhyUshort(sc, 0x1F, 0x0000);
-                        MP_WritePhyUshort(sc, MII_ANAR, MP_ReadPhyUshort(sc, MII_ANAR)&~(ANAR_PAUSE_SYM |ANAR_PAUSE_ASYM));
+                        MP_WritePhyUshort(sc, MII_ANAR, MP_ReadPhyUshort(sc, MII_ANAR)&~(ANAR_FC |ANAR_PAUSE_ASYM));
                 }
         }
 
@@ -7672,7 +9243,9 @@ static void re_link_on_patch(struct re_softc *sc)
                         Data32 |= BIT_1;
                         re_eri_write(sc, 0x1D0, 1, Data32, ERIAR_ExGMAC);
                 } else if (sc->re_type == MACFG_80 || sc->re_type == MACFG_81 ||
-                           sc->re_type == MACFG_82 || sc->re_type == MACFG_83) {
+                           sc->re_type == MACFG_82 || sc->re_type == MACFG_83 ||
+                           sc->re_type == MACFG_90 || sc->re_type == MACFG_91 ||
+                           sc->re_type == MACFG_92) {
                         MP_WriteMcuAccessRegWord(sc, 0xE080, MP_ReadMcuAccessRegWord(sc, 0xE080)|BIT_1);
                 }
         }
@@ -7682,15 +9255,9 @@ static void re_link_on_patch(struct re_softc *sc)
 
 static void re_link_down_patch(struct re_softc *sc)
 {
-        struct ifnet		*ifp;
-
-        ifp = RE_GET_IFNET(sc);
-
         re_txeof(sc);
         re_rxeof(sc);
         re_stop(sc);
-
-        sc->ifmedia_upd(ifp);
 }
 
 /*
@@ -7816,7 +9383,7 @@ static int re_ifmedia_upd(struct ifnet *ifp)
         if (sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
             sc->re_type == MACFG_70 || sc->re_type == MACFG_71 ||
             sc->re_type == MACFG_72 || sc->re_type == MACFG_73 ||
-            sc->re_type == MACFG_74) {
+            sc->re_type == MACFG_74 || sc->re_type == MACFG_75) {
                 //Disable Giga Lite
                 MP_WritePhyUshort(sc, 0x1F, 0x0A42);
                 ClearEthPhyBit(sc, 0x14, BIT_9);
@@ -7891,11 +9458,11 @@ static int re_ifmedia_upd(struct ifnet *ifp)
         if (sc->re_device_id==RT_DEVICEID_8169 || sc->re_device_id==RT_DEVICEID_8169SC ||
             sc->re_device_id==RT_DEVICEID_8168 || sc->re_device_id==RT_DEVICEID_8161 ||
             sc->re_device_id==RT_DEVICEID_8162) {
-                MP_WritePhyUshort(sc, MII_ANAR, anar | 0x0800 | ANAR_FC);
+                MP_WritePhyUshort(sc, MII_ANAR, anar | ANAR_FC | ANAR_PAUSE_ASYM);
                 MP_WritePhyUshort(sc, MII_100T2CR, gbcr);
                 MP_WritePhyUshort(sc, MII_BMCR, BMCR_RESET | BMCR_AUTOEN | BMCR_STARTNEG);
         } else if (sc->re_type == MACFG_36) {
-                MP_WritePhyUshort(sc, MII_ANAR, anar | 0x0800 | ANAR_FC);
+                MP_WritePhyUshort(sc, MII_ANAR, anar | ANAR_FC | ANAR_PAUSE_ASYM);
                 MP_WritePhyUshort(sc, MII_BMCR, BMCR_RESET | BMCR_AUTOEN | BMCR_STARTNEG);
         } else {
                 MP_WritePhyUshort(sc, MII_ANAR, anar | 1);
@@ -7911,7 +9478,7 @@ static int re_ifmedia_upd_8125(struct ifnet *ifp)
         struct ifmedia	*ifm = &sc->media;
         int anar;
         int gbcr;
-        int cr2500 = 0;
+        int cr2500;
 
         if (IFM_TYPE(ifm->ifm_media) != IFM_ETHER)
                 return(EINVAL);
@@ -7919,72 +9486,50 @@ static int re_ifmedia_upd_8125(struct ifnet *ifp)
         //Disable Giga Lite
         ClearEthPhyOcpBit(sc, 0xA428, BIT_9);
         ClearEthPhyOcpBit(sc, 0xA5EA, BIT_0);
+        if (sc->re_device_id == RT_DEVICEID_8126)
+                ClearEthPhyOcpBit(sc, 0xB5EA, BIT_1);
 
-        cr2500 = MP_RealReadPhyOcpRegWord(sc, 0xA5D4);
-        cr2500 &= ~RTK_ADVERTISE_2500FULL;
+        cr2500 = MP_RealReadPhyOcpRegWord(sc, 0xA5D4) &
+                 ~(RTK_ADVERTISE_2500FULL | RTK_ADVERTISE_5000FULL);
+        gbcr = MP_ReadPhyUshort(sc, MII_100T2CR) &
+               ~(GTCR_ADV_1000TFDX | GTCR_ADV_1000THDX);
+        anar = MP_ReadPhyUshort(sc, MII_ANAR) &
+               ~(ANAR_10 | ANAR_10_FD | ANAR_TX | ANAR_TX_FD | ANAR_FC | ANAR_PAUSE_ASYM);
 
         switch (IFM_SUBTYPE(ifm->ifm_media)) {
         case IFM_AUTO:
-                cr2500 |= RTK_ADVERTISE_2500FULL;
-                anar = ANAR_TX_FD |
-                       ANAR_TX |
-                       ANAR_10_FD |
-                       ANAR_10;
-                gbcr = GTCR_ADV_1000TFDX |
-                       GTCR_ADV_1000THDX;
-                break;
+        case IFM_5000_T:
+                if (sc->re_device_id == RT_DEVICEID_8126)
+                        cr2500 |= RTK_ADVERTISE_5000FULL;
+        /*	FALLTHROUGH */
         case IFM_2500_SX:
         case IFM_2500_X:
         case IFM_2500_T:
                 cr2500 |= RTK_ADVERTISE_2500FULL;
-                anar = ANAR_TX_FD |
-                       ANAR_TX |
-                       ANAR_10_FD |
-                       ANAR_10;
-                gbcr = GTCR_ADV_1000TFDX |
-                       GTCR_ADV_1000THDX;
-                break;
+        /*	FALLTHROUGH */
+        case MACFG_80:
         case IFM_1000_SX:
 #if OS_VER < 500000
         case IFM_1000_TX:
 #else
         case IFM_1000_T:
 #endif
-                anar = ANAR_TX_FD |
-                       ANAR_TX |
-                       ANAR_10_FD |
-                       ANAR_10;
-                gbcr = GTCR_ADV_1000TFDX |
-                       GTCR_ADV_1000THDX;
-                break;
+                gbcr |= GTCR_ADV_1000TFDX;
+                anar |= ANAR_TX_FD;
+        /*	FALLTHROUGH */
         case IFM_100_TX:
-                gbcr = MP_ReadPhyUshort(sc, MII_100T2CR) &
-                       ~(GTCR_ADV_1000TFDX | GTCR_ADV_1000THDX);
-                if ((ifm->ifm_media & IFM_GMASK) == IFM_FDX) {
-                        anar = ANAR_TX_FD |
-                               ANAR_TX |
-                               ANAR_10_FD |
-                               ANAR_10;
-                } else {
-                        anar = ANAR_TX |
-                               ANAR_10_FD |
-                               ANAR_10;
-                }
-                break;
+                anar |= ANAR_TX | ANAR_10_FD;
+                if ((ifm->ifm_media & IFM_GMASK) == IFM_FDX)
+                        anar |= ANAR_TX_FD;
+        /*	FALLTHROUGH */
         case IFM_10_T:
-                gbcr = MP_ReadPhyUshort(sc, MII_100T2CR) &
-                       ~(GTCR_ADV_1000TFDX | GTCR_ADV_1000THDX);
-                if ((ifm->ifm_media & IFM_GMASK) == IFM_FDX) {
-                        anar = ANAR_10_FD |
-                               ANAR_10;
-                } else {
-                        anar = ANAR_10;
-                }
+                anar |= ANAR_10;
+                if ((ifm->ifm_media & IFM_GMASK) == IFM_FDX)
+                        anar |= ANAR_10_FD;
 
                 if (sc->re_type == MACFG_13) {
                         MP_WritePhyUshort(sc, MII_BMCR, 0x8000);
                 }
-
                 break;
         default:
                 printf("re%d: Unsupported media type\n", sc->re_unit);
@@ -7993,7 +9538,7 @@ static int re_ifmedia_upd_8125(struct ifnet *ifp)
 
         MP_WritePhyUshort(sc, 0x1F, 0x0000);
         MP_RealWritePhyOcpRegWord(sc, 0xA5D4, cr2500);
-        MP_WritePhyUshort(sc, MII_ANAR, anar | 0x0800 | ANAR_FC);
+        MP_WritePhyUshort(sc, MII_ANAR, anar | ANAR_FC | ANAR_PAUSE_ASYM);
         MP_WritePhyUshort(sc, MII_100T2CR, gbcr);
         MP_WritePhyUshort(sc, MII_BMCR, BMCR_RESET | BMCR_AUTOEN | BMCR_STARTNEG);
 
@@ -8077,6 +9622,10 @@ struct ifmediareq	*ifmr;
                         ifmr->ifm_active |= IFM_1000_T;
                 else if (msr & RL_PHY_STATUS_2500MF)
                         ifmr->ifm_active |= IFM_2500_T;
+                else if (msr & RL_PHY_STATUS_5000MF_LITE)
+                        ifmr->ifm_active |= IFM_2500_T;
+                else if (msr & RL_PHY_STATUS_5000MF)
+                        ifmr->ifm_active |= IFM_5000_T;
         }
 
         RE_UNLOCK(sc);
@@ -8226,6 +9775,7 @@ static int re_enable_EEE(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
                 data = re_eri_read(sc, 0x1B0, 4, ERIAR_ExGMAC);
                 data |= BIT_1 | BIT_0;
                 re_eri_write(sc, 0x1B0, 4, data, ERIAR_ExGMAC);
@@ -8263,6 +9813,18 @@ static int re_enable_EEE(struct re_softc *sc)
                 ClearEthPhyOcpBit(sc, 0xA4A2, BIT_9);
                 break;
 
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
+                SetMcuAccessRegBit(sc, 0xE040, (BIT_1|BIT_0));
+
+                SetEthPhyOcpBit(sc, 0xA5D0, (BIT_2 | BIT_1));
+                ClearEthPhyOcpBit(sc, 0xA6D4, (BIT_1|BIT_0));
+
+                ClearEthPhyOcpBit(sc, 0xA428, BIT_7);
+                ClearEthPhyOcpBit(sc, 0xA4A2, BIT_9);
+                break;
+
         default:
                 ret = -EOPNOTSUPP;
                 break;
@@ -8272,6 +9834,7 @@ static int re_enable_EEE(struct re_softc *sc)
         case MACFG_68:
         case MACFG_69:
         case MACFG_74:
+        case MACFG_75:
                 MP_WritePhyUshort(sc, 0x1F, 0x0A4A);
                 SetEthPhyBit(sc, 0x11, BIT_9);
                 MP_WritePhyUshort(sc, 0x1F, 0x0A42);
@@ -8292,10 +9855,14 @@ static int re_enable_EEE(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 re_set_phy_mcu_patch_request(sc);
                 break;
         }
@@ -8370,6 +9937,7 @@ static int re_enable_EEE(struct re_softc *sc)
         case MACFG_68:
         case MACFG_69:
         case MACFG_74:
+        case MACFG_75:
                 ClearMcuAccessRegBit(sc, 0xE052, BIT_0);
 
                 MP_WritePhyUshort(sc, 0x1F, 0x0A43);
@@ -8385,6 +9953,9 @@ static int re_enable_EEE(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 ClearMcuAccessRegBit(sc, 0xE052, BIT_0);
                 ClearEthPhyOcpBit(sc, 0xA442, BIT_12 | BIT_13);
                 ClearEthPhyOcpBit(sc, 0xA430, BIT_15);
@@ -8402,10 +9973,14 @@ static int re_enable_EEE(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 re_clear_phy_mcu_patch_request(sc);
                 break;
         }
@@ -8566,12 +10141,16 @@ static int re_disable_EEE(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
                 data = re_eri_read(sc, 0x1B0, 4, ERIAR_ExGMAC);
                 data &= ~(BIT_1 | BIT_0);
                 re_eri_write(sc, 0x1B0, 4, data, ERIAR_ExGMAC);
                 MP_WritePhyUshort(sc, 0x1F, 0x0A43);
                 data = MP_ReadPhyUshort(sc, 0x11);
-                MP_WritePhyUshort(sc, 0x11, data & ~BIT_4);
+                if (sc->re_type == MACFG_75)
+                        MP_WritePhyUshort(sc, 0x11, data | BIT_4);
+                else
+                        MP_WritePhyUshort(sc, 0x11, data & ~BIT_4);
                 MP_WritePhyUshort(sc, 0x1F, 0x0A5D);
                 MP_WritePhyUshort(sc, 0x10, 0x0000);
                 MP_WritePhyUshort(sc, 0x1F, 0x0000);
@@ -8603,6 +10182,18 @@ static int re_disable_EEE(struct re_softc *sc)
                 ClearEthPhyOcpBit(sc, 0xA4A2, BIT_9);
                 break;
 
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
+                ClearMcuAccessRegBit(sc, 0xE040, (BIT_1|BIT_0));
+
+                ClearEthPhyOcpBit(sc, 0xA5D0, (BIT_2 | BIT_1));
+                ClearEthPhyOcpBit(sc, 0xA6D4, (BIT_0 | BIT_1));
+
+                ClearEthPhyOcpBit(sc, 0xA428, BIT_7);
+                ClearEthPhyOcpBit(sc, 0xA4A2, BIT_9);
+                break;
+
         default:
                 ret = -EOPNOTSUPP;
                 break;
@@ -8612,6 +10203,7 @@ static int re_disable_EEE(struct re_softc *sc)
         case MACFG_68:
         case MACFG_69:
         case MACFG_74:
+        case MACFG_75:
                 MP_WritePhyUshort(sc, 0x1F, 0x0A42);
                 ClearEthPhyBit(sc, 0x14, BIT_7);
                 MP_WritePhyUshort(sc, 0x1F, 0x0A4A);
@@ -8632,10 +10224,14 @@ static int re_disable_EEE(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 re_set_phy_mcu_patch_request(sc);
                 break;
         }
@@ -8675,6 +10271,7 @@ static int re_disable_EEE(struct re_softc *sc)
         case MACFG_68:
         case MACFG_69:
         case MACFG_74:
+        case MACFG_75:
                 data = MP_ReadMcuAccessRegWord(sc, 0xE052);
                 data &= ~(BIT_0);
                 MP_WriteMcuAccessRegWord(sc, 0xE052, data);
@@ -8692,6 +10289,9 @@ static int re_disable_EEE(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 ClearMcuAccessRegBit(sc, 0xE052, BIT_0);
                 ClearEthPhyOcpBit(sc, 0xA442, BIT_12 | BIT_13);
                 ClearEthPhyOcpBit(sc, 0xA430, BIT_15);
@@ -8709,10 +10309,14 @@ static int re_disable_EEE(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 re_clear_phy_mcu_patch_request(sc);
                 break;
         }
@@ -8865,6 +10469,8 @@ static int re_hw_phy_mcu_code_ver_matched(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 MP_WritePhyUshort(sc, 0x1F, 0x0A43);
                 MP_WritePhyUshort(sc, 0x13, 0x801E);
                 sc->re_hw_ram_code_ver = MP_ReadPhyUshort(sc, 0x14);
@@ -8874,6 +10480,9 @@ static int re_hw_phy_mcu_code_ver_matched(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x801E);
                 sc->re_hw_ram_code_ver = MP_RealReadPhyOcpRegWord(sc, 0xA438);
                 break;
@@ -8925,6 +10534,8 @@ static void re_write_hw_phy_mcu_code_ver(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 MP_WritePhyUshort(sc, 0x1F, 0x0A43);
                 MP_WritePhyUshort(sc, 0x13, 0x801E);
                 MP_WritePhyUshort(sc, 0x14, sc->re_sw_ram_code_ver);
@@ -8935,6 +10546,9 @@ static void re_write_hw_phy_mcu_code_ver(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x801E);
                 MP_RealWritePhyOcpRegWord(sc, 0xA438, sc->re_sw_ram_code_ver);
                 sc->re_hw_ram_code_ver = sc->re_sw_ram_code_ver;
@@ -9011,6 +10625,8 @@ re_set_phy_mcu_patch_request(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 MP_WritePhyUshort(sc, 0x1f, 0x0B82);
                 SetEthPhyBit(sc, 0x10, BIT_4);
 
@@ -9031,6 +10647,9 @@ re_set_phy_mcu_patch_request(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 SetEthPhyOcpBit(sc, 0xB820, BIT_4);
 
                 WaitCount = 0;
@@ -9072,6 +10691,8 @@ re_clear_phy_mcu_patch_request(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
                 MP_WritePhyUshort(sc, 0x1f, 0x0B82);
                 ClearEthPhyBit(sc, 0x10, BIT_4);
 
@@ -9092,6 +10713,9 @@ re_clear_phy_mcu_patch_request(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
                 ClearEthPhyOcpBit(sc, 0xB820, BIT_4);
 
                 WaitCount = 0;
@@ -19944,23 +21568,45 @@ static void re_set_phy_mcu_8168h_2(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x13, 0xA014);
         MP_WritePhyUshort(sc, 0x14, 0x2c04);
         MP_WritePhyUshort(sc, 0x14, 0x2c09);
-        MP_WritePhyUshort(sc, 0x14, 0x2c09);
-        MP_WritePhyUshort(sc, 0x14, 0x2c09);
+        MP_WritePhyUshort(sc, 0x14, 0x2c0d);
+        MP_WritePhyUshort(sc, 0x14, 0x2c12);
         MP_WritePhyUshort(sc, 0x14, 0xad01);
         MP_WritePhyUshort(sc, 0x14, 0xad01);
         MP_WritePhyUshort(sc, 0x14, 0xad01);
         MP_WritePhyUshort(sc, 0x14, 0xad01);
         MP_WritePhyUshort(sc, 0x14, 0x236c);
+        MP_WritePhyUshort(sc, 0x14, 0xd03c);
+        MP_WritePhyUshort(sc, 0x14, 0xd1aa);
+        MP_WritePhyUshort(sc, 0x14, 0xc010);
+        MP_WritePhyUshort(sc, 0x14, 0x2745);
+        MP_WritePhyUshort(sc, 0x14, 0x33de);
+        MP_WritePhyUshort(sc, 0x14, 0x16ba);
+        MP_WritePhyUshort(sc, 0x14, 0x31ee);
+        MP_WritePhyUshort(sc, 0x14, 0x2712);
+        MP_WritePhyUshort(sc, 0x14, 0x274e);
+        MP_WritePhyUshort(sc, 0x14, 0xc2bb);
+        MP_WritePhyUshort(sc, 0x14, 0xd500);
+        MP_WritePhyUshort(sc, 0x14, 0xc426);
+        MP_WritePhyUshort(sc, 0x14, 0xd01d);
+        MP_WritePhyUshort(sc, 0x14, 0xd1c3);
+        MP_WritePhyUshort(sc, 0x14, 0x401c);
+        MP_WritePhyUshort(sc, 0x14, 0xd501);
+        MP_WritePhyUshort(sc, 0x14, 0xc2b3);
+        MP_WritePhyUshort(sc, 0x14, 0xd500);
+        MP_WritePhyUshort(sc, 0x14, 0xd00b);
+        MP_WritePhyUshort(sc, 0x14, 0xd1c3);
+        MP_WritePhyUshort(sc, 0x14, 0x401c);
+        MP_WritePhyUshort(sc, 0x14, 0x241a);
         MP_WritePhyUshort(sc, 0x13, 0xA01A);
         MP_WritePhyUshort(sc, 0x14, 0x0000);
         MP_WritePhyUshort(sc, 0x13, 0xA006);
-        MP_WritePhyUshort(sc, 0x14, 0x0fff);
+        MP_WritePhyUshort(sc, 0x14, 0x0414);
         MP_WritePhyUshort(sc, 0x13, 0xA004);
-        MP_WritePhyUshort(sc, 0x14, 0x0fff);
+        MP_WritePhyUshort(sc, 0x14, 0x074c);
         MP_WritePhyUshort(sc, 0x13, 0xA002);
-        MP_WritePhyUshort(sc, 0x14, 0x0fff);
+        MP_WritePhyUshort(sc, 0x14, 0x0744);
         MP_WritePhyUshort(sc, 0x13, 0xA000);
-        MP_WritePhyUshort(sc, 0x14, 0x136b);
+        MP_WritePhyUshort(sc, 0x14, 0xf36b);
         MP_WritePhyUshort(sc, 0x13, 0xB820);
         MP_WritePhyUshort(sc, 0x14, 0x0210);
 
@@ -20272,6 +21918,7 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
 
         re_set_phy_mcu_patch_request(sc);
 
+
         MP_WritePhyUshort(sc, 0x1f, 0x0A43);
         MP_WritePhyUshort(sc, 0x13, 0x8042);
         MP_WritePhyUshort(sc, 0x14, 0x3800);
@@ -20288,15 +21935,57 @@ static void re_set_phy_mcu_8168h_3(struct re_softc *sc)
         MP_WritePhyUshort(sc, 0x14, 0x0000);
         MP_WritePhyUshort(sc, 0x13, 0xA014);
         MP_WritePhyUshort(sc, 0x14, 0x1800);
-        MP_WritePhyUshort(sc, 0x14, 0x8002);
+        MP_WritePhyUshort(sc, 0x14, 0x8010);
+        MP_WritePhyUshort(sc, 0x14, 0x1800);
+        MP_WritePhyUshort(sc, 0x14, 0x8014);
+        MP_WritePhyUshort(sc, 0x14, 0x1800);
+        MP_WritePhyUshort(sc, 0x14, 0x8022);
+        MP_WritePhyUshort(sc, 0x14, 0x1800);
+        MP_WritePhyUshort(sc, 0x14, 0x8022);
+        MP_WritePhyUshort(sc, 0x14, 0x1800);
+        MP_WritePhyUshort(sc, 0x14, 0x8022);
+        MP_WritePhyUshort(sc, 0x14, 0x1800);
+        MP_WritePhyUshort(sc, 0x14, 0x8022);
+        MP_WritePhyUshort(sc, 0x14, 0x1800);
+        MP_WritePhyUshort(sc, 0x14, 0x8022);
+        MP_WritePhyUshort(sc, 0x14, 0x1800);
+        MP_WritePhyUshort(sc, 0x14, 0x8022);
         MP_WritePhyUshort(sc, 0x14, 0x2b5d);
         MP_WritePhyUshort(sc, 0x14, 0x0c68);
         MP_WritePhyUshort(sc, 0x14, 0x1800);
         MP_WritePhyUshort(sc, 0x14, 0x0b3c);
+        MP_WritePhyUshort(sc, 0x14, 0xc2bb);
+        MP_WritePhyUshort(sc, 0x14, 0xd500);
+        MP_WritePhyUshort(sc, 0x14, 0xc426);
+        MP_WritePhyUshort(sc, 0x14, 0xd01d);
+        MP_WritePhyUshort(sc, 0x14, 0xd1c3);
+        MP_WritePhyUshort(sc, 0x14, 0x401c);
+        MP_WritePhyUshort(sc, 0x14, 0xd501);
+        MP_WritePhyUshort(sc, 0x14, 0xc2b3);
+        MP_WritePhyUshort(sc, 0x14, 0xd500);
+        MP_WritePhyUshort(sc, 0x14, 0xd00b);
+        MP_WritePhyUshort(sc, 0x14, 0xd1c3);
+        MP_WritePhyUshort(sc, 0x14, 0x401c);
+        MP_WritePhyUshort(sc, 0x14, 0x1800);
+        MP_WritePhyUshort(sc, 0x14, 0x0478);
+        MP_WritePhyUshort(sc, 0x13, 0xA026);
+        MP_WritePhyUshort(sc, 0x14, 0x0fff);
+        MP_WritePhyUshort(sc, 0x13, 0xA024);
+        MP_WritePhyUshort(sc, 0x14, 0x0fff);
+        MP_WritePhyUshort(sc, 0x13, 0xA022);
+        MP_WritePhyUshort(sc, 0x14, 0x0fff);
+        MP_WritePhyUshort(sc, 0x13, 0xA020);
+        MP_WritePhyUshort(sc, 0x14, 0x0fff);
+        MP_WritePhyUshort(sc, 0x13, 0xA006);
+        MP_WritePhyUshort(sc, 0x14, 0x0fff);
+        MP_WritePhyUshort(sc, 0x13, 0xA004);
+        MP_WritePhyUshort(sc, 0x14, 0x0fff);
+        MP_WritePhyUshort(sc, 0x13, 0xA002);
+        MP_WritePhyUshort(sc, 0x14, 0x0472);
         MP_WritePhyUshort(sc, 0x13, 0xA000);
         MP_WritePhyUshort(sc, 0x14, 0x0b3a);
         MP_WritePhyUshort(sc, 0x13, 0xA008);
-        MP_WritePhyUshort(sc, 0x14, 0x0100);
+        MP_WritePhyUshort(sc, 0x14, 0x0300);
         MP_WritePhyUshort(sc, 0x13, 0xB820);
         MP_WritePhyUshort(sc, 0x14, 0x0010);
 
@@ -24155,6 +25844,2351 @@ static const u_int16_t phy_mcu_ram_code_8125b_2[] = {
         0xFFFF, 0xFFFF
 };
 
+static const u_int16_t phy_mcu_ram_code_8126a_1_1[] = {
+        0xa436, 0x8023, 0xa438, 0x4900, 0xa436, 0xB82E, 0xa438, 0x0001,
+        0xBFBA, 0xE000, 0xBF1A, 0xC1B9, 0xBFA8, 0x10F0, 0xBFB0, 0x0210,
+        0xBFB4, 0xE7E4, 0xb820, 0x0090, 0xa436, 0xA016, 0xa438, 0x0000,
+        0xa436, 0xA012, 0xa438, 0x0000, 0xa436, 0xA014, 0xa438, 0x1800,
+        0xa438, 0x8010, 0xa438, 0x1800, 0xa438, 0x8062, 0xa438, 0x1800,
+        0xa438, 0x8069, 0xa438, 0x1800, 0xa438, 0x80e2, 0xa438, 0x1800,
+        0xa438, 0x80eb, 0xa438, 0x1800, 0xa438, 0x80f5, 0xa438, 0x1800,
+        0xa438, 0x811b, 0xa438, 0x1800, 0xa438, 0x8120, 0xa438, 0xd500,
+        0xa438, 0xd049, 0xa438, 0xd1b9, 0xa438, 0xa208, 0xa438, 0x8208,
+        0xa438, 0xd503, 0xa438, 0xa104, 0xa438, 0x0c07, 0xa438, 0x0902,
+        0xa438, 0xd500, 0xa438, 0xbc10, 0xa438, 0xc484, 0xa438, 0xd503,
+        0xa438, 0xcc02, 0xa438, 0xcd0d, 0xa438, 0xaf01, 0xa438, 0xd500,
+        0xa438, 0xd703, 0xa438, 0x4531, 0xa438, 0xbd08, 0xa438, 0x1000,
+        0xa438, 0x16bb, 0xa438, 0xd75e, 0xa438, 0x5fb3, 0xa438, 0xd503,
+        0xa438, 0xd04d, 0xa438, 0xd1c7, 0xa438, 0x0cf0, 0xa438, 0x0e10,
+        0xa438, 0xd704, 0xa438, 0x5ffc, 0xa438, 0xd04d, 0xa438, 0xd1c7,
+        0xa438, 0x0cf0, 0xa438, 0x0e20, 0xa438, 0xd704, 0xa438, 0x5ffc,
+        0xa438, 0xd04d, 0xa438, 0xd1c7, 0xa438, 0x0cf0, 0xa438, 0x0e40,
+        0xa438, 0xd704, 0xa438, 0x5ffc, 0xa438, 0xd04d, 0xa438, 0xd1c7,
+        0xa438, 0x0cf0, 0xa438, 0x0e80, 0xa438, 0xd704, 0xa438, 0x5ffc,
+        0xa438, 0xd07b, 0xa438, 0xd1c5, 0xa438, 0x8ef0, 0xa438, 0xd704,
+        0xa438, 0x5ffc, 0xa438, 0x9d08, 0xa438, 0x1000, 0xa438, 0x16bb,
+        0xa438, 0xd75e, 0xa438, 0x7fb3, 0xa438, 0x1000, 0xa438, 0x16bb,
+        0xa438, 0xd75e, 0xa438, 0x5fad, 0xa438, 0x1000, 0xa438, 0x181f,
+        0xa438, 0xd703, 0xa438, 0x3181, 0xa438, 0x8059, 0xa438, 0x60ad,
+        0xa438, 0x1000, 0xa438, 0x16bb, 0xa438, 0xd703, 0xa438, 0x5fbb,
+        0xa438, 0x1000, 0xa438, 0x16bb, 0xa438, 0xd719, 0xa438, 0x7fa8,
+        0xa438, 0xd500, 0xa438, 0xd049, 0xa438, 0xd1b9, 0xa438, 0x1800,
+        0xa438, 0x0f0b, 0xa438, 0xd500, 0xa438, 0xd07b, 0xa438, 0xd1b5,
+        0xa438, 0xd0f6, 0xa438, 0xd1c5, 0xa438, 0x1800, 0xa438, 0x1049,
+        0xa438, 0xd707, 0xa438, 0x4121, 0xa438, 0xd706, 0xa438, 0x40fa,
+        0xa438, 0xd099, 0xa438, 0xd1c6, 0xa438, 0x1000, 0xa438, 0x16bb,
+        0xa438, 0xd704, 0xa438, 0x5fbc, 0xa438, 0xbc80, 0xa438, 0xc489,
+        0xa438, 0xd503, 0xa438, 0xcc08, 0xa438, 0xcd46, 0xa438, 0xaf01,
+        0xa438, 0xd500, 0xa438, 0x1000, 0xa438, 0x0903, 0xa438, 0x1000,
+        0xa438, 0x16bb, 0xa438, 0xd75e, 0xa438, 0x5f6d, 0xa438, 0x1000,
+        0xa438, 0x181f, 0xa438, 0xd504, 0xa438, 0xa210, 0xa438, 0xd500,
+        0xa438, 0x1000, 0xa438, 0x16bb, 0xa438, 0xd719, 0xa438, 0x5fbc,
+        0xa438, 0xd504, 0xa438, 0x8210, 0xa438, 0xd503, 0xa438, 0xc6d0,
+        0xa438, 0xa521, 0xa438, 0xcd49, 0xa438, 0xaf01, 0xa438, 0xd504,
+        0xa438, 0xa220, 0xa438, 0xd500, 0xa438, 0x1000, 0xa438, 0x16bb,
+        0xa438, 0xd75e, 0xa438, 0x5fad, 0xa438, 0x1000, 0xa438, 0x181f,
+        0xa438, 0xd503, 0xa438, 0xa704, 0xa438, 0x0c07, 0xa438, 0x0904,
+        0xa438, 0xd504, 0xa438, 0xa102, 0xa438, 0xd500, 0xa438, 0x1000,
+        0xa438, 0x16bb, 0xa438, 0xd718, 0xa438, 0x5fab, 0xa438, 0xd503,
+        0xa438, 0xc6f0, 0xa438, 0xa521, 0xa438, 0xd505, 0xa438, 0xa404,
+        0xa438, 0xd500, 0xa438, 0xd701, 0xa438, 0x6085, 0xa438, 0xd504,
+        0xa438, 0xc9f1, 0xa438, 0xf003, 0xa438, 0xd504, 0xa438, 0xc9f0,
+        0xa438, 0xd503, 0xa438, 0xcd4a, 0xa438, 0xaf01, 0xa438, 0xd500,
+        0xa438, 0xd504, 0xa438, 0xa802, 0xa438, 0xd500, 0xa438, 0x1000,
+        0xa438, 0x16bb, 0xa438, 0xd707, 0xa438, 0x5fb1, 0xa438, 0xd707,
+        0xa438, 0x5f10, 0xa438, 0xd505, 0xa438, 0xa402, 0xa438, 0xd503,
+        0xa438, 0xd707, 0xa438, 0x41a1, 0xa438, 0xd706, 0xa438, 0x60ba,
+        0xa438, 0x60fc, 0xa438, 0x0c07, 0xa438, 0x0204, 0xa438, 0xf009,
+        0xa438, 0x0c07, 0xa438, 0x0202, 0xa438, 0xf006, 0xa438, 0x0c07,
+        0xa438, 0x0206, 0xa438, 0xf003, 0xa438, 0x0c07, 0xa438, 0x0202,
+        0xa438, 0xd500, 0xa438, 0xd703, 0xa438, 0x3181, 0xa438, 0x80e0,
+        0xa438, 0x616d, 0xa438, 0xd701, 0xa438, 0x6065, 0xa438, 0x1800,
+        0xa438, 0x1229, 0xa438, 0x1000, 0xa438, 0x16bb, 0xa438, 0xd707,
+        0xa438, 0x6061, 0xa438, 0xd704, 0xa438, 0x5f7c, 0xa438, 0x1800,
+        0xa438, 0x124a, 0xa438, 0xd504, 0xa438, 0x8c0f, 0xa438, 0xd505,
+        0xa438, 0xa20e, 0xa438, 0xd500, 0xa438, 0x1000, 0xa438, 0x1871,
+        0xa438, 0x1800, 0xa438, 0x1899, 0xa438, 0xd70b, 0xa438, 0x60b0,
+        0xa438, 0xd05a, 0xa438, 0xd19a, 0xa438, 0x1800, 0xa438, 0x1aef,
+        0xa438, 0xd0ef, 0xa438, 0xd19a, 0xa438, 0x1800, 0xa438, 0x1aef,
+        0xa438, 0x1000, 0xa438, 0x1d09, 0xa438, 0xd708, 0xa438, 0x3399,
+        0xa438, 0x1b63, 0xa438, 0xd709, 0xa438, 0x5f5d, 0xa438, 0xd70b,
+        0xa438, 0x6130, 0xa438, 0xd70d, 0xa438, 0x6163, 0xa438, 0xd709,
+        0xa438, 0x430b, 0xa438, 0xd71e, 0xa438, 0x62c2, 0xa438, 0xb401,
+        0xa438, 0xf014, 0xa438, 0xc901, 0xa438, 0x1000, 0xa438, 0x810e,
+        0xa438, 0xf010, 0xa438, 0xc902, 0xa438, 0x1000, 0xa438, 0x810e,
+        0xa438, 0xf00c, 0xa438, 0xce04, 0xa438, 0xcf01, 0xa438, 0xd70a,
+        0xa438, 0x5fe2, 0xa438, 0xce04, 0xa438, 0xcf02, 0xa438, 0xc900,
+        0xa438, 0xd70a, 0xa438, 0x4057, 0xa438, 0xb401, 0xa438, 0x0800,
+        0xa438, 0x1800, 0xa438, 0x1b5d, 0xa438, 0xa480, 0xa438, 0xa2b0,
+        0xa438, 0xa806, 0xa438, 0x1800, 0xa438, 0x225c, 0xa438, 0xa7e8,
+        0xa438, 0xac08, 0xa438, 0x1800, 0xa438, 0x1a4e, 0xa436, 0xA026,
+        0xa438, 0x1a4d, 0xa436, 0xA024, 0xa438, 0x225a, 0xa436, 0xA022,
+        0xa438, 0x1b53, 0xa436, 0xA020, 0xa438, 0x1aed, 0xa436, 0xA006,
+        0xa438, 0x1892, 0xa436, 0xA004, 0xa438, 0x11a4, 0xa436, 0xA002,
+        0xa438, 0x103c, 0xa436, 0xA000, 0xa438, 0x0ea6, 0xa436, 0xA008,
+        0xa438, 0xff00, 0xa436, 0xA016, 0xa438, 0x0000, 0xa436, 0xA012,
+        0xa438, 0x0ff8, 0xa436, 0xA014, 0xa438, 0x0000, 0xa438, 0xD098,
+        0xa438, 0xc483, 0xa438, 0xc483, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa436, 0xA152, 0xa438, 0x3fff,
+        0xa436, 0xA154, 0xa438, 0x0413, 0xa436, 0xA156, 0xa438, 0x1A32,
+        0xa436, 0xA158, 0xa438, 0x1CC0, 0xa436, 0xA15A, 0xa438, 0x3fff,
+        0xa436, 0xA15C, 0xa438, 0x3fff, 0xa436, 0xA15E, 0xa438, 0x3fff,
+        0xa436, 0xA160, 0xa438, 0x3fff, 0xa436, 0xA150, 0xa438, 0x000E,
+        0xa436, 0xA016, 0xa438, 0x0020, 0xa436, 0xA012, 0xa438, 0x0000,
+        0xa436, 0xA014, 0xa438, 0x1800, 0xa438, 0x8010, 0xa438, 0x1800,
+        0xa438, 0x8021, 0xa438, 0x1800, 0xa438, 0x8037, 0xa438, 0x1800,
+        0xa438, 0x803f, 0xa438, 0x1800, 0xa438, 0x8084, 0xa438, 0x1800,
+        0xa438, 0x80c5, 0xa438, 0x1800, 0xa438, 0x80cc, 0xa438, 0x1800,
+        0xa438, 0x80d5, 0xa438, 0xa00a, 0xa438, 0xa280, 0xa438, 0xa404,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x1800, 0xa438, 0x099b, 0xa438, 0x1000, 0xa438, 0x1021,
+        0xa438, 0xd700, 0xa438, 0x5fab, 0xa438, 0xa208, 0xa438, 0x8204,
+        0xa438, 0xcb38, 0xa438, 0xaa40, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x1800, 0xa438, 0x0b2a,
+        0xa438, 0x82a0, 0xa438, 0x8404, 0xa438, 0xa110, 0xa438, 0xd706,
+        0xa438, 0x4041, 0xa438, 0xa180, 0xa438, 0x1800, 0xa438, 0x0e7f,
+        0xa438, 0x8190, 0xa438, 0xcb93, 0xa438, 0x1000, 0xa438, 0x0ef4,
+        0xa438, 0xd704, 0xa438, 0x7fb8, 0xa438, 0xa008, 0xa438, 0xd706,
+        0xa438, 0x4040, 0xa438, 0xa002, 0xa438, 0xd705, 0xa438, 0x4079,
+        0xa438, 0x1000, 0xa438, 0x10ad, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x85f0, 0xa438, 0x9503, 0xa438, 0xd705, 0xa438, 0x40d9,
+        0xa438, 0xd70c, 0xa438, 0x6083, 0xa438, 0x0c1f, 0xa438, 0x0d09,
+        0xa438, 0xf003, 0xa438, 0x0c1f, 0xa438, 0x0d0a, 0xa438, 0x0cc0,
+        0xa438, 0x0d80, 0xa438, 0x1000, 0xa438, 0x104f, 0xa438, 0x1000,
+        0xa438, 0x0ef4, 0xa438, 0x8020, 0xa438, 0xd705, 0xa438, 0x40d9,
+        0xa438, 0xd704, 0xa438, 0x609f, 0xa438, 0xd70c, 0xa438, 0x6043,
+        0xa438, 0x8504, 0xa438, 0xcb94, 0xa438, 0x1000, 0xa438, 0x0ef4,
+        0xa438, 0xd706, 0xa438, 0x7fa2, 0xa438, 0x800a, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0x0cf0, 0xa438, 0x05a0, 0xa438, 0x9503,
+        0xa438, 0xd705, 0xa438, 0x40b9, 0xa438, 0x0c1f, 0xa438, 0x0d00,
+        0xa438, 0x8dc0, 0xa438, 0xf005, 0xa438, 0xa190, 0xa438, 0x0c1f,
+        0xa438, 0x0d17, 0xa438, 0x8dc0, 0xa438, 0x1000, 0xa438, 0x104f,
+        0xa438, 0xd705, 0xa438, 0x39cc, 0xa438, 0x0c7d, 0xa438, 0x1800,
+        0xa438, 0x0e67, 0xa438, 0xcb96, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0xab05, 0xa438, 0xac04, 0xa438, 0xac08, 0xa438, 0x9503,
+        0xa438, 0x0c1f, 0xa438, 0x0d00, 0xa438, 0x8dc0, 0xa438, 0x1000,
+        0xa438, 0x104f, 0xa438, 0x1000, 0xa438, 0x1021, 0xa438, 0xd706,
+        0xa438, 0x2215, 0xa438, 0x8099, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0xae02, 0xa438, 0x9503, 0xa438, 0xd706, 0xa438, 0x6451,
+        0xa438, 0xd71f, 0xa438, 0x2e70, 0xa438, 0x0f00, 0xa438, 0xd706,
+        0xa438, 0x3290, 0xa438, 0x80be, 0xa438, 0xd704, 0xa438, 0x2e70,
+        0xa438, 0x8090, 0xa438, 0xd706, 0xa438, 0x339c, 0xa438, 0x8090,
+        0xa438, 0x8718, 0xa438, 0x8910, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0xc500, 0xa438, 0x9503, 0xa438, 0x0c1f, 0xa438, 0x0d17,
+        0xa438, 0x8dc0, 0xa438, 0x1000, 0xa438, 0x104f, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0x8c04, 0xa438, 0x9503, 0xa438, 0xa00a,
+        0xa438, 0xa190, 0xa438, 0xa280, 0xa438, 0xa404, 0xa438, 0x1800,
+        0xa438, 0x0f35, 0xa438, 0x1800, 0xa438, 0x0f07, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0x8c08, 0xa438, 0x8c04, 0xa438, 0x9503,
+        0xa438, 0x1800, 0xa438, 0x0f02, 0xa438, 0x1000, 0xa438, 0x1021,
+        0xa438, 0xd700, 0xa438, 0x5fb4, 0xa438, 0xaa10, 0xa438, 0x1800,
+        0xa438, 0x0c6b, 0xa438, 0x82a0, 0xa438, 0x8406, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0xac04, 0xa438, 0x8602, 0xa438, 0x9503,
+        0xa438, 0x1800, 0xa438, 0x0e09, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x8308, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0xc555, 0xa438, 0x9503, 0xa438, 0xa728,
+        0xa438, 0x8440, 0xa438, 0x0c03, 0xa438, 0x0901, 0xa438, 0x8801,
+        0xa438, 0xd700, 0xa438, 0x4040, 0xa438, 0xa801, 0xa438, 0xd701,
+        0xa438, 0x4052, 0xa438, 0xa810, 0xa438, 0xd701, 0xa438, 0x4054,
+        0xa438, 0xa820, 0xa438, 0xd701, 0xa438, 0x4057, 0xa438, 0xa640,
+        0xa438, 0xd704, 0xa438, 0x4046, 0xa438, 0xa840, 0xa438, 0xd706,
+        0xa438, 0x40b5, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xae20,
+        0xa438, 0x9503, 0xa438, 0xd401, 0xa438, 0x1000, 0xa438, 0x0fcf,
+        0xa438, 0x1000, 0xa438, 0x0fda, 0xa438, 0x1000, 0xa438, 0x1008,
+        0xa438, 0x1000, 0xa438, 0x0fe3, 0xa438, 0xcc00, 0xa438, 0x80c0,
+        0xa438, 0x8103, 0xa438, 0x83e0, 0xa438, 0xd71e, 0xa438, 0x2318,
+        0xa438, 0x01ae, 0xa438, 0xd704, 0xa438, 0x40bc, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0x8302, 0xa438, 0x9503, 0xa438, 0xb801,
+        0xa438, 0xd706, 0xa438, 0x2b59, 0xa438, 0x07f8, 0xa438, 0xd700,
+        0xa438, 0x2109, 0xa438, 0x04ab, 0xa438, 0xa508, 0xa438, 0xcb15,
+        0xa438, 0xd70c, 0xa438, 0x430c, 0xa438, 0x1000, 0xa438, 0x10ca,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xa108, 0xa438, 0x9503,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0x0c1f, 0xa438, 0x0f13,
+        0xa438, 0x9503, 0xa438, 0x1000, 0xa438, 0x1021, 0xa438, 0xd70c,
+        0xa438, 0x5fb3, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0x8f1f,
+        0xa438, 0x9503, 0xa438, 0x1000, 0xa438, 0x1021, 0xa438, 0xd70c,
+        0xa438, 0x7f33, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0x0c0f,
+        0xa438, 0x0d00, 0xa438, 0x0c70, 0xa438, 0x0b00, 0xa438, 0xab08,
+        0xa438, 0x9503, 0xa438, 0xd704, 0xa438, 0x3cf1, 0xa438, 0x01f9,
+        0xa438, 0x0c1f, 0xa438, 0x0d11, 0xa438, 0xf003, 0xa438, 0x0c1f,
+        0xa438, 0x0d0d, 0xa438, 0x0cc0, 0xa438, 0x0d40, 0xa438, 0x1000,
+        0xa438, 0x104f, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xab80,
+        0xa438, 0x9503, 0xa438, 0x1000, 0xa438, 0x1021, 0xa438, 0xa940,
+        0xa438, 0xd700, 0xa438, 0x5f99, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x8b80, 0xa438, 0x9503, 0xa438, 0x8940, 0xa438, 0xd700,
+        0xa438, 0x5bbf, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0x8b08,
+        0xa438, 0x9503, 0xa438, 0xba20, 0xa438, 0xd704, 0xa438, 0x4100,
+        0xa438, 0xd115, 0xa438, 0xd04f, 0xa438, 0xf001, 0xa438, 0x1000,
+        0xa438, 0x1021, 0xa438, 0xd700, 0xa438, 0x5fb4, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0x0c0f, 0xa438, 0x0d00, 0xa438, 0x0c70,
+        0xa438, 0x0b10, 0xa438, 0xab08, 0xa438, 0x9503, 0xa438, 0xd704,
+        0xa438, 0x3cf1, 0xa438, 0x8178, 0xa438, 0x0c1f, 0xa438, 0x0d11,
+        0xa438, 0xf003, 0xa438, 0x0c1f, 0xa438, 0x0d0d, 0xa438, 0x0cc0,
+        0xa438, 0x0d40, 0xa438, 0x1000, 0xa438, 0x104f, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0xab80, 0xa438, 0x9503, 0xa438, 0x1000,
+        0xa438, 0x1021, 0xa438, 0xd706, 0xa438, 0x5fad, 0xa438, 0xd407,
+        0xa438, 0x1000, 0xa438, 0x0fcf, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x8b88, 0xa438, 0x9503, 0xa438, 0x1000, 0xa438, 0x1021,
+        0xa438, 0xd702, 0xa438, 0x7fa4, 0xa438, 0xd706, 0xa438, 0x61bf,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0x0c30, 0xa438, 0x0110,
+        0xa438, 0xa304, 0xa438, 0x9503, 0xa438, 0xd199, 0xa438, 0xd04b,
+        0xa438, 0x1000, 0xa438, 0x1021, 0xa438, 0xd700, 0xa438, 0x5fb4,
+        0xa438, 0xd704, 0xa438, 0x3cf1, 0xa438, 0x81a5, 0xa438, 0x0c1f,
+        0xa438, 0x0d02, 0xa438, 0xf003, 0xa438, 0x0c1f, 0xa438, 0x0d01,
+        0xa438, 0x0cc0, 0xa438, 0x0d40, 0xa438, 0xa420, 0xa438, 0x8720,
+        0xa438, 0x1000, 0xa438, 0x104f, 0xa438, 0x1000, 0xa438, 0x0fda,
+        0xa438, 0xd70c, 0xa438, 0x41ac, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x8108, 0xa438, 0x9503, 0xa438, 0x0cc0, 0xa438, 0x0040,
+        0xa438, 0x0c03, 0xa438, 0x0102, 0xa438, 0x0ce0, 0xa438, 0x03e0,
+        0xa438, 0xccce, 0xa438, 0xf008, 0xa438, 0x0cc0, 0xa438, 0x0040,
+        0xa438, 0x0c03, 0xa438, 0x0100, 0xa438, 0x0ce0, 0xa438, 0x0380,
+        0xa438, 0xcc9c, 0xa438, 0x1000, 0xa438, 0x103f, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0xa640, 0xa438, 0x9503, 0xa438, 0xcb16,
+        0xa438, 0xd706, 0xa438, 0x6129, 0xa438, 0xd70c, 0xa438, 0x608c,
+        0xa438, 0xd17a, 0xa438, 0xd04a, 0xa438, 0xf006, 0xa438, 0xd17a,
+        0xa438, 0xd04b, 0xa438, 0xf003, 0xa438, 0xd13d, 0xa438, 0xd04b,
+        0xa438, 0x0c1f, 0xa438, 0x0f14, 0xa438, 0xcb17, 0xa438, 0x8fc0,
+        0xa438, 0x1000, 0xa438, 0x0fbd, 0xa438, 0xaf40, 0xa438, 0x1000,
+        0xa438, 0x0fbd, 0xa438, 0x0cc0, 0xa438, 0x0f80, 0xa438, 0x1000,
+        0xa438, 0x0fbd, 0xa438, 0xafc0, 0xa438, 0x1000, 0xa438, 0x0fbd,
+        0xa438, 0x1000, 0xa438, 0x1021, 0xa438, 0xd701, 0xa438, 0x652e,
+        0xa438, 0xd700, 0xa438, 0x5db4, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x8640, 0xa438, 0xa702, 0xa438, 0x9503, 0xa438, 0xa720,
+        0xa438, 0x1000, 0xa438, 0x0fda, 0xa438, 0xa108, 0xa438, 0x1000,
+        0xa438, 0x0fec, 0xa438, 0x8108, 0xa438, 0x1000, 0xa438, 0x0fe3,
+        0xa438, 0xa202, 0xa438, 0xa308, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x8308, 0xa438, 0xcb18,
+        0xa438, 0x1000, 0xa438, 0x10c2, 0xa438, 0x1000, 0xa438, 0x1021,
+        0xa438, 0xd70c, 0xa438, 0x2c60, 0xa438, 0x02bd, 0xa438, 0xff58,
+        0xa438, 0x8f1f, 0xa438, 0x1000, 0xa438, 0x1021, 0xa438, 0xd701,
+        0xa438, 0x7f8e, 0xa438, 0x1000, 0xa438, 0x0fe3, 0xa438, 0xa130,
+        0xa438, 0xaa2f, 0xa438, 0xa2d5, 0xa438, 0xa407, 0xa438, 0xa720,
+        0xa438, 0x8310, 0xa438, 0xa308, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x8308, 0xa438, 0x1800,
+        0xa438, 0x02d2, 0xa436, 0xA10E, 0xa438, 0x017f, 0xa436, 0xA10C,
+        0xa438, 0x0e04, 0xa436, 0xA10A, 0xa438, 0x0c67, 0xa436, 0xA108,
+        0xa438, 0x0f13, 0xa436, 0xA106, 0xa438, 0x0eb1, 0xa436, 0xA104,
+        0xa438, 0x0e79, 0xa436, 0xA102, 0xa438, 0x0b23, 0xa436, 0xA100,
+        0xa438, 0x0908, 0xa436, 0xA110, 0xa438, 0x00ff, 0xa436, 0xb87c,
+        0xa438, 0x8ad8, 0xa436, 0xb87e, 0xa438, 0xaf8a, 0xa438, 0xf0af,
+        0xa438, 0x8af9, 0xa438, 0xaf8d, 0xa438, 0xdaaf, 0xa438, 0x8e1c,
+        0xa438, 0xaf8f, 0xa438, 0x03af, 0xa438, 0x8f06, 0xa438, 0xaf8f,
+        0xa438, 0x06af, 0xa438, 0x8f06, 0xa438, 0x0265, 0xa438, 0xa002,
+        0xa438, 0x8d78, 0xa438, 0xaf23, 0xa438, 0x47a1, 0xa438, 0x0d06,
+        0xa438, 0x028b, 0xa438, 0x05af, 0xa438, 0x225a, 0xa438, 0xaf22,
+        0xa438, 0x66f8, 0xa438, 0xe08a, 0xa438, 0x33a0, 0xa438, 0x0005,
+        0xa438, 0x028b, 0xa438, 0x21ae, 0xa438, 0x0ea0, 0xa438, 0x0105,
+        0xa438, 0x028b, 0xa438, 0xb3ae, 0xa438, 0x06a0, 0xa438, 0x0203,
+        0xa438, 0x028c, 0xa438, 0x9dfc, 0xa438, 0x04f8, 0xa438, 0xfbfa,
+        0xa438, 0xef69, 0xa438, 0xe080, 0xa438, 0x13ad, 0xa438, 0x267e,
+        0xa438, 0xd067, 0xa438, 0xe48a, 0xa438, 0x34e4, 0xa438, 0x8a36,
+        0xa438, 0xe48a, 0xa438, 0x38e4, 0xa438, 0x8a3a, 0xa438, 0xd0ae,
+        0xa438, 0xe48a, 0xa438, 0x35e4, 0xa438, 0x8a37, 0xa438, 0xe48a,
+        0xa438, 0x39e4, 0xa438, 0x8a3b, 0xa438, 0xd000, 0xa438, 0xe48a,
+        0xa438, 0x3ce4, 0xa438, 0x8a3d, 0xa438, 0xe48a, 0xa438, 0x3ee4,
+        0xa438, 0x8a3f, 0xa438, 0xe48a, 0xa438, 0x40e4, 0xa438, 0x8a41,
+        0xa438, 0xe48a, 0xa438, 0x42e4, 0xa438, 0x8a43, 0xa438, 0xe48a,
+        0xa438, 0x44d0, 0xa438, 0x02e4, 0xa438, 0x8a45, 0xa438, 0xd00a,
+        0xa438, 0xe48a, 0xa438, 0x46d0, 0xa438, 0x16e4, 0xa438, 0x8a47,
+        0xa438, 0xd01e, 0xa438, 0xe48a, 0xa438, 0x48d1, 0xa438, 0x02bf,
+        0xa438, 0x8dce, 0xa438, 0x026b, 0xa438, 0xd0d1, 0xa438, 0x0abf,
+        0xa438, 0x8dd1, 0xa438, 0x026b, 0xa438, 0xd0d1, 0xa438, 0x16bf,
+        0xa438, 0x8dd4, 0xa438, 0x026b, 0xa438, 0xd0d1, 0xa438, 0x1ebf,
+        0xa438, 0x8dd7, 0xa438, 0x026b, 0xa438, 0xd002, 0xa438, 0x73ab,
+        0xa438, 0xef47, 0xa438, 0xe585, 0xa438, 0x5de4, 0xa438, 0x855c,
+        0xa438, 0xee8a, 0xa438, 0x3301, 0xa438, 0xae03, 0xa438, 0x0224,
+        0xa438, 0x95ef, 0xa438, 0x96fe, 0xa438, 0xfffc, 0xa438, 0x04f8,
+        0xa438, 0xf9fa, 0xa438, 0xcefa, 0xa438, 0xef69, 0xa438, 0xfb02,
+        0xa438, 0x8dab, 0xa438, 0xad50, 0xa438, 0x2ee1, 0xa438, 0x8a44,
+        0xa438, 0xa104, 0xa438, 0x2bee, 0xa438, 0x8a33, 0xa438, 0x02e1,
+        0xa438, 0x8a45, 0xa438, 0xbf8d, 0xa438, 0xce02, 0xa438, 0x6bd0,
+        0xa438, 0xe18a, 0xa438, 0x46bf, 0xa438, 0x8dd1, 0xa438, 0x026b,
+        0xa438, 0xd0e1, 0xa438, 0x8a47, 0xa438, 0xbf8d, 0xa438, 0xd402,
+        0xa438, 0x6bd0, 0xa438, 0xe18a, 0xa438, 0x48bf, 0xa438, 0x8dd7,
+        0xa438, 0x026b, 0xa438, 0xd0af, 0xa438, 0x8c94, 0xa438, 0xd200,
+        0xa438, 0xbe00, 0xa438, 0x0002, 0xa438, 0x8ca5, 0xa438, 0x12a2,
+        0xa438, 0x04f6, 0xa438, 0xe18a, 0xa438, 0x44a1, 0xa438, 0x0020,
+        0xa438, 0xd129, 0xa438, 0xbf8d, 0xa438, 0xce02, 0xa438, 0x6bd0,
+        0xa438, 0xd121, 0xa438, 0xbf8d, 0xa438, 0xd102, 0xa438, 0x6bd0,
+        0xa438, 0xd125, 0xa438, 0xbf8d, 0xa438, 0xd402, 0xa438, 0x6bd0,
+        0xa438, 0xbf8d, 0xa438, 0xd702, 0xa438, 0x6bd0, 0xa438, 0xae44,
+        0xa438, 0xa101, 0xa438, 0x1ed1, 0xa438, 0x31bf, 0xa438, 0x8dce,
+        0xa438, 0x026b, 0xa438, 0xd0bf, 0xa438, 0x8dd1, 0xa438, 0x026b,
+        0xa438, 0xd0d1, 0xa438, 0x2dbf, 0xa438, 0x8dd4, 0xa438, 0x026b,
+        0xa438, 0xd0bf, 0xa438, 0x8dd7, 0xa438, 0x026b, 0xa438, 0xd0ae,
+        0xa438, 0x23a1, 0xa438, 0x0220, 0xa438, 0xd139, 0xa438, 0xbf8d,
+        0xa438, 0xce02, 0xa438, 0x6bd0, 0xa438, 0xbf8d, 0xa438, 0xd102,
+        0xa438, 0x6bd0, 0xa438, 0xd13d, 0xa438, 0xbf8d, 0xa438, 0xd402,
+        0xa438, 0x6bd0, 0xa438, 0xd135, 0xa438, 0xbf8d, 0xa438, 0xd702,
+        0xa438, 0x6bd0, 0xa438, 0xae00, 0xa438, 0xe18a, 0xa438, 0x4411,
+        0xa438, 0xe58a, 0xa438, 0x44d0, 0xa438, 0x00e4, 0xa438, 0x8a3c,
+        0xa438, 0xe48a, 0xa438, 0x3de4, 0xa438, 0x8a3e, 0xa438, 0xe48a,
+        0xa438, 0x3fe4, 0xa438, 0x8a40, 0xa438, 0xe48a, 0xa438, 0x41e4,
+        0xa438, 0x8a42, 0xa438, 0xe48a, 0xa438, 0x4302, 0xa438, 0x73ab,
+        0xa438, 0xef47, 0xa438, 0xe585, 0xa438, 0x5de4, 0xa438, 0x855c,
+        0xa438, 0xffef, 0xa438, 0x96fe, 0xa438, 0xc6fe, 0xa438, 0xfdfc,
+        0xa438, 0x0402, 0xa438, 0x2495, 0xa438, 0xee8a, 0xa438, 0x3300,
+        0xa438, 0x04f8, 0xa438, 0xf9fa, 0xa438, 0xfbef, 0xa438, 0x79fb,
+        0xa438, 0xcffb, 0xa438, 0xd300, 0xa438, 0xa200, 0xa438, 0x09bf,
+        0xa438, 0x8dc2, 0xa438, 0x026b, 0xa438, 0xefaf, 0xa438, 0x8cda,
+        0xa438, 0xa201, 0xa438, 0x09bf, 0xa438, 0x8dc5, 0xa438, 0x026b,
+        0xa438, 0xefaf, 0xa438, 0x8cda, 0xa438, 0xa202, 0xa438, 0x09bf,
+        0xa438, 0x8dc8, 0xa438, 0x026b, 0xa438, 0xefaf, 0xa438, 0x8cda,
+        0xa438, 0xbf8d, 0xa438, 0xcb02, 0xa438, 0x6bef, 0xa438, 0xef64,
+        0xa438, 0xbf8a, 0xa438, 0x3c1a, 0xa438, 0x921a, 0xa438, 0x92d8,
+        0xa438, 0x19d9, 0xa438, 0xef74, 0xa438, 0x0273, 0xa438, 0x93ef,
+        0xa438, 0x47bf, 0xa438, 0x8a3c, 0xa438, 0x1a92, 0xa438, 0x1a92,
+        0xa438, 0xdc19, 0xa438, 0xddd1, 0xa438, 0x0011, 0xa438, 0xa1ff,
+        0xa438, 0xfc13, 0xa438, 0xa310, 0xa438, 0xaf02, 0xa438, 0x8d0e,
+        0xa438, 0xffc7, 0xa438, 0xffef, 0xa438, 0x97ff, 0xa438, 0xfefd,
+        0xa438, 0xfc04, 0xa438, 0xf8fa, 0xa438, 0xfbef, 0xa438, 0x79fb,
+        0xa438, 0xcffb, 0xa438, 0xbf8a, 0xa438, 0x3c1a, 0xa438, 0x921a,
+        0xa438, 0x92d8, 0xa438, 0x19d9, 0xa438, 0xef64, 0xa438, 0xbf8a,
+        0xa438, 0x341a, 0xa438, 0x921a, 0xa438, 0x92d8, 0xa438, 0x19d9,
+        0xa438, 0xef74, 0xa438, 0x0273, 0xa438, 0x78a2, 0xa438, 0x0005,
+        0xa438, 0xbe8d, 0xa438, 0xceae, 0xa438, 0x13a2, 0xa438, 0x0105,
+        0xa438, 0xbe8d, 0xa438, 0xd1ae, 0xa438, 0x0ba2, 0xa438, 0x0205,
+        0xa438, 0xbe8d, 0xa438, 0xd4ae, 0xa438, 0x03be, 0xa438, 0x8dd7,
+        0xa438, 0xad50, 0xa438, 0x17bf, 0xa438, 0x8a45, 0xa438, 0x1a92,
+        0xa438, 0x0702, 0xa438, 0x6bef, 0xa438, 0x07dd, 0xa438, 0xef46,
+        0xa438, 0xbf8a, 0xa438, 0x341a, 0xa438, 0x921a, 0xa438, 0x92dc,
+        0xa438, 0x19dd, 0xa438, 0xffc7, 0xa438, 0xffef, 0xa438, 0x97ff,
+        0xa438, 0xfefc, 0xa438, 0x04ee, 0xa438, 0x8a33, 0xa438, 0x00ee,
+        0xa438, 0x8a32, 0xa438, 0x0404, 0xa438, 0xf8fa, 0xa438, 0xef69,
+        0xa438, 0xe080, 0xa438, 0x13ad, 0xa438, 0x2624, 0xa438, 0xd102,
+        0xa438, 0xbf8d, 0xa438, 0xce02, 0xa438, 0x6bd0, 0xa438, 0xd10a,
+        0xa438, 0xbf8d, 0xa438, 0xd102, 0xa438, 0x6bd0, 0xa438, 0xd116,
+        0xa438, 0xbf8d, 0xa438, 0xd402, 0xa438, 0x6bd0, 0xa438, 0xd11e,
+        0xa438, 0xbf8d, 0xa438, 0xd702, 0xa438, 0x6bd0, 0xa438, 0xee8a,
+        0xa438, 0x3300, 0xa438, 0xef96, 0xa438, 0xfefc, 0xa438, 0x04f8,
+        0xa438, 0xfae0, 0xa438, 0x855c, 0xa438, 0xe185, 0xa438, 0x5def,
+        0xa438, 0x64d0, 0xa438, 0x00e1, 0xa438, 0x8a32, 0xa438, 0xef74,
+        0xa438, 0x0273, 0xa438, 0xc6fe, 0xa438, 0xfc04, 0xa438, 0xf0b2,
+        0xa438, 0x02f0, 0xa438, 0xb282, 0xa438, 0xf0b3, 0xa438, 0x02f0,
+        0xa438, 0xb382, 0xa438, 0x50ac, 0xa438, 0xd450, 0xa438, 0xacd6,
+        0xa438, 0xb6ac, 0xa438, 0xd4b6, 0xa438, 0xacd6, 0xa438, 0xbf8e,
+        0xa438, 0x0d02, 0xa438, 0x6bd0, 0xa438, 0xd0ff, 0xa438, 0xd1fe,
+        0xa438, 0xbf8e, 0xa438, 0x1002, 0xa438, 0x6bd0, 0xa438, 0xd004,
+        0xa438, 0xd14d, 0xa438, 0xbf8e, 0xa438, 0x1302, 0xa438, 0x6bd0,
+        0xa438, 0xd0fc, 0xa438, 0xd1c6, 0xa438, 0xbf8e, 0xa438, 0x1602,
+        0xa438, 0x6bd0, 0xa438, 0xd009, 0xa438, 0xd146, 0xa438, 0xbf8e,
+        0xa438, 0x1902, 0xa438, 0x6bd0, 0xa438, 0xef13, 0xa438, 0xaf2d,
+        0xa438, 0xbdf0, 0xa438, 0xac1c, 0xa438, 0xf0ac, 0xa438, 0x2af0,
+        0xa438, 0xac2c, 0xa438, 0xf0ac, 0xa438, 0x2ef0, 0xa438, 0xac30,
+        0xa438, 0xbf8e, 0xa438, 0xf102, 0xa438, 0x6bef, 0xa438, 0xac28,
+        0xa438, 0x70bf, 0xa438, 0x8eeb, 0xa438, 0x026b, 0xa438, 0xefac,
+        0xa438, 0x2867, 0xa438, 0xbf8e, 0xa438, 0xee02, 0xa438, 0x6bef,
+        0xa438, 0xad28, 0xa438, 0x5bbf, 0xa438, 0x8ff2, 0xa438, 0xd8bf,
+        0xa438, 0x8ff3, 0xa438, 0xd9bf, 0xa438, 0x8ef4, 0xa438, 0x026b,
+        0xa438, 0xd0bf, 0xa438, 0x8ff0, 0xa438, 0xd8bf, 0xa438, 0x8ff1,
+        0xa438, 0xd9bf, 0xa438, 0x8ef7, 0xa438, 0x026b, 0xa438, 0xd0bf,
+        0xa438, 0x8fee, 0xa438, 0xd8bf, 0xa438, 0x8fef, 0xa438, 0xd9bf,
+        0xa438, 0x8efa, 0xa438, 0x026b, 0xa438, 0xd0bf, 0xa438, 0x8fec,
+        0xa438, 0xd8bf, 0xa438, 0x8fed, 0xa438, 0xd9bf, 0xa438, 0x8efd,
+        0xa438, 0x026b, 0xa438, 0xd0bf, 0xa438, 0x8fea, 0xa438, 0xd8bf,
+        0xa438, 0x8feb, 0xa438, 0xd9bf, 0xa438, 0x8f00, 0xa438, 0x026b,
+        0xa438, 0xd0bf, 0xa438, 0x8fe8, 0xa438, 0xd8bf, 0xa438, 0x8fe9,
+        0xa438, 0xd9bf, 0xa438, 0x8e0d, 0xa438, 0x026b, 0xa438, 0xd01f,
+        0xa438, 0x00e1, 0xa438, 0x86ee, 0xa438, 0x1b64, 0xa438, 0xaf3d,
+        0xa438, 0x7abf, 0xa438, 0x8ffe, 0xa438, 0xd8bf, 0xa438, 0x8fff,
+        0xa438, 0xd9bf, 0xa438, 0x8ef4, 0xa438, 0x026b, 0xa438, 0xd0bf,
+        0xa438, 0x8ffc, 0xa438, 0xd8bf, 0xa438, 0x8ffd, 0xa438, 0xd9bf,
+        0xa438, 0x8ef7, 0xa438, 0x026b, 0xa438, 0xd0bf, 0xa438, 0x8ffa,
+        0xa438, 0xd8bf, 0xa438, 0x8ffb, 0xa438, 0xd9bf, 0xa438, 0x8efa,
+        0xa438, 0x026b, 0xa438, 0xd0bf, 0xa438, 0x8ff8, 0xa438, 0xd8bf,
+        0xa438, 0x8ff9, 0xa438, 0xd9bf, 0xa438, 0x8efd, 0xa438, 0x026b,
+        0xa438, 0xd0bf, 0xa438, 0x8ff6, 0xa438, 0xd8bf, 0xa438, 0x8ff7,
+        0xa438, 0xd9bf, 0xa438, 0x8f00, 0xa438, 0x026b, 0xa438, 0xd0bf,
+        0xa438, 0x8ff4, 0xa438, 0xd8bf, 0xa438, 0x8ff5, 0xa438, 0xd9bf,
+        0xa438, 0x8e0d, 0xa438, 0x026b, 0xa438, 0xd0ae, 0xa438, 0xa766,
+        0xa438, 0xac5c, 0xa438, 0xbbac, 0xa438, 0x5c99, 0xa438, 0xac5c,
+        0xa438, 0xf0ac, 0xa438, 0x26f0, 0xa438, 0xac24, 0xa438, 0xf0ac,
+        0xa438, 0x22f0, 0xa438, 0xac20, 0xa438, 0xf0ac, 0xa438, 0x1eaf,
+        0xa438, 0x44f8, 0xa436, 0xb85e, 0xa438, 0x2344, 0xa436, 0xb860,
+        0xa438, 0x2254, 0xa436, 0xb862, 0xa438, 0x2DB5, 0xa436, 0xb864,
+        0xa438, 0x3D6C, 0xa436, 0xb886, 0xa438, 0x44ED, 0xa436, 0xb888,
+        0xa438, 0xffff, 0xa436, 0xb88a, 0xa438, 0xffff, 0xa436, 0xb88c,
+        0xa438, 0xffff, 0xa436, 0xb838, 0xa438, 0x001f, 0xb820, 0x0010,
+        0xa436, 0x87ad, 0xa438, 0xaf87, 0xa438, 0xc5af, 0xa438, 0x87e4,
+        0xa438, 0xaf8a, 0xa438, 0x3daf, 0xa438, 0x8a62, 0xa438, 0xaf8a,
+        0xa438, 0x62af, 0xa438, 0x8a62, 0xa438, 0xaf8a, 0xa438, 0x62af,
+        0xa438, 0x8a62, 0xa438, 0x2810, 0xa438, 0x0d01, 0xa438, 0xe484,
+        0xa438, 0xbf29, 0xa438, 0x100d, 0xa438, 0x11e5, 0xa438, 0x84c0,
+        0xa438, 0x2a10, 0xa438, 0x0d21, 0xa438, 0xe684, 0xa438, 0xc12b,
+        0xa438, 0x100d, 0xa438, 0x31e7, 0xa438, 0x84c2, 0xa438, 0xaf3f,
+        0xa438, 0x7cf8, 0xa438, 0xe080, 0xa438, 0x4cac, 0xa438, 0x222c,
+        0xa438, 0xe080, 0xa438, 0x40ad, 0xa438, 0x2232, 0xa438, 0xbf8a,
+        0xa438, 0x2502, 0xa438, 0x6752, 0xa438, 0xad29, 0xa438, 0x0502,
+        0xa438, 0x8827, 0xa438, 0xae0d, 0xa438, 0xad28, 0xa438, 0x0502,
+        0xa438, 0x8961, 0xa438, 0xae05, 0xa438, 0x0214, 0xa438, 0x04ae,
+        0xa438, 0x00e0, 0xa438, 0x8040, 0xa438, 0xac22, 0xa438, 0x1102,
+        0xa438, 0x13e1, 0xa438, 0xae0c, 0xa438, 0x0288, 0xa438, 0x7c02,
+        0xa438, 0x8a10, 0xa438, 0x0214, 0xa438, 0x2502, 0xa438, 0x1404,
+        0xa438, 0xfcaf, 0xa438, 0x13c6, 0xa438, 0xf8f8, 0xa438, 0xccf9,
+        0xa438, 0xfaef, 0xa438, 0x69fb, 0xa438, 0xe080, 0xa438, 0x18ad,
+        0xa438, 0x223b, 0xa438, 0xbf8a, 0xa438, 0x2b02, 0xa438, 0x6752,
+        0xa438, 0xad28, 0xa438, 0x32bf, 0xa438, 0x8a28, 0xa438, 0x026f,
+        0xa438, 0x17ee, 0xa438, 0x8ff3, 0xa438, 0x00bf, 0xa438, 0x6854,
+        0xa438, 0x0267, 0xa438, 0x52ad, 0xa438, 0x281f, 0xa438, 0xbf68,
+        0xa438, 0x5d02, 0xa438, 0x6752, 0xa438, 0xad28, 0xa438, 0x16e0,
+        0xa438, 0x8ff4, 0xa438, 0xe18f, 0xa438, 0xf502, 0xa438, 0x8891,
+        0xa438, 0xad50, 0xa438, 0x0abf, 0xa438, 0x8a28, 0xa438, 0x026f,
+        0xa438, 0x20ee, 0xa438, 0x8ff3, 0xa438, 0x0102, 0xa438, 0x1404,
+        0xa438, 0xffef, 0xa438, 0x96fe, 0xa438, 0xfdc4, 0xa438, 0xfcfc,
+        0xa438, 0x04f8, 0xa438, 0xf9ef, 0xa438, 0x59e0, 0xa438, 0x8018,
+        0xa438, 0xad22, 0xa438, 0x06bf, 0xa438, 0x8a28, 0xa438, 0x026f,
+        0xa438, 0x17ef, 0xa438, 0x95fd, 0xa438, 0xfc04, 0xa438, 0xf8f9,
+        0xa438, 0xf9ef, 0xa438, 0x59fa, 0xa438, 0xface, 0xa438, 0xe48f,
+        0xa438, 0xfee5, 0xa438, 0x8fff, 0xa438, 0xbf6e, 0xa438, 0x1b02,
+        0xa438, 0x6f20, 0xa438, 0xbf6e, 0xa438, 0x1802, 0xa438, 0x6f17,
+        0xa438, 0xd102, 0xa438, 0xbf6e, 0xa438, 0x1202, 0xa438, 0x6733,
+        0xa438, 0xbf6e, 0xa438, 0x1502, 0xa438, 0x6f17, 0xa438, 0xbe00,
+        0xa438, 0x00cc, 0xa438, 0xbf69, 0xa438, 0xcb02, 0xa438, 0x6733,
+        0xa438, 0xbf69, 0xa438, 0xce02, 0xa438, 0x6f17, 0xa438, 0xbf69,
+        0xa438, 0xce02, 0xa438, 0x6f20, 0xa438, 0xbf69, 0xa438, 0xd102,
+        0xa438, 0x6752, 0xa438, 0xad28, 0xa438, 0xf70c, 0xa438, 0x81bf,
+        0xa438, 0x8ff6, 0xa438, 0x1a98, 0xa438, 0xef59, 0xa438, 0xbf69,
+        0xa438, 0xd402, 0xa438, 0x6752, 0xa438, 0xef95, 0xa438, 0xdc19,
+        0xa438, 0xdd0d, 0xa438, 0x8118, 0xa438, 0xa800, 0xa438, 0x04c9,
+        0xa438, 0xbf69, 0xa438, 0xce02, 0xa438, 0x6f17, 0xa438, 0xe08f,
+        0xa438, 0xfce1, 0xa438, 0x8ffd, 0xa438, 0xef74, 0xa438, 0xe08f,
+        0xa438, 0xfae1, 0xa438, 0x8ffb, 0xa438, 0xef64, 0xa438, 0x026e,
+        0xa438, 0x57ad, 0xa438, 0x5008, 0xa438, 0xe08f, 0xa438, 0xfce1,
+        0xa438, 0x8ffd, 0xa438, 0xae06, 0xa438, 0xe08f, 0xa438, 0xfae1,
+        0xa438, 0x8ffb, 0xa438, 0xe28f, 0xa438, 0xf8e3, 0xa438, 0x8ff9,
+        0xa438, 0xef75, 0xa438, 0xe28f, 0xa438, 0xf6e3, 0xa438, 0x8ff7,
+        0xa438, 0xef65, 0xa438, 0x026e, 0xa438, 0x57ad, 0xa438, 0x5008,
+        0xa438, 0xe28f, 0xa438, 0xf8e3, 0xa438, 0x8ff9, 0xa438, 0xae06,
+        0xa438, 0xe28f, 0xa438, 0xf6e3, 0xa438, 0x8ff7, 0xa438, 0x1b45,
+        0xa438, 0xad27, 0xa438, 0x05d7, 0xa438, 0x0000, 0xa438, 0xae0d,
+        0xa438, 0xef74, 0xa438, 0xe08f, 0xa438, 0xfee1, 0xa438, 0x8fff,
+        0xa438, 0xef64, 0xa438, 0x026e, 0xa438, 0x57c6, 0xa438, 0xfefe,
+        0xa438, 0xef95, 0xa438, 0xfdfd, 0xa438, 0xfc04, 0xa438, 0xf8f9,
+        0xa438, 0xfaef, 0xa438, 0x69fb, 0xa438, 0xe080, 0xa438, 0x18ac,
+        0xa438, 0x2103, 0xa438, 0xaf8a, 0xa438, 0x06bf, 0xa438, 0x8a2b,
+        0xa438, 0xac21, 0xa438, 0x03af, 0xa438, 0x8a06, 0xa438, 0xbf8a,
+        0xa438, 0x2802, 0xa438, 0x6f17, 0xa438, 0xee8f, 0xa438, 0xee00,
+        0xa438, 0xee8f, 0xa438, 0xed00, 0xa438, 0xbf8a, 0xa438, 0x2e02,
+        0xa438, 0x6752, 0xa438, 0xad28, 0xa438, 0x03af, 0xa438, 0x8a06,
+        0xa438, 0xe28f, 0xa438, 0xefe3, 0xa438, 0x8ff0, 0xa438, 0xbf68,
+        0xa438, 0x5102, 0xa438, 0x6752, 0xa438, 0xac28, 0xa438, 0x11e2,
+        0xa438, 0x8ff1, 0xa438, 0xe38f, 0xa438, 0xf2bf, 0xa438, 0x6848,
+        0xa438, 0x0267, 0xa438, 0x52ac, 0xa438, 0x2802, 0xa438, 0xae53,
+        0xa438, 0xbf68, 0xa438, 0x5a02, 0xa438, 0x6752, 0xa438, 0xad28,
+        0xa438, 0x0aef, 0xa438, 0x4502, 0xa438, 0x8891, 0xa438, 0xac50,
+        0xa438, 0x38ae, 0xa438, 0x40bf, 0xa438, 0x8a31, 0xa438, 0x0267,
+        0xa438, 0x52ef, 0xa438, 0x31bf, 0xa438, 0x8a34, 0xa438, 0x0267,
+        0xa438, 0x520c, 0xa438, 0x311e, 0xa438, 0x31bf, 0xa438, 0x8a37,
+        0xa438, 0x0267, 0xa438, 0x520c, 0xa438, 0x311e, 0xa438, 0x31bf,
+        0xa438, 0x8a3a, 0xa438, 0x0267, 0xa438, 0x520c, 0xa438, 0x311e,
+        0xa438, 0x31e7, 0xa438, 0x8fee, 0xa438, 0xa30c, 0xa438, 0x02ae,
+        0xa438, 0x08a3, 0xa438, 0x0e02, 0xa438, 0xae03, 0xa438, 0xa30d,
+        0xa438, 0x0aee, 0xa438, 0x8fed, 0xa438, 0x01bf, 0xa438, 0x8a28,
+        0xa438, 0x026f, 0xa438, 0x2002, 0xa438, 0x1404, 0xa438, 0xffef,
+        0xa438, 0x96fe, 0xa438, 0xfdfc, 0xa438, 0x04f8, 0xa438, 0xfaef,
+        0xa438, 0x69e0, 0xa438, 0x8018, 0xa438, 0xad21, 0xa438, 0x06bf,
+        0xa438, 0x8a28, 0xa438, 0x026f, 0xa438, 0x17ef, 0xa438, 0x96fe,
+        0xa438, 0xfc04, 0xa438, 0xf8a4, 0xa438, 0xb677, 0xa438, 0xa4b6,
+        0xa438, 0x22a4, 0xa438, 0x4222, 0xa438, 0xa668, 0xa438, 0x00b2,
+        0xa438, 0x3e00, 0xa438, 0xb2be, 0xa438, 0x00b3, 0xa438, 0x3e00,
+        0xa438, 0xb3be, 0xa438, 0xd10f, 0xa438, 0xbf8a, 0xa438, 0x5c02,
+        0xa438, 0x6733, 0xa438, 0xbf8a, 0xa438, 0x5f02, 0xa438, 0x6733,
+        0xa438, 0xbf8a, 0xa438, 0x5c02, 0xa438, 0x6f17, 0xa438, 0xbf8a,
+        0xa438, 0x5f02, 0xa438, 0x6f17, 0xa438, 0x1f00, 0xa438, 0xaf3d,
+        0xa438, 0x0c30, 0xa438, 0xa85a, 0xa438, 0xfcad, 0xa438, 0x0e00,
+        0xa436, 0xb818, 0xa438, 0x3f31, 0xa436, 0xb81a, 0xa438, 0x13a4,
+        0xa436, 0xb81c, 0xa438, 0x3d0a, 0xa436, 0xb81e, 0xa438, 0xffff,
+        0xa436, 0xb850, 0xa438, 0xffff, 0xa436, 0xb852, 0xa438, 0xffff,
+        0xa436, 0xb878, 0xa438, 0xffff, 0xa436, 0xb884, 0xa438, 0xffff,
+        0xa436, 0xb832, 0xa438, 0x0007, 0xa436, 0x84cf, 0xa438, 0x0101,
+        0xa466, 0x0002, 0xa436, 0x86a7, 0xa438, 0x0000, 0xa436, 0x0000,
+        0xa438, 0x0000, 0xa436, 0xB82E, 0xa438, 0x0000, 0xa436, 0x8023,
+        0xa438, 0x0000, 0xa436, 0x801E, 0xa438, 0x0023, 0xb820, 0x0000,
+        0xFFFF, 0xFFFF
+};
+
+static const u_int16_t phy_mcu_ram_code_8126a_1_2[] = {
+        0xB87C, 0x8a32, 0xB87E, 0x0400, 0xB87C, 0x8376, 0xB87E, 0x0300,
+        0xce00, 0x6CAF, 0xB87C, 0x8301, 0xB87E, 0x1133, 0xB87C, 0x8105,
+        0xB87E, 0xa000, 0xB87C, 0x8148, 0xB87E, 0xa000, 0xa436, 0x81d8,
+        0xa438, 0x5865, 0xacf8, 0xCCC0, 0xac90, 0x52B0, 0xad2C, 0x8000,
+        0xB87C, 0x83e6, 0xB87E, 0x4A0E, 0xB87C, 0x83d2, 0xB87E, 0x0A0E,
+        0xB87C, 0x80a0, 0xB87E, 0xB8B6, 0xB87C, 0x805e, 0xB87E, 0xB8B6,
+        0xB87C, 0x8057, 0xB87E, 0x305A, 0xB87C, 0x8099, 0xB87E, 0x305A,
+        0xB87C, 0x8052, 0xB87E, 0x3333, 0xB87C, 0x8094, 0xB87E, 0x3333,
+        0xB87C, 0x807F, 0xB87E, 0x7975, 0xB87C, 0x803D, 0xB87E, 0x7975,
+        0xB87C, 0x8036, 0xB87E, 0x305A, 0xB87C, 0x8078, 0xB87E, 0x305A,
+        0xB87C, 0x8031, 0xB87E, 0x3335, 0xB87C, 0x8073, 0xB87E, 0x3335,
+        0xa436, 0x81D8, 0xa438, 0x5865, 0xB87C, 0x867c, 0xB87E, 0x0617,
+        0xad94, 0x0092, 0xB87C, 0x89B1, 0xB87E, 0x5050, 0xB87C, 0x86E0,
+        0xB87E, 0x809A, 0xB87C, 0x86E2, 0xB87E, 0xB34D, 0xB87C, 0x8FD2,
+        0xB87E, 0x004B, 0xB87C, 0x8691, 0xB87E, 0x007D, 0xB87E, 0x00AF,
+        0xB87E, 0x00E1, 0xB87E, 0x00FF, 0xB87C, 0x867F, 0xB87E, 0x0201,
+        0xB87E, 0x0201, 0xB87E, 0x0201, 0xB87E, 0x0201, 0xB87E, 0x0201,
+        0xB87E, 0x0201, 0xB87C, 0x86DA, 0xB87E, 0xCDCD, 0xB87E, 0xE6CD,
+        0xB87E, 0xCDCD, 0xB87C, 0x8FE8, 0xB87E, 0x0368, 0xB87E, 0x033F,
+        0xB87E, 0x1046, 0xB87E, 0x147D, 0xB87E, 0x147D, 0xB87E, 0x147D,
+        0xB87E, 0x0368, 0xB87E, 0x033F, 0xB87E, 0x1046, 0xB87E, 0x147D,
+        0xB87E, 0x147D, 0xB87E, 0x147D, 0xa436, 0x80dd, 0xa438, 0xf0AB,
+        0xa436, 0x80df, 0xa438, 0xC009, 0xa436, 0x80e7, 0xa438, 0x401E,
+        0xa436, 0x80e1, 0xa438, 0x120A, 0xa436, 0x86f2, 0xa438, 0x5094,
+        0xa436, 0x8701, 0xa438, 0x5094, 0xa436, 0x80f1, 0xa438, 0x30CC,
+        0xa436, 0x80f3, 0xa438, 0x0001, 0xa436, 0x80f5, 0xa438, 0x330B,
+        0xa436, 0x80f8, 0xa438, 0xCB76, 0xa436, 0x8105, 0xa438, 0xf0D3,
+        0xa436, 0x8107, 0xa438, 0x0002, 0xa436, 0x8109, 0xa438, 0xff0B,
+        0xa436, 0x810c, 0xa438, 0xC86D, 0xB87C, 0x8a32, 0xB87E, 0x0400,
+        0xa6f8, 0x0000, 0xa6f8, 0x0000, 0xa436, 0x81bc, 0xa438, 0x1300,
+        0xa846, 0x2410, 0xa86A, 0x0801, 0xa85C, 0x9680, 0xa436, 0x841D,
+        0xa438, 0x4A28, 0xa436, 0x8016, 0xa438, 0xBE05, 0xBF9C, 0x004A,
+        0xBF96, 0x41FA, 0xBF9A, 0xDC81, 0xa436, 0x8018, 0xa438, 0x0700,
+        0xa436, 0x8ff4, 0xa438, 0x01AE, 0xa436, 0x8fef, 0xa438, 0x0172,
+        0xa438, 0x00dc, 0xc842, 0x0002, 0xFFFF, 0xFFFF
+};
+
+static const u_int16_t phy_mcu_ram_code_8126a_1_3[] = {
+        0xb892, 0x0000, 0xB88E, 0xC236, 0xB890, 0x1A1C, 0xB88E, 0xC238,
+        0xB890, 0x1C1C, 0xB890, 0x1C1C, 0xB890, 0x2D2D, 0xB890, 0x2D2D,
+        0xB890, 0x2D2A, 0xB890, 0x2A2A, 0xB890, 0x2A2A, 0xB890, 0x2A19,
+        0xB88E, 0xC272, 0xB890, 0x8484, 0xB890, 0x8484, 0xB890, 0x84B4,
+        0xB890, 0xB4B4, 0xB890, 0xB4B4, 0xB890, 0xF8F8, 0xB890, 0xF8F8,
+        0xB890, 0xF8F8, 0xB88E, 0xC000, 0xB890, 0x0303, 0xB890, 0x0405,
+        0xB890, 0x0608, 0xB890, 0x0A0B, 0xB890, 0x0E11, 0xB890, 0x1519,
+        0xB890, 0x2028, 0xB890, 0x3503, 0xB890, 0x0304, 0xB890, 0x0405,
+        0xB890, 0x0606, 0xB890, 0x0708, 0xB890, 0x090A, 0xB890, 0x0B0D,
+        0xB890, 0x0F11, 0xB890, 0x1315, 0xB890, 0x181A, 0xB890, 0x2029,
+        0xB890, 0x2F36, 0xB890, 0x3D43, 0xB890, 0x0101, 0xB890, 0x0102,
+        0xB890, 0x0202, 0xB890, 0x0303, 0xB890, 0x0405, 0xB890, 0x0607,
+        0xB890, 0x090A, 0xB890, 0x0C0E, 0xB88E, 0xC038, 0xB890, 0x6AE1,
+        0xB890, 0x8E6B, 0xB890, 0xA767, 0xB890, 0x01EF, 0xB890, 0x5A63,
+        0xB890, 0x2B99, 0xB890, 0x7F5D, 0xB890, 0x361F, 0xB890, 0xA127,
+        0xB890, 0xB558, 0xB890, 0x11C3, 0xB890, 0x7D85, 0xB890, 0xBAC5,
+        0xB890, 0xE691, 0xB890, 0x8F79, 0xB890, 0x3164, 0xB890, 0x3293,
+        0xB890, 0xB80D, 0xB890, 0xE2B7, 0xB890, 0x0D62, 0xB890, 0x4F85,
+        0xB890, 0xC919, 0xB890, 0x78F3, 0xB890, 0x77FF, 0xB890, 0xBD9E,
+        0xB890, 0x69D6, 0xB890, 0x6DA4, 0xB890, 0x0CC5, 0xB88E, 0xC1D2,
+        0xB890, 0x2425, 0xB890, 0x2627, 0xB890, 0x2829, 0xB890, 0x2A2B,
+        0xB890, 0x2C2D, 0xB890, 0x2E2F, 0xB890, 0x3031, 0xB890, 0x3233,
+        0xB890, 0x2323, 0xB890, 0x2424, 0xB890, 0x2525, 0xB890, 0x2626,
+        0xB890, 0x2727, 0xB890, 0x2828, 0xB890, 0x2929, 0xB890, 0x2A2A,
+        0xB890, 0x2B2C, 0xB890, 0x2C2D, 0xB890, 0x2D2E, 0xB890, 0x2E2F,
+        0xB890, 0x2F30, 0xB890, 0x1A1B, 0xB890, 0x1D1E, 0xB890, 0x1F20,
+        0xB890, 0x2123, 0xB890, 0x2425, 0xB890, 0x2628, 0xB890, 0x292A,
+        0xB890, 0x2B2C, 0xB890, 0x2E12, 0xB88E, 0xC09A, 0xB890, 0xD3D3,
+        0xB890, 0xD3D3, 0xB890, 0xD3D3, 0xB890, 0xD3D3, 0xB890, 0xD3D3,
+        0xB890, 0xD3D3, 0xB890, 0xD3D3, 0xB890, 0xD3D3, 0xFFFF, 0xFFFF
+};
+
+static const u_int16_t phy_mcu_ram_code_8126a_2_1[] = {
+        0xa436, 0x8023, 0xa438, 0x4700, 0xa436, 0xB82E, 0xa438, 0x0001,
+        0xb820, 0x0090, 0xa436, 0xA016, 0xa438, 0x0000, 0xa436, 0xA012,
+        0xa438, 0x0000, 0xa436, 0xA014, 0xa438, 0x1800, 0xa438, 0x8010,
+        0xa438, 0x1800, 0xa438, 0x8025, 0xa438, 0x1800, 0xa438, 0x8033,
+        0xa438, 0x1800, 0xa438, 0x8037, 0xa438, 0x1800, 0xa438, 0x803c,
+        0xa438, 0x1800, 0xa438, 0x8044, 0xa438, 0x1800, 0xa438, 0x8054,
+        0xa438, 0x1800, 0xa438, 0x8059, 0xa438, 0xd504, 0xa438, 0xc9b5,
+        0xa438, 0xd500, 0xa438, 0xd707, 0xa438, 0x4070, 0xa438, 0x1800,
+        0xa438, 0x107a, 0xa438, 0xd504, 0xa438, 0xc994, 0xa438, 0xd500,
+        0xa438, 0xd707, 0xa438, 0x60d0, 0xa438, 0xd701, 0xa438, 0x252d,
+        0xa438, 0x8023, 0xa438, 0x1800, 0xa438, 0x1064, 0xa438, 0x1800,
+        0xa438, 0x107a, 0xa438, 0x1800, 0xa438, 0x1052, 0xa438, 0xd504,
+        0xa438, 0xc9d0, 0xa438, 0xd500, 0xa438, 0xd707, 0xa438, 0x60d0,
+        0xa438, 0xd701, 0xa438, 0x252d, 0xa438, 0x8031, 0xa438, 0x1800,
+        0xa438, 0x1171, 0xa438, 0x1800, 0xa438, 0x1187, 0xa438, 0x1800,
+        0xa438, 0x116a, 0xa438, 0xc0ff, 0xa438, 0xcaff, 0xa438, 0x1800,
+        0xa438, 0x00d6, 0xa438, 0xd504, 0xa438, 0xa001, 0xa438, 0xd704,
+        0xa438, 0x1800, 0xa438, 0x128b, 0xa438, 0xd707, 0xa438, 0x2005,
+        0xa438, 0x8042, 0xa438, 0xd75e, 0xa438, 0x1800, 0xa438, 0x137a,
+        0xa438, 0x1800, 0xa438, 0x13ed, 0xa438, 0x61d0, 0xa438, 0xd701,
+        0xa438, 0x60a5, 0xa438, 0xd504, 0xa438, 0xc9b2, 0xa438, 0xd500,
+        0xa438, 0xf004, 0xa438, 0xd504, 0xa438, 0xc9b1, 0xa438, 0xd500,
+        0xa438, 0xd707, 0xa438, 0x6070, 0xa438, 0x1800, 0xa438, 0x10a8,
+        0xa438, 0x1800, 0xa438, 0x10bd, 0xa438, 0xd500, 0xa438, 0xc492,
+        0xa438, 0xd501, 0xa438, 0x1800, 0xa438, 0x13c1, 0xa438, 0xa980,
+        0xa438, 0xd500, 0xa438, 0x1800, 0xa438, 0x143b, 0xa436, 0xA026,
+        0xa438, 0x143a, 0xa436, 0xA024, 0xa438, 0x13c0, 0xa436, 0xA022,
+        0xa438, 0x10bc, 0xa436, 0xA020, 0xa438, 0x1379, 0xa436, 0xA006,
+        0xa438, 0x128a, 0xa436, 0xA004, 0xa438, 0x00d5, 0xa436, 0xA002,
+        0xa438, 0x1182, 0xa436, 0xA000, 0xa438, 0x1075, 0xa436, 0xA008,
+        0xa438, 0xff00, 0xa436, 0xA016, 0xa438, 0x0010, 0xa436, 0xA012,
+        0xa438, 0x0000, 0xa436, 0xA014, 0xa438, 0x1800, 0xa438, 0x8010,
+        0xa438, 0x1800, 0xa438, 0x8015, 0xa438, 0x1800, 0xa438, 0x801a,
+        0xa438, 0x1800, 0xa438, 0x801e, 0xa438, 0x1800, 0xa438, 0x8027,
+        0xa438, 0x1800, 0xa438, 0x8027, 0xa438, 0x1800, 0xa438, 0x8027,
+        0xa438, 0x1800, 0xa438, 0x8027, 0xa438, 0x0c0f, 0xa438, 0x0505,
+        0xa438, 0xba01, 0xa438, 0x1800, 0xa438, 0x015e, 0xa438, 0x0c0f,
+        0xa438, 0x0506, 0xa438, 0xba02, 0xa438, 0x1800, 0xa438, 0x017c,
+        0xa438, 0x9910, 0xa438, 0x9a03, 0xa438, 0x1800, 0xa438, 0x02d4,
+        0xa438, 0x8580, 0xa438, 0xc090, 0xa438, 0x9a03, 0xa438, 0x1000,
+        0xa438, 0x02c9, 0xa438, 0xd700, 0xa438, 0x5fa3, 0xa438, 0x1800,
+        0xa438, 0x0067, 0xa436, 0xA08E, 0xa438, 0xffff, 0xa436, 0xA08C,
+        0xa438, 0xffff, 0xa436, 0xA08A, 0xa438, 0xffff, 0xa436, 0xA088,
+        0xa438, 0xffff, 0xa436, 0xA086, 0xa438, 0x018c, 0xa436, 0xA084,
+        0xa438, 0x02d3, 0xa436, 0xA082, 0xa438, 0x017a, 0xa436, 0xA080,
+        0xa438, 0x015c, 0xa436, 0xA090, 0xa438, 0x000f, 0xa436, 0xA016,
+        0xa438, 0x0020, 0xa436, 0xA012, 0xa438, 0x0000, 0xa436, 0xA014,
+        0xa438, 0x1800, 0xa438, 0x8010, 0xa438, 0x1800, 0xa438, 0x8023,
+        0xa438, 0x1800, 0xa438, 0x8313, 0xa438, 0x1800, 0xa438, 0x831a,
+        0xa438, 0x1800, 0xa438, 0x8489, 0xa438, 0x1800, 0xa438, 0x86b9,
+        0xa438, 0x1800, 0xa438, 0x86c1, 0xa438, 0x1800, 0xa438, 0x87ad,
+        0xa438, 0x1000, 0xa438, 0x124e, 0xa438, 0x9308, 0xa438, 0xb201,
+        0xa438, 0xb301, 0xa438, 0xd701, 0xa438, 0x5fe0, 0xa438, 0xd2ff,
+        0xa438, 0xb302, 0xa438, 0xd200, 0xa438, 0xb201, 0xa438, 0xb309,
+        0xa438, 0xd701, 0xa438, 0x5fe0, 0xa438, 0xd2ff, 0xa438, 0xb302,
+        0xa438, 0xd200, 0xa438, 0x1800, 0xa438, 0x0025, 0xa438, 0xd706,
+        0xa438, 0x6069, 0xa438, 0xd700, 0xa438, 0x6421, 0xa438, 0xd70c,
+        0xa438, 0x43ab, 0xa438, 0x800a, 0xa438, 0x8190, 0xa438, 0x8204,
+        0xa438, 0xa280, 0xa438, 0x8406, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0xa108, 0xa438, 0x9503, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x0c1f, 0xa438, 0x0f19, 0xa438, 0x9503, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd70c, 0xa438, 0x5fb3, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0x8f1f, 0xa438, 0x9503, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd70c, 0xa438, 0x7f33, 0xa438, 0x1000,
+        0xa438, 0x11bd, 0xa438, 0x1800, 0xa438, 0x81aa, 0xa438, 0x8710,
+        0xa438, 0xd701, 0xa438, 0x33b1, 0xa438, 0x8051, 0xa438, 0xd701,
+        0xa438, 0x60b5, 0xa438, 0xd706, 0xa438, 0x6069, 0xa438, 0x1800,
+        0xa438, 0x8056, 0xa438, 0xa00a, 0xa438, 0xa280, 0xa438, 0xa404,
+        0xa438, 0x1800, 0xa438, 0x80f3, 0xa438, 0xd173, 0xa438, 0xd04d,
+        0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fb4,
+        0xa438, 0xd173, 0xa438, 0xd05d, 0xa438, 0xd10d, 0xa438, 0xd049,
+        0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fb4,
+        0xa438, 0xd700, 0xa438, 0x64f5, 0xa438, 0xd700, 0xa438, 0x5ee7,
+        0xa438, 0xb920, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd71f,
+        0xa438, 0x7fb4, 0xa438, 0x9920, 0xa438, 0xcb3c, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd71f, 0xa438, 0x7d94, 0xa438, 0x6045,
+        0xa438, 0xfffa, 0xa438, 0xb820, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd71f, 0xa438, 0x7fa5, 0xa438, 0x9820, 0xa438, 0xcb3d,
+        0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x60b5,
+        0xa438, 0xd71f, 0xa438, 0x7bb4, 0xa438, 0x61b6, 0xa438, 0xfff8,
+        0xa438, 0xbb80, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd71f,
+        0xa438, 0x5fb4, 0xa438, 0x9b80, 0xa438, 0xd700, 0xa438, 0x60e7,
+        0xa438, 0xcb3f, 0xa438, 0x1800, 0xa438, 0x8094, 0xa438, 0xcb3e,
+        0xa438, 0x1800, 0xa438, 0x810f, 0xa438, 0x1800, 0xa438, 0x80f3,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xae04, 0xa438, 0x9503,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x8e04, 0xa438, 0x9503, 0xa438, 0xd706, 0xa438, 0x65fe,
+        0xa438, 0x0c1f, 0xa438, 0x0d04, 0xa438, 0x8dc0, 0xa438, 0x1000,
+        0xa438, 0x11bd, 0xa438, 0xd70c, 0xa438, 0x414b, 0xa438, 0x0cc0,
+        0xa438, 0x0040, 0xa438, 0x0c03, 0xa438, 0x0102, 0xa438, 0x0ce0,
+        0xa438, 0x03e0, 0xa438, 0xccce, 0xa438, 0x1800, 0xa438, 0x80b7,
+        0xa438, 0x0cc0, 0xa438, 0x0040, 0xa438, 0x0c03, 0xa438, 0x0100,
+        0xa438, 0x0ce0, 0xa438, 0x0380, 0xa438, 0xcc9c, 0xa438, 0x8710,
+        0xa438, 0x1000, 0xa438, 0x1118, 0xa438, 0xa104, 0xa438, 0x1000,
+        0xa438, 0x112a, 0xa438, 0x8104, 0xa438, 0xa202, 0xa438, 0xa140,
+        0xa438, 0x1000, 0xa438, 0x112a, 0xa438, 0x8140, 0xa438, 0x1000,
+        0xa438, 0x1121, 0xa438, 0xaa0f, 0xa438, 0xa130, 0xa438, 0xaa2f,
+        0xa438, 0xa2d5, 0xa438, 0xa405, 0xa438, 0xa720, 0xa438, 0xa00a,
+        0xa438, 0x1800, 0xa438, 0x80f3, 0xa438, 0xd704, 0xa438, 0x3cf1,
+        0xa438, 0x80d5, 0xa438, 0x0c1f, 0xa438, 0x0d02, 0xa438, 0x1800,
+        0xa438, 0x80d7, 0xa438, 0x0c1f, 0xa438, 0x0d01, 0xa438, 0x0cc0,
+        0xa438, 0x0d40, 0xa438, 0x1000, 0xa438, 0x11bd, 0xa438, 0x8710,
+        0xa438, 0x1000, 0xa438, 0x1118, 0xa438, 0xa108, 0xa438, 0x1000,
+        0xa438, 0x112a, 0xa438, 0x8108, 0xa438, 0xa203, 0xa438, 0x8a2f,
+        0xa438, 0xa130, 0xa438, 0x8204, 0xa438, 0xa140, 0xa438, 0x1000,
+        0xa438, 0x112a, 0xa438, 0x8140, 0xa438, 0x1000, 0xa438, 0x1121,
+        0xa438, 0xd17a, 0xa438, 0xd04b, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd700, 0xa438, 0x5fb4, 0xa438, 0xa204, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fa7, 0xa438, 0xb920,
+        0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd71f, 0xa438, 0x7fb4,
+        0xa438, 0x9920, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd71f,
+        0xa438, 0x6125, 0xa438, 0x6054, 0xa438, 0xfffb, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fa7, 0xa438, 0x1800,
+        0xa438, 0x80f7, 0xa438, 0xb820, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd71f, 0xa438, 0x7fa5, 0xa438, 0x9820, 0xa438, 0x9b01,
+        0xa438, 0xd402, 0xa438, 0x1000, 0xa438, 0x110d, 0xa438, 0xd701,
+        0xa438, 0x33b1, 0xa438, 0x811c, 0xa438, 0xd701, 0xa438, 0x60b5,
+        0xa438, 0xd706, 0xa438, 0x6069, 0xa438, 0x1800, 0xa438, 0x811e,
+        0xa438, 0x1800, 0xa438, 0x8183, 0xa438, 0xd70c, 0xa438, 0x40ab,
+        0xa438, 0x800a, 0xa438, 0x8110, 0xa438, 0x8284, 0xa438, 0x8404,
+        0xa438, 0xa710, 0xa438, 0x8120, 0xa438, 0x8241, 0xa438, 0x1000,
+        0xa438, 0x1118, 0xa438, 0xa104, 0xa438, 0x1000, 0xa438, 0x112a,
+        0xa438, 0x8104, 0xa438, 0x1000, 0xa438, 0x1121, 0xa438, 0xaa2f,
+        0xa438, 0xd70c, 0xa438, 0x438b, 0xa438, 0xa284, 0xa438, 0xd078,
+        0xa438, 0x800a, 0xa438, 0x8110, 0xa438, 0xa284, 0xa438, 0x8404,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xa108, 0xa438, 0x9503,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0x0c1f, 0xa438, 0x0f19,
+        0xa438, 0x9503, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd70c,
+        0xa438, 0x5fb3, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0x8f1f,
+        0xa438, 0x9503, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd70c,
+        0xa438, 0x7f33, 0xa438, 0x0c1f, 0xa438, 0x0d06, 0xa438, 0x8dc0,
+        0xa438, 0x1000, 0xa438, 0x11bd, 0xa438, 0x8110, 0xa438, 0xa284,
+        0xa438, 0xa404, 0xa438, 0xa00a, 0xa438, 0xd70c, 0xa438, 0x40a1,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xad10, 0xa438, 0x9503,
+        0xa438, 0xd70c, 0xa438, 0x414b, 0xa438, 0x0cc0, 0xa438, 0x0080,
+        0xa438, 0x0c03, 0xa438, 0x0102, 0xa438, 0x0ce0, 0xa438, 0x0340,
+        0xa438, 0xcc52, 0xa438, 0x1800, 0xa438, 0x816b, 0xa438, 0x80c0,
+        0xa438, 0x8103, 0xa438, 0x83e0, 0xa438, 0x8cff, 0xa438, 0xd193,
+        0xa438, 0xd047, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0x1000,
+        0xa438, 0x1193, 0xa438, 0xd700, 0xa438, 0x5f74, 0xa438, 0xa110,
+        0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0x1000, 0xa438, 0x1193,
+        0xa438, 0xd700, 0xa438, 0x5f6a, 0xa438, 0xa180, 0xa438, 0xd1f5,
+        0xa438, 0xd049, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0x1000,
+        0xa438, 0x1193, 0xa438, 0xd700, 0xa438, 0x5f74, 0xa438, 0x8710,
+        0xa438, 0xa00a, 0xa438, 0x8190, 0xa438, 0x8204, 0xa438, 0xa280,
+        0xa438, 0xa404, 0xa438, 0xbb80, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd71f, 0xa438, 0x5fb4, 0xa438, 0xb920, 0xa438, 0x9b80,
+        0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd71f, 0xa438, 0x7fb4,
+        0xa438, 0x9920, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xcb33,
+        0xa438, 0xd71f, 0xa438, 0x6105, 0xa438, 0x5f74, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fa7, 0xa438, 0x1800,
+        0xa438, 0x818e, 0xa438, 0xa710, 0xa438, 0xb820, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd71f, 0xa438, 0x7f65, 0xa438, 0x9820,
+        0xa438, 0x1800, 0xa438, 0x81f1, 0xa438, 0x0c1f, 0xa438, 0x0d04,
+        0xa438, 0x8dc0, 0xa438, 0x1000, 0xa438, 0x11bd, 0xa438, 0xa00a,
+        0xa438, 0x8280, 0xa438, 0xa710, 0xa438, 0xd103, 0xa438, 0xd04c,
+        0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fb4,
+        0xa438, 0x0c1f, 0xa438, 0x0d06, 0xa438, 0x8dc0, 0xa438, 0x1000,
+        0xa438, 0x11bd, 0xa438, 0x8710, 0xa438, 0xa190, 0xa438, 0xa204,
+        0xa438, 0x8280, 0xa438, 0xa404, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd700, 0xa438, 0x5fa7, 0xa438, 0xa00a, 0xa438, 0xa110,
+        0xa438, 0xa284, 0xa438, 0xa404, 0xa438, 0xcb33, 0xa438, 0xd71f,
+        0xa438, 0x5f54, 0xa438, 0xb920, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd71f, 0xa438, 0x7fb4, 0xa438, 0x9920, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd71f, 0xa438, 0x6145, 0xa438, 0x6074,
+        0xa438, 0x1800, 0xa438, 0x81d3, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd700, 0xa438, 0x5fa7, 0xa438, 0x1800, 0xa438, 0x81cd,
+        0xa438, 0xb820, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd71f,
+        0xa438, 0x7fa5, 0xa438, 0xa710, 0xa438, 0x9820, 0xa438, 0xbb20,
+        0xa438, 0x9308, 0xa438, 0xb210, 0xa438, 0xb301, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd701, 0xa438, 0x5fa4, 0xa438, 0xb302,
+        0xa438, 0x9210, 0xa438, 0xa00a, 0xa438, 0xa190, 0xa438, 0xa284,
+        0xa438, 0xa404, 0xa438, 0xcb34, 0xa438, 0xd701, 0xa438, 0x33b1,
+        0xa438, 0x823f, 0xa438, 0xd706, 0xa438, 0x60a9, 0xa438, 0xd1f5,
+        0xa438, 0xd049, 0xa438, 0x1800, 0xa438, 0x8201, 0xa438, 0xd13c,
+        0xa438, 0xd04a, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0x1000,
+        0xa438, 0x1193, 0xa438, 0xd700, 0xa438, 0x5f74, 0xa438, 0xd700,
+        0xa438, 0x5f2b, 0xa438, 0x0c1f, 0xa438, 0x0d03, 0xa438, 0x8dc0,
+        0xa438, 0x1000, 0xa438, 0x11bd, 0xa438, 0x8190, 0xa438, 0x8204,
+        0xa438, 0xa280, 0xa438, 0xa00a, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x8304, 0xa438, 0x9503, 0xa438, 0xcb35, 0xa438, 0xd70c,
+        0xa438, 0x414b, 0xa438, 0x8280, 0xa438, 0x800a, 0xa438, 0xd411,
+        0xa438, 0x1000, 0xa438, 0x110d, 0xa438, 0x1000, 0xa438, 0x11bd,
+        0xa438, 0xa280, 0xa438, 0xa00a, 0xa438, 0xd40a, 0xa438, 0xcb36,
+        0xa438, 0x1000, 0xa438, 0x110d, 0xa438, 0xd706, 0xa438, 0x431b,
+        0xa438, 0x800a, 0xa438, 0x8180, 0xa438, 0x8280, 0xa438, 0x8404,
+        0xa438, 0xa004, 0xa438, 0x1000, 0xa438, 0x112a, 0xa438, 0x8004,
+        0xa438, 0xa001, 0xa438, 0x1000, 0xa438, 0x112a, 0xa438, 0x8001,
+        0xa438, 0x0c03, 0xa438, 0x0902, 0xa438, 0xa00a, 0xa438, 0xd14a,
+        0xa438, 0xd048, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0x1000,
+        0xa438, 0x1193, 0xa438, 0xd700, 0xa438, 0x5f74, 0xa438, 0x0c1f,
+        0xa438, 0x0d06, 0xa438, 0x8dc0, 0xa438, 0x1000, 0xa438, 0x11bd,
+        0xa438, 0xd70c, 0xa438, 0x414b, 0xa438, 0x0cc0, 0xa438, 0x0080,
+        0xa438, 0x0c03, 0xa438, 0x0101, 0xa438, 0x0ce0, 0xa438, 0x03a0,
+        0xa438, 0xccb5, 0xa438, 0x1800, 0xa438, 0x8256, 0xa438, 0x0cc0,
+        0xa438, 0x0000, 0xa438, 0x0c03, 0xa438, 0x0101, 0xa438, 0x0ce0,
+        0xa438, 0x0320, 0xa438, 0xcc21, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x0c30, 0xa438, 0x0120, 0xa438, 0xa304, 0xa438, 0x9503,
+        0xa438, 0xd70c, 0xa438, 0x674b, 0xa438, 0xd704, 0xa438, 0x471a,
+        0xa438, 0xa301, 0xa438, 0x800a, 0xa438, 0xa110, 0xa438, 0x8180,
+        0xa438, 0xa204, 0xa438, 0x82a0, 0xa438, 0xa404, 0xa438, 0xaa40,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xaa01, 0xa438, 0x9503,
+        0xa438, 0xd178, 0xa438, 0xd049, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0x1000, 0xa438, 0x1193, 0xa438, 0xd700, 0xa438, 0x5f74,
+        0xa438, 0x8301, 0xa438, 0xa00a, 0xa438, 0x8110, 0xa438, 0xa180,
+        0xa438, 0xa284, 0xa438, 0x8220, 0xa438, 0xa404, 0xa438, 0xd178,
+        0xa438, 0xd048, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0x1000,
+        0xa438, 0x1193, 0xa438, 0xd700, 0xa438, 0x5f74, 0xa438, 0xcb3a,
+        0xa438, 0x8301, 0xa438, 0xa00a, 0xa438, 0xa190, 0xa438, 0xa280,
+        0xa438, 0x8224, 0xa438, 0xa404, 0xa438, 0xd700, 0xa438, 0x6041,
+        0xa438, 0xa402, 0xa438, 0xd178, 0xa438, 0xd049, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0x1000, 0xa438, 0x1193, 0xa438, 0xd700,
+        0xa438, 0x5f74, 0xa438, 0x1800, 0xa438, 0x82ab, 0xa438, 0xa00a,
+        0xa438, 0xa190, 0xa438, 0xa2a4, 0xa438, 0xa404, 0xa438, 0xd700,
+        0xa438, 0x6041, 0xa438, 0xa402, 0xa438, 0xcb37, 0xa438, 0xd706,
+        0xa438, 0x60a9, 0xa438, 0xd13d, 0xa438, 0xd04a, 0xa438, 0x1800,
+        0xa438, 0x82a7, 0xa438, 0xd13c, 0xa438, 0xd04b, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fb4, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0x1000, 0xa438, 0x1193, 0xa438, 0xd700,
+        0xa438, 0x5f6b, 0xa438, 0x0c1f, 0xa438, 0x0d07, 0xa438, 0x8dc0,
+        0xa438, 0x1000, 0xa438, 0x11bd, 0xa438, 0xd40d, 0xa438, 0x1000,
+        0xa438, 0x110d, 0xa438, 0xa208, 0xa438, 0x8204, 0xa438, 0xaa40,
+        0xa438, 0xcb38, 0xa438, 0xd706, 0xa438, 0x6129, 0xa438, 0xd70c,
+        0xa438, 0x608b, 0xa438, 0xd17a, 0xa438, 0xd047, 0xa438, 0xf006,
+        0xa438, 0xd13d, 0xa438, 0xd04b, 0xa438, 0xf003, 0xa438, 0xd196,
+        0xa438, 0xd04b, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0x1000,
+        0xa438, 0x1193, 0xa438, 0xd700, 0xa438, 0x5f74, 0xa438, 0xd704,
+        0xa438, 0x35ac, 0xa438, 0x8311, 0xa438, 0x0cc0, 0xa438, 0x0000,
+        0xa438, 0x0c03, 0xa438, 0x0101, 0xa438, 0x0ce0, 0xa438, 0x0320,
+        0xa438, 0xcc21, 0xa438, 0x0c1f, 0xa438, 0x0d03, 0xa438, 0x8dc0,
+        0xa438, 0x1000, 0xa438, 0x11bd, 0xa438, 0x0cc0, 0xa438, 0x0000,
+        0xa438, 0x0c07, 0xa438, 0x0c07, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0xa280, 0xa438, 0x8780, 0xa438, 0x0c60, 0xa438, 0x0700,
+        0xa438, 0x9503, 0xa438, 0xd704, 0xa438, 0x409c, 0xa438, 0xd110,
+        0xa438, 0xd04d, 0xa438, 0xf003, 0xa438, 0xd110, 0xa438, 0xd04d,
+        0xa438, 0xcb4a, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd700,
+        0xa438, 0x5fb4, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xa240,
+        0xa438, 0xa180, 0xa438, 0xa201, 0xa438, 0xa780, 0xa438, 0x9503,
+        0xa438, 0xd114, 0xa438, 0xd04a, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x0000,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0xcb4b, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fb4, 0xa438, 0x1800,
+        0xa438, 0x0bc3, 0xa438, 0x1800, 0xa438, 0x0bc3, 0xa438, 0x1000,
+        0xa438, 0x110d, 0xa438, 0xd419, 0xa438, 0x1000, 0xa438, 0x110d,
+        0xa438, 0x1800, 0xa438, 0x01ae, 0xa438, 0x8110, 0xa438, 0xa180,
+        0xa438, 0x8280, 0xa438, 0xa404, 0xa438, 0xa00a, 0xa438, 0x8402,
+        0xa438, 0xcb42, 0xa438, 0xd706, 0xa438, 0x3de9, 0xa438, 0x837a,
+        0xa438, 0xd704, 0xa438, 0x35ac, 0xa438, 0x8380, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fab, 0xa438, 0x0c1f,
+        0xa438, 0x0d06, 0xa438, 0x8dc0, 0xa438, 0x1000, 0xa438, 0x11bd,
+        0xa438, 0xd418, 0xa438, 0x1000, 0xa438, 0x110d, 0xa438, 0x0c1f,
+        0xa438, 0x0d03, 0xa438, 0x8dc0, 0xa438, 0x1000, 0xa438, 0x11bd,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xa780, 0xa438, 0xa20e,
+        0xa438, 0x9503, 0xa438, 0xd704, 0xa438, 0x409c, 0xa438, 0xd114,
+        0xa438, 0xd04d, 0xa438, 0xf003, 0xa438, 0xd114, 0xa438, 0xd04d,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xa003, 0xa438, 0x9503,
+        0xa438, 0xcb4c, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd700,
+        0xa438, 0x5fb4, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0x0c60,
+        0xa438, 0x0720, 0xa438, 0xa220, 0xa438, 0x9503, 0xa438, 0xcb4d,
+        0xa438, 0xd704, 0xa438, 0x409c, 0xa438, 0xd128, 0xa438, 0xd04f,
+        0xa438, 0xf003, 0xa438, 0xd128, 0xa438, 0xd04f, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fb4, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0x0c60, 0xa438, 0x0740, 0xa438, 0xa210,
+        0xa438, 0x9503, 0xa438, 0xd704, 0xa438, 0x409c, 0xa438, 0xd114,
+        0xa438, 0xd04e, 0xa438, 0xf003, 0xa438, 0xd114, 0xa438, 0xd04e,
+        0xa438, 0xcb4e, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd700,
+        0xa438, 0x5fb4, 0xa438, 0x0c1f, 0xa438, 0x0d06, 0xa438, 0x8dc0,
+        0xa438, 0x1000, 0xa438, 0x11bd, 0xa438, 0x0cc0, 0xa438, 0x0000,
+        0xa438, 0x0c07, 0xa438, 0x0c01, 0xa438, 0xd704, 0xa438, 0x40b5,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xa23c, 0xa438, 0x9503,
+        0xa438, 0xb920, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd71f,
+        0xa438, 0x7fb4, 0xa438, 0x8710, 0xa438, 0x9920, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd71f, 0xa438, 0x6105, 0xa438, 0x6054,
+        0xa438, 0xfffb, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd700,
+        0xa438, 0x5fa7, 0xa438, 0xffef, 0xa438, 0xa710, 0xa438, 0xb820,
+        0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd71f, 0xa438, 0x7fa5,
+        0xa438, 0x9820, 0xa438, 0xa00a, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0xa103, 0xa438, 0x9503, 0xa438, 0xbb20, 0xa438, 0xd706,
+        0xa438, 0x60dd, 0xa438, 0x0c1f, 0xa438, 0x0d07, 0xa438, 0x8dc0,
+        0xa438, 0x1000, 0xa438, 0x11bd, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x0c30, 0xa438, 0x0120, 0xa438, 0xa304, 0xa438, 0x9503,
+        0xa438, 0xa190, 0xa438, 0xa2a0, 0xa438, 0xa404, 0xa438, 0xa00a,
+        0xa438, 0xa604, 0xa438, 0xd700, 0xa438, 0x6041, 0xa438, 0xa402,
+        0xa438, 0xcb43, 0xa438, 0xd17a, 0xa438, 0xd048, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0x1000, 0xa438, 0x1193, 0xa438, 0xd700,
+        0xa438, 0x5f74, 0xa438, 0x609d, 0xa438, 0xd417, 0xa438, 0x1000,
+        0xa438, 0x110d, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0x1000,
+        0xa438, 0x1193, 0xa438, 0xd700, 0xa438, 0x5f7a, 0xa438, 0xd704,
+        0xa438, 0x5f36, 0xa438, 0xd706, 0xa438, 0x6089, 0xa438, 0xd40c,
+        0xa438, 0x1000, 0xa438, 0x110d, 0xa438, 0xaa40, 0xa438, 0xbb10,
+        0xa438, 0xcb50, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0x1000,
+        0xa438, 0x1193, 0xa438, 0xd71f, 0xa438, 0x5f75, 0xa438, 0x8190,
+        0xa438, 0x82a0, 0xa438, 0x8402, 0xa438, 0xa404, 0xa438, 0x800a,
+        0xa438, 0x8718, 0xa438, 0x9b10, 0xa438, 0x9b20, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd71f, 0xa438, 0x7fb5, 0xa438, 0xcb51,
+        0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd71f, 0xa438, 0x5f94,
+        0xa438, 0xd706, 0xa438, 0x6089, 0xa438, 0xd141, 0xa438, 0xd043,
+        0xa438, 0xf003, 0xa438, 0xd141, 0xa438, 0xd044, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fb4, 0xa438, 0xd700,
+        0xa438, 0x60e5, 0xa438, 0xd704, 0xa438, 0x60be, 0xa438, 0xd706,
+        0xa438, 0x29b1, 0xa438, 0x83fb, 0xa438, 0xf002, 0xa438, 0xa880,
+        0xa438, 0xa00a, 0xa438, 0xa190, 0xa438, 0x8220, 0xa438, 0xa280,
+        0xa438, 0xa404, 0xa438, 0xa620, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0xc5aa, 0xa438, 0x9503, 0xa438, 0xd700, 0xa438, 0x6061,
+        0xa438, 0xa402, 0xa438, 0xa480, 0xa438, 0xcb52, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fba, 0xa438, 0xd704,
+        0xa438, 0x5f76, 0xa438, 0xb920, 0xa438, 0xcb53, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd71f, 0xa438, 0x7fb4, 0xa438, 0x9920,
+        0xa438, 0xa00a, 0xa438, 0xa190, 0xa438, 0xa280, 0xa438, 0x8220,
+        0xa438, 0xa404, 0xa438, 0xb580, 0xa438, 0xd700, 0xa438, 0x40a1,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xa602, 0xa438, 0x9503,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xa310, 0xa438, 0x9503,
+        0xa438, 0xcb60, 0xa438, 0xd1c8, 0xa438, 0xd045, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fb4, 0xa438, 0xaa10,
+        0xa438, 0xd70c, 0xa438, 0x2833, 0xa438, 0x8434, 0xa438, 0xf003,
+        0xa438, 0x1000, 0xa438, 0x1238, 0xa438, 0xd70c, 0xa438, 0x40a6,
+        0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xa140, 0xa438, 0x9503,
+        0xa438, 0xd70c, 0xa438, 0x40a3, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0xac20, 0xa438, 0x9503, 0xa438, 0xa90c, 0xa438, 0xaa80,
+        0xa438, 0x0c1f, 0xa438, 0x0d07, 0xa438, 0x8dc0, 0xa438, 0x1000,
+        0xa438, 0x11bd, 0xa438, 0xa00a, 0xa438, 0xa190, 0xa438, 0xa280,
+        0xa438, 0x8220, 0xa438, 0xa404, 0xa438, 0xb580, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0xc500, 0xa438, 0x9503, 0xa438, 0x83e0,
+        0xa438, 0xd700, 0xa438, 0x40c1, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0xa602, 0xa438, 0x9503, 0xa438, 0x8e01, 0xa438, 0xd14a,
+        0xa438, 0xd058, 0xa438, 0xd70c, 0xa438, 0x4063, 0xa438, 0x1000,
+        0xa438, 0x11f2, 0xa438, 0xcb62, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd704, 0xa438, 0x2e70, 0xa438, 0x8479, 0xa438, 0xd71f,
+        0xa438, 0x626e, 0xa438, 0xd704, 0xa438, 0x3868, 0xa438, 0x847d,
+        0xa438, 0xd70c, 0xa438, 0x2f18, 0xa438, 0x8483, 0xa438, 0xd700,
+        0xa438, 0x5db5, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xc5aa,
+        0xa438, 0x9503, 0xa438, 0x0ce0, 0xa438, 0x0320, 0xa438, 0x1800,
+        0xa438, 0x0d6f, 0xa438, 0x1800, 0xa438, 0x0f15, 0xa438, 0x1800,
+        0xa438, 0x0dae, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0xc5aa,
+        0xa438, 0x9503, 0xa438, 0x1800, 0xa438, 0x0fc9, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0xc5aa, 0xa438, 0x9503, 0xa438, 0x1800,
+        0xa438, 0x0d84, 0xa438, 0x1000, 0xa438, 0x16e5, 0xa438, 0xd70c,
+        0xa438, 0x5fa4, 0xa438, 0xa706, 0xa438, 0xd70c, 0xa438, 0x408b,
+        0xa438, 0xa701, 0xa438, 0xa502, 0xa438, 0xa880, 0xa438, 0x8801,
+        0xa438, 0x8e01, 0xa438, 0xca50, 0xa438, 0x1000, 0xa438, 0x852e,
+        0xa438, 0xca51, 0xa438, 0xd70e, 0xa438, 0x2210, 0xa438, 0x852c,
+        0xa438, 0xd70c, 0xa438, 0x4084, 0xa438, 0xd705, 0xa438, 0x5efd,
+        0xa438, 0xf007, 0xa438, 0x1000, 0xa438, 0x16e9, 0xa438, 0xd70c,
+        0xa438, 0x5ca2, 0xa438, 0x1800, 0xa438, 0x15b2, 0xa438, 0xd70c,
+        0xa438, 0x605a, 0xa438, 0x9a10, 0xa438, 0x8e40, 0xa438, 0x8404,
+        0xa438, 0x1000, 0xa438, 0x174e, 0xa438, 0x8e80, 0xa438, 0xca62,
+        0xa438, 0xd705, 0xa438, 0x3084, 0xa438, 0x850e, 0xa438, 0xba10,
+        0xa438, 0x0000, 0xa438, 0x0000, 0xa438, 0x1000, 0xa438, 0x8608,
+        0xa438, 0x0c03, 0xa438, 0x0100, 0xa438, 0xd702, 0xa438, 0x4638,
+        0xa438, 0xd1c4, 0xa438, 0xd044, 0xa438, 0x1000, 0xa438, 0x16e5,
+        0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd70c, 0xa438, 0x5f7c,
+        0xa438, 0x8108, 0xa438, 0x0c1f, 0xa438, 0x0907, 0xa438, 0x8940,
+        0xa438, 0x1000, 0xa438, 0x1702, 0xa438, 0xa0c4, 0xa438, 0x8610,
+        0xa438, 0x8030, 0xa438, 0x8706, 0xa438, 0x0c07, 0xa438, 0x0b06,
+        0xa438, 0x8410, 0xa438, 0xa980, 0xa438, 0xa702, 0xa438, 0xd1c4,
+        0xa438, 0xd045, 0xa438, 0x1000, 0xa438, 0x16e5, 0xa438, 0x1000,
+        0xa438, 0x170f, 0xa438, 0xd70c, 0xa438, 0x5f7c, 0xa438, 0x0c07,
+        0xa438, 0x0b06, 0xa438, 0xa030, 0xa438, 0xa610, 0xa438, 0xd700,
+        0xa438, 0x6041, 0xa438, 0xa501, 0xa438, 0xa108, 0xa438, 0xd1c4,
+        0xa438, 0xd045, 0xa438, 0xca63, 0xa438, 0x1000, 0xa438, 0x16e5,
+        0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd70c, 0xa438, 0x5f7c,
+        0xa438, 0xd702, 0xa438, 0x6078, 0xa438, 0x9920, 0xa438, 0xf003,
+        0xa438, 0xb920, 0xa438, 0xa880, 0xa438, 0x9a10, 0xa438, 0x1000,
+        0xa438, 0x16e5, 0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd71f,
+        0xa438, 0x5f73, 0xa438, 0xf011, 0xa438, 0xd70c, 0xa438, 0x409b,
+        0xa438, 0x9920, 0xa438, 0x9a10, 0xa438, 0xfff5, 0xa438, 0x80fe,
+        0xa438, 0x8610, 0xa438, 0x8501, 0xa438, 0x8980, 0xa438, 0x8702,
+        0xa438, 0xa410, 0xa438, 0xa940, 0xa438, 0x81c0, 0xa438, 0xae80,
+        0xa438, 0x1800, 0xa438, 0x84b3, 0xa438, 0x8804, 0xa438, 0xa704,
+        0xa438, 0x8788, 0xa438, 0xff80, 0xa438, 0xbb08, 0xa438, 0x0c1f,
+        0xa438, 0x0907, 0xa438, 0x8940, 0xa438, 0x1000, 0xa438, 0x1702,
+        0xa438, 0x8701, 0xa438, 0x8502, 0xa438, 0xa0f4, 0xa438, 0xa610,
+        0xa438, 0xd700, 0xa438, 0x6061, 0xa438, 0xa002, 0xa438, 0xa501,
+        0xa438, 0x8706, 0xa438, 0x8410, 0xa438, 0xa980, 0xa438, 0xca64,
+        0xa438, 0xd110, 0xa438, 0xd040, 0xa438, 0x1000, 0xa438, 0x16e5,
+        0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd70c, 0xa438, 0x5f7c,
+        0xa438, 0x8804, 0xa438, 0xa706, 0xa438, 0x1800, 0xa438, 0x848d,
+        0xa438, 0x1800, 0xa438, 0x1384, 0xa438, 0xd705, 0xa438, 0x405f,
+        0xa438, 0xf036, 0xa438, 0xd705, 0xa438, 0x6234, 0xa438, 0xd70c,
+        0xa438, 0x41c6, 0xa438, 0xd70d, 0xa438, 0x419d, 0xa438, 0xd70d,
+        0xa438, 0x417e, 0xa438, 0xd704, 0xa438, 0x6127, 0xa438, 0x2951,
+        0xa438, 0x8543, 0xa438, 0xd70c, 0xa438, 0x4083, 0xa438, 0xd70c,
+        0xa438, 0x2e81, 0xa438, 0x8543, 0xa438, 0xf0c5, 0xa438, 0x80fe,
+        0xa438, 0x8610, 0xa438, 0x8501, 0xa438, 0x8704, 0xa438, 0x0c30,
+        0xa438, 0x0410, 0xa438, 0xa701, 0xa438, 0xac02, 0xa438, 0xa502,
+        0xa438, 0x8980, 0xa438, 0xca60, 0xa438, 0xa004, 0xa438, 0xd70c,
+        0xa438, 0x6065, 0xa438, 0x1800, 0xa438, 0x8554, 0xa438, 0x8004,
+        0xa438, 0xa804, 0xa438, 0x0c0f, 0xa438, 0x0602, 0xa438, 0x0c70,
+        0xa438, 0x0730, 0xa438, 0xa708, 0xa438, 0xd704, 0xa438, 0x609c,
+        0xa438, 0x0c1f, 0xa438, 0x0912, 0xa438, 0xf003, 0xa438, 0x0c1f,
+        0xa438, 0x090e, 0xa438, 0xa940, 0xa438, 0x1000, 0xa438, 0x1702,
+        0xa438, 0xa780, 0xa438, 0xf0a2, 0xa438, 0xd704, 0xa438, 0x63eb,
+        0xa438, 0xd705, 0xa438, 0x43b1, 0xa438, 0xd702, 0xa438, 0x339c,
+        0xa438, 0x8607, 0xa438, 0x8788, 0xa438, 0x8704, 0xa438, 0x0c1f,
+        0xa438, 0x0907, 0xa438, 0x8940, 0xa438, 0x1000, 0xa438, 0x1702,
+        0xa438, 0x8410, 0xa438, 0xa0f4, 0xa438, 0xa610, 0xa438, 0xd700,
+        0xa438, 0x6061, 0xa438, 0xa002, 0xa438, 0xa501, 0xa438, 0xa706,
+        0xa438, 0x8804, 0xa438, 0xa980, 0xa438, 0xd70c, 0xa438, 0x6085,
+        0xa438, 0x8701, 0xa438, 0x8502, 0xa438, 0x8c02, 0xa438, 0xa701,
+        0xa438, 0xa502, 0xa438, 0xf082, 0xa438, 0xd70c, 0xa438, 0x60c5,
+        0xa438, 0xd702, 0xa438, 0x6053, 0xa438, 0xf07d, 0xa438, 0x1800,
+        0xa438, 0x8604, 0xa438, 0xd70d, 0xa438, 0x4d1b, 0xa438, 0xba10,
+        0xa438, 0xae40, 0xa438, 0x0cfc, 0xa438, 0x03b4, 0xa438, 0x0cfc,
+        0xa438, 0x05b4, 0xa438, 0xd1c4, 0xa438, 0xd044, 0xa438, 0x1000,
+        0xa438, 0x16e5, 0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd70c,
+        0xa438, 0x5f7c, 0xa438, 0x8706, 0xa438, 0x8280, 0xa438, 0xace0,
+        0xa438, 0xa680, 0xa438, 0xa240, 0xa438, 0x1000, 0xa438, 0x16e5,
+        0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd702, 0xa438, 0x5f79,
+        0xa438, 0x8240, 0xa438, 0xd702, 0xa438, 0x6898, 0xa438, 0xd702,
+        0xa438, 0x4957, 0xa438, 0x1800, 0xa438, 0x85f6, 0xa438, 0xa1c0,
+        0xa438, 0x0c3f, 0xa438, 0x0220, 0xa438, 0x0cfc, 0xa438, 0x030c,
+        0xa438, 0x0cfc, 0xa438, 0x050c, 0xa438, 0x8108, 0xa438, 0x8640,
+        0xa438, 0xa120, 0xa438, 0xa640, 0xa438, 0x0c03, 0xa438, 0x0101,
+        0xa438, 0xa110, 0xa438, 0xd1c4, 0xa438, 0xd044, 0xa438, 0xca84,
+        0xa438, 0x1000, 0xa438, 0x16e5, 0xa438, 0x1000, 0xa438, 0x170f,
+        0xa438, 0xd70c, 0xa438, 0x5f7c, 0xa438, 0xd702, 0xa438, 0x60fc,
+        0xa438, 0x8210, 0xa438, 0x0ce0, 0xa438, 0x0320, 0xa438, 0x0ce0,
+        0xa438, 0x0520, 0xa438, 0xf002, 0xa438, 0xa210, 0xa438, 0xd1c4,
+        0xa438, 0xd043, 0xa438, 0x1000, 0xa438, 0x16e5, 0xa438, 0x1000,
+        0xa438, 0x170f, 0xa438, 0xd70c, 0xa438, 0x5f7c, 0xa438, 0x8233,
+        0xa438, 0x0cfc, 0xa438, 0x036c, 0xa438, 0x0cfc, 0xa438, 0x056c,
+        0xa438, 0xd1c4, 0xa438, 0xd044, 0xa438, 0xca85, 0xa438, 0x1000,
+        0xa438, 0x16e5, 0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd70c,
+        0xa438, 0x5f7c, 0xa438, 0xa680, 0xa438, 0xa240, 0xa438, 0x1000,
+        0xa438, 0x16e5, 0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd702,
+        0xa438, 0x5f79, 0xa438, 0x8240, 0xa438, 0x0cfc, 0xa438, 0x0390,
+        0xa438, 0x0cfc, 0xa438, 0x0590, 0xa438, 0xd702, 0xa438, 0x6058,
+        0xa438, 0xf002, 0xa438, 0xfec7, 0xa438, 0x81c0, 0xa438, 0x8880,
+        0xa438, 0x8706, 0xa438, 0xca61, 0xa438, 0xd1c4, 0xa438, 0xd054,
+        0xa438, 0x1000, 0xa438, 0x16e5, 0xa438, 0x1000, 0xa438, 0x170f,
+        0xa438, 0xd70c, 0xa438, 0x5f7d, 0xa438, 0xa706, 0xa438, 0xf004,
+        0xa438, 0x8788, 0xa438, 0xa404, 0xa438, 0x8702, 0xa438, 0x0800,
+        0xa438, 0x8443, 0xa438, 0x8303, 0xa438, 0x8280, 0xa438, 0x9920,
+        0xa438, 0x8ce0, 0xa438, 0x8004, 0xa438, 0xa1c0, 0xa438, 0xd70e,
+        0xa438, 0x404a, 0xa438, 0xa280, 0xa438, 0xd702, 0xa438, 0x3bd0,
+        0xa438, 0x8618, 0xa438, 0x0c3f, 0xa438, 0x0223, 0xa438, 0xf003,
+        0xa438, 0x0c3f, 0xa438, 0x0220, 0xa438, 0x0cfc, 0xa438, 0x0308,
+        0xa438, 0x0cfc, 0xa438, 0x0508, 0xa438, 0x8108, 0xa438, 0x8640,
+        0xa438, 0xa120, 0xa438, 0xa640, 0xa438, 0xd702, 0xa438, 0x6077,
+        0xa438, 0x8103, 0xa438, 0xf003, 0xa438, 0x0c03, 0xa438, 0x0101,
+        0xa438, 0xa110, 0xa438, 0xd702, 0xa438, 0x6077, 0xa438, 0xa108,
+        0xa438, 0xf006, 0xa438, 0xd704, 0xa438, 0x6077, 0xa438, 0x8108,
+        0xa438, 0xf002, 0xa438, 0xa108, 0xa438, 0xd193, 0xa438, 0xd045,
+        0xa438, 0xca82, 0xa438, 0x1000, 0xa438, 0x16e5, 0xa438, 0xd70e,
+        0xa438, 0x606a, 0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd70c,
+        0xa438, 0x5f3c, 0xa438, 0xd702, 0xa438, 0x60fc, 0xa438, 0x8210,
+        0xa438, 0x0ce0, 0xa438, 0x0320, 0xa438, 0x0ce0, 0xa438, 0x0520,
+        0xa438, 0xf002, 0xa438, 0xa210, 0xa438, 0xd1c4, 0xa438, 0xd043,
+        0xa438, 0x1000, 0xa438, 0x16e5, 0xa438, 0xd70e, 0xa438, 0x606a,
+        0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd70c, 0xa438, 0x5f3c,
+        0xa438, 0xd702, 0xa438, 0x3bd0, 0xa438, 0x8656, 0xa438, 0x0c3f,
+        0xa438, 0x020c, 0xa438, 0xf002, 0xa438, 0x823f, 0xa438, 0x0cfc,
+        0xa438, 0x034c, 0xa438, 0x0cfc, 0xa438, 0x054c, 0xa438, 0xd1c4,
+        0xa438, 0xd044, 0xa438, 0x1000, 0xa438, 0x16e5, 0xa438, 0xd70e,
+        0xa438, 0x606a, 0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd70c,
+        0xa438, 0x5f3c, 0xa438, 0x820c, 0xa438, 0xa360, 0xa438, 0xa560,
+        0xa438, 0xd1c4, 0xa438, 0xd043, 0xa438, 0xca83, 0xa438, 0x1000,
+        0xa438, 0x16e5, 0xa438, 0xd70e, 0xa438, 0x606a, 0xa438, 0x1000,
+        0xa438, 0x170f, 0xa438, 0xd70c, 0xa438, 0x5f3c, 0xa438, 0xd70e,
+        0xa438, 0x406a, 0xa438, 0x8680, 0xa438, 0xf002, 0xa438, 0xa680,
+        0xa438, 0xa240, 0xa438, 0x0c0f, 0xa438, 0x0604, 0xa438, 0x0c70,
+        0xa438, 0x0750, 0xa438, 0xa708, 0xa438, 0xd704, 0xa438, 0x609c,
+        0xa438, 0x0c1f, 0xa438, 0x0914, 0xa438, 0xf003, 0xa438, 0x0c1f,
+        0xa438, 0x0910, 0xa438, 0xa940, 0xa438, 0x1000, 0xa438, 0x1702,
+        0xa438, 0xa780, 0xa438, 0x1000, 0xa438, 0x16e5, 0xa438, 0xd70e,
+        0xa438, 0x606a, 0xa438, 0x1000, 0xa438, 0x170f, 0xa438, 0xd702,
+        0xa438, 0x399c, 0xa438, 0x8689, 0xa438, 0x8240, 0xa438, 0x8788,
+        0xa438, 0xd702, 0xa438, 0x63f8, 0xa438, 0xd705, 0xa438, 0x643c,
+        0xa438, 0xa402, 0xa438, 0xf012, 0xa438, 0x8402, 0xa438, 0xd705,
+        0xa438, 0x611b, 0xa438, 0xa401, 0xa438, 0xa302, 0xa438, 0xd702,
+        0xa438, 0x417d, 0xa438, 0xa440, 0xa438, 0xa280, 0xa438, 0xf008,
+        0xa438, 0x8401, 0xa438, 0x8302, 0xa438, 0xd70c, 0xa438, 0x6060,
+        0xa438, 0xa301, 0xa438, 0xf002, 0xa438, 0x8301, 0xa438, 0xd70c,
+        0xa438, 0x4080, 0xa438, 0xd70e, 0xa438, 0x604a, 0xa438, 0xff5f,
+        0xa438, 0xd705, 0xa438, 0x3cdd, 0xa438, 0x86b8, 0xa438, 0xff5b,
+        0xa438, 0x0cfc, 0xa438, 0x0390, 0xa438, 0x0cfc, 0xa438, 0x0590,
+        0xa438, 0x0800, 0xa438, 0x0c1f, 0xa438, 0x0d00, 0xa438, 0x8dc0,
+        0xa438, 0x1000, 0xa438, 0x11bd, 0xa438, 0xa504, 0xa438, 0x1800,
+        0xa438, 0x0fd3, 0xa438, 0xd70d, 0xa438, 0x407d, 0xa438, 0xa710,
+        0xa438, 0xf002, 0xa438, 0xa710, 0xa438, 0x9580, 0xa438, 0x0c03,
+        0xa438, 0x1502, 0xa438, 0xa304, 0xa438, 0x9503, 0xa438, 0x0c1f,
+        0xa438, 0x0d07, 0xa438, 0x8dc0, 0xa438, 0x1000, 0xa438, 0x11bd,
+        0xa438, 0xcb81, 0xa438, 0xd70c, 0xa438, 0x4882, 0xa438, 0xd706,
+        0xa438, 0x407a, 0xa438, 0xd70c, 0xa438, 0x4807, 0xa438, 0xd706,
+        0xa438, 0x405a, 0xa438, 0x8910, 0xa438, 0xa210, 0xa438, 0xd704,
+        0xa438, 0x611c, 0xa438, 0x0cc0, 0xa438, 0x0080, 0xa438, 0x0c03,
+        0xa438, 0x0101, 0xa438, 0x0ce0, 0xa438, 0x03a0, 0xa438, 0xccb5,
+        0xa438, 0x0cc0, 0xa438, 0x0080, 0xa438, 0x0c03, 0xa438, 0x0102,
+        0xa438, 0x0ce0, 0xa438, 0x0340, 0xa438, 0xcc52, 0xa438, 0xd706,
+        0xa438, 0x42ba, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0x0c1f,
+        0xa438, 0x0f1c, 0xa438, 0x9503, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd70c, 0xa438, 0x5fb3, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x8f1f, 0xa438, 0x9503, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd70c, 0xa438, 0x7f33, 0xa438, 0x8190, 0xa438, 0x8204,
+        0xa438, 0xf016, 0xa438, 0x0c03, 0xa438, 0x1502, 0xa438, 0x0c1f,
+        0xa438, 0x0f1b, 0xa438, 0x9503, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd70c, 0xa438, 0x5fb3, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0x8f1f, 0xa438, 0x9503, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd70c, 0xa438, 0x7f33, 0xa438, 0xd70c, 0xa438, 0x6047,
+        0xa438, 0xf002, 0xa438, 0xf00c, 0xa438, 0xd403, 0xa438, 0xcb82,
+        0xa438, 0x1000, 0xa438, 0x110d, 0xa438, 0xd40a, 0xa438, 0x1000,
+        0xa438, 0x110d, 0xa438, 0xd70c, 0xa438, 0x4247, 0xa438, 0x1000,
+        0xa438, 0x1225, 0xa438, 0x8a40, 0xa438, 0x1000, 0xa438, 0x1118,
+        0xa438, 0xa104, 0xa438, 0x1000, 0xa438, 0x112a, 0xa438, 0x8104,
+        0xa438, 0x1000, 0xa438, 0x1121, 0xa438, 0x0c03, 0xa438, 0x1502,
+        0xa438, 0xa704, 0xa438, 0x9503, 0xa438, 0xcb88, 0xa438, 0xf012,
+        0xa438, 0xa210, 0xa438, 0xa00a, 0xa438, 0xaa40, 0xa438, 0x1000,
+        0xa438, 0x1118, 0xa438, 0xa104, 0xa438, 0x1000, 0xa438, 0x112a,
+        0xa438, 0x8104, 0xa438, 0x1000, 0xa438, 0x1121, 0xa438, 0xa190,
+        0xa438, 0xa284, 0xa438, 0xa404, 0xa438, 0x8a10, 0xa438, 0x8a80,
+        0xa438, 0xcb84, 0xa438, 0xd13e, 0xa438, 0xd05a, 0xa438, 0xd13e,
+        0xa438, 0xd06b, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd700,
+        0xa438, 0x3559, 0xa438, 0x874b, 0xa438, 0xfffb, 0xa438, 0xd700,
+        0xa438, 0x604b, 0xa438, 0xcb8a, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd700, 0xa438, 0x3659, 0xa438, 0x8754, 0xa438, 0xfffb,
+        0xa438, 0xd700, 0xa438, 0x606b, 0xa438, 0xcb8b, 0xa438, 0x5eeb,
+        0xa438, 0xd700, 0xa438, 0x6041, 0xa438, 0xa402, 0xa438, 0xcb8c,
+        0xa438, 0xd706, 0xa438, 0x609a, 0xa438, 0xd1f5, 0xa438, 0xd048,
+        0xa438, 0xf003, 0xa438, 0xd160, 0xa438, 0xd04b, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fb4, 0xa438, 0xcb8d,
+        0xa438, 0x8710, 0xa438, 0xd71f, 0xa438, 0x5fd4, 0xa438, 0xb920,
+        0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd71f, 0xa438, 0x7fb4,
+        0xa438, 0x9920, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd71f,
+        0xa438, 0x6105, 0xa438, 0x6054, 0xa438, 0xfffb, 0xa438, 0x1000,
+        0xa438, 0x1175, 0xa438, 0xd700, 0xa438, 0x5fab, 0xa438, 0xfff0,
+        0xa438, 0xa710, 0xa438, 0xb820, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd71f, 0xa438, 0x7fa5, 0xa438, 0x9820, 0xa438, 0xd114,
+        0xa438, 0xd040, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd700,
+        0xa438, 0x5fba, 0xa438, 0xd704, 0xa438, 0x5f76, 0xa438, 0xd700,
+        0xa438, 0x5f34, 0xa438, 0xd700, 0xa438, 0x6081, 0xa438, 0xd706,
+        0xa438, 0x405a, 0xa438, 0xa480, 0xa438, 0xcb86, 0xa438, 0xd706,
+        0xa438, 0x609a, 0xa438, 0xd1c8, 0xa438, 0xd045, 0xa438, 0xf003,
+        0xa438, 0xd17a, 0xa438, 0xd04b, 0xa438, 0x1000, 0xa438, 0x1175,
+        0xa438, 0xd700, 0xa438, 0x5fb4, 0xa438, 0x0cc0, 0xa438, 0x0000,
+        0xa438, 0x0c03, 0xa438, 0x0101, 0xa438, 0x0ce0, 0xa438, 0x0320,
+        0xa438, 0xcc29, 0xa438, 0xa208, 0xa438, 0x8204, 0xa438, 0xd114,
+        0xa438, 0xd040, 0xa438, 0xd700, 0xa438, 0x5ff4, 0xa438, 0x1800,
+        0xa438, 0x0bc3, 0xa438, 0xa00a, 0xa438, 0x9308, 0xa438, 0xb210,
+        0xa438, 0xb301, 0xa438, 0x1000, 0xa438, 0x1175, 0xa438, 0xd701,
+        0xa438, 0x5fa4, 0xa438, 0xb302, 0xa438, 0x9210, 0xa438, 0x800a,
+        0xa438, 0x1800, 0xa438, 0x0573, 0xa436, 0xA10E, 0xa438, 0x0572,
+        0xa436, 0xA10C, 0xa438, 0x0e47, 0xa436, 0xA10A, 0xa438, 0x0fd2,
+        0xa436, 0xA108, 0xa438, 0x1503, 0xa436, 0xA106, 0xa438, 0x0c0d,
+        0xa436, 0xA104, 0xa438, 0x01ac, 0xa436, 0xA102, 0xa438, 0x0956,
+        0xa436, 0xA100, 0xa438, 0x001c, 0xa436, 0xA110, 0xa438, 0x00ff,
+        0xa436, 0xA016, 0xa438, 0x0020, 0xa436, 0xA012, 0xa438, 0x1ff8,
+        0xa436, 0xA014, 0xa438, 0x0000, 0xa438, 0x85f0, 0xa438, 0xa2a0,
+        0xa438, 0x8880, 0xa438, 0x0d00, 0xa438, 0xc500, 0xa438, 0x800a,
+        0xa438, 0xae01, 0xa436, 0xA164, 0xa438, 0x1013, 0xa436, 0xA166,
+        0xa438, 0x1014, 0xa436, 0xA168, 0xa438, 0x0F98, 0xa436, 0xA16A,
+        0xa438, 0x0DCA, 0xa436, 0xA16C, 0xa438, 0x109B, 0xa436, 0xA16E,
+        0xa438, 0x10A2, 0xa436, 0xA170, 0xa438, 0x0F33, 0xa436, 0xA172,
+        0xa438, 0x0F6E, 0xa436, 0xA162, 0xa438, 0x00ff, 0xa436, 0xb87c,
+        0xa438, 0x8a45, 0xa436, 0xb87e, 0xa438, 0xaf8a, 0xa438, 0x5daf,
+        0xa438, 0x8a63, 0xa438, 0xaf8a, 0xa438, 0x6caf, 0xa438, 0x8a78,
+        0xa438, 0xaf8a, 0xa438, 0x87af, 0xa438, 0x8a90, 0xa438, 0xaf8a,
+        0xa438, 0x96af, 0xa438, 0x8acf, 0xa438, 0x028a, 0xa438, 0xecaf,
+        0xa438, 0x211f, 0xa438, 0x0265, 0xa438, 0xcb02, 0xa438, 0x8fb4,
+        0xa438, 0xaf21, 0xa438, 0x6fa1, 0xa438, 0x1903, 0xa438, 0x028f,
+        0xa438, 0x3d02, 0xa438, 0x2261, 0xa438, 0xaf21, 0xa438, 0x2ead,
+        0xa438, 0x2109, 0xa438, 0xe08f, 0xa438, 0xffac, 0xa438, 0x2503,
+        0xa438, 0xaf4b, 0xa438, 0xeeaf, 0xa438, 0x4beb, 0xa438, 0xad35,
+        0xa438, 0x03af, 0xa438, 0x421b, 0xa438, 0xaf42, 0xa438, 0x5ce1,
+        0xa438, 0x8652, 0xa438, 0xaf49, 0xa438, 0xdcef, 0xa438, 0x31e1,
+        0xa438, 0x8ffd, 0xa438, 0xac28, 0xa438, 0x2ebf, 0xa438, 0x6dda,
+        0xa438, 0x0274, 0xa438, 0x95ad, 0xa438, 0x2825, 0xa438, 0xe28f,
+        0xa438, 0xe4ef, 0xa438, 0x131b, 0xa438, 0x12ac, 0xa438, 0x2f10,
+        0xa438, 0xef31, 0xa438, 0x1f44, 0xa438, 0xef13, 0xa438, 0xbf6c,
+        0xa438, 0xcf02, 0xa438, 0x7476, 0xa438, 0x1a12, 0xa438, 0xae08,
+        0xa438, 0xbf6c, 0xa438, 0xcf02, 0xa438, 0x744a, 0xa438, 0xef13,
+        0xa438, 0xaf08, 0xa438, 0x66af, 0xa438, 0x085c, 0xa438, 0xe18f,
+        0xa438, 0xe3ad, 0xa438, 0x2706, 0xa438, 0xe58f, 0xa438, 0xe9af,
+        0xa438, 0x4091, 0xa438, 0xe08f, 0xa438, 0xe1ac, 0xa438, 0x2002,
+        0xa438, 0xae03, 0xa438, 0xe18f, 0xa438, 0xe2e5, 0xa438, 0x8fe9,
+        0xa438, 0xaf3f, 0xa438, 0xe5f8, 0xa438, 0xe08f, 0xa438, 0xe7a0,
+        0xa438, 0x0005, 0xa438, 0x028b, 0xa438, 0x0dae, 0xa438, 0x13a0,
+        0xa438, 0x0105, 0xa438, 0x028b, 0xa438, 0x96ae, 0xa438, 0x0ba0,
+        0xa438, 0x0205, 0xa438, 0x028b, 0xa438, 0xc2ae, 0xa438, 0x0302,
+        0xa438, 0x8c18, 0xa438, 0xfc04, 0xa438, 0xf8fa, 0xa438, 0xef69,
+        0xa438, 0xfafb, 0xa438, 0xe080, 0xa438, 0x15ad, 0xa438, 0x2343,
+        0xa438, 0xe08f, 0xa438, 0xfdac, 0xa438, 0x203d, 0xa438, 0xe08f,
+        0xa438, 0xe9a0, 0xa438, 0x0002, 0xa438, 0xae35, 0xa438, 0xee8f,
+        0xa438, 0xe800, 0xa438, 0x028c, 0xa438, 0xc8bf, 0xa438, 0x8feb,
+        0xa438, 0xd819, 0xa438, 0xd9ef, 0xa438, 0x64bf, 0xa438, 0x8fef,
+        0xa438, 0xd819, 0xa438, 0xd9ef, 0xa438, 0x7402, 0xa438, 0x73a4,
+        0xa438, 0xad50, 0xa438, 0x18ee, 0xa438, 0x8fff, 0xa438, 0x0102,
+        0xa438, 0x8e1b, 0xa438, 0x0273, 0xa438, 0xd7ef, 0xa438, 0x47e5,
+        0xa438, 0x85a6, 0xa438, 0xe485, 0xa438, 0xa5ee, 0xa438, 0x8fe7,
+        0xa438, 0x01ae, 0xa438, 0x33bf, 0xa438, 0x8f87, 0xa438, 0x0274,
+        0xa438, 0x4abf, 0xa438, 0x8f8d, 0xa438, 0x0274, 0xa438, 0x4abf,
+        0xa438, 0x8f93, 0xa438, 0x0274, 0xa438, 0x4abf, 0xa438, 0x8f99,
+        0xa438, 0x0274, 0xa438, 0x4abf, 0xa438, 0x8f84, 0xa438, 0x0274,
+        0xa438, 0x53bf, 0xa438, 0x8f8a, 0xa438, 0x0274, 0xa438, 0x53bf,
+        0xa438, 0x8f90, 0xa438, 0x0274, 0xa438, 0x53bf, 0xa438, 0x8f96,
+        0xa438, 0x0274, 0xa438, 0x5302, 0xa438, 0x2261, 0xa438, 0xfffe,
+        0xa438, 0xef96, 0xa438, 0xfefc, 0xa438, 0x04f8, 0xa438, 0xfafb,
+        0xa438, 0xe085, 0xa438, 0xa5e1, 0xa438, 0x85a6, 0xa438, 0xef64,
+        0xa438, 0xd000, 0xa438, 0xe18f, 0xa438, 0xeaef, 0xa438, 0x7402,
+        0xa438, 0x73f2, 0xa438, 0xad50, 0xa438, 0x10e0, 0xa438, 0x8fe8,
+        0xa438, 0xac24, 0xa438, 0x06ee, 0xa438, 0x8fe7, 0xa438, 0x02ae,
+        0xa438, 0x04ee, 0xa438, 0x8fe7, 0xa438, 0x03ff, 0xa438, 0xfefc,
+        0xa438, 0x04f8, 0xa438, 0xf9fa, 0xa438, 0xef69, 0xa438, 0xfb02,
+        0xa438, 0x8cc8, 0xa438, 0xbf8f, 0xa438, 0xebd8, 0xa438, 0x19d9,
+        0xa438, 0xbf8f, 0xa438, 0xf3e2, 0xa438, 0x8fe8, 0xa438, 0xef32,
+        0xa438, 0x4b02, 0xa438, 0x1a93, 0xa438, 0xdc19, 0xa438, 0xdd12,
+        0xa438, 0xe68f, 0xa438, 0xe8e3, 0xa438, 0x8fe9, 0xa438, 0x1b23,
+        0xa438, 0xad37, 0xa438, 0x07e0, 0xa438, 0x8fff, 0xa438, 0x4802,
+        0xa438, 0xae09, 0xa438, 0xee8f, 0xa438, 0xe810, 0xa438, 0x1f00,
+        0xa438, 0xe48f, 0xa438, 0xfee4, 0xa438, 0x8fff, 0xa438, 0x028e,
+        0xa438, 0x1b02, 0xa438, 0x73d7, 0xa438, 0xef47, 0xa438, 0xe585,
+        0xa438, 0xa6e4, 0xa438, 0x85a5, 0xa438, 0xee8f, 0xa438, 0xe701,
+        0xa438, 0xffef, 0xa438, 0x96fe, 0xa438, 0xfdfc, 0xa438, 0x04f8,
+        0xa438, 0xf9fa, 0xa438, 0xef69, 0xa438, 0xfafb, 0xa438, 0x028c,
+        0xa438, 0xc8bf, 0xa438, 0x8feb, 0xa438, 0xd819, 0xa438, 0xd9ef,
+        0xa438, 0x64bf, 0xa438, 0x8fef, 0xa438, 0xd819, 0xa438, 0xd9ef,
+        0xa438, 0x7402, 0xa438, 0x73a4, 0xa438, 0xad50, 0xa438, 0x27bf,
+        0xa438, 0x8fed, 0xa438, 0xd819, 0xa438, 0xd9ef, 0xa438, 0x64bf,
+        0xa438, 0x8ff1, 0xa438, 0xd819, 0xa438, 0xd9ef, 0xa438, 0x7402,
+        0xa438, 0x73a4, 0xa438, 0xad50, 0xa438, 0x11e2, 0xa438, 0x8fe8,
+        0xa438, 0xe38f, 0xa438, 0xe9ef, 0xa438, 0x0258, 0xa438, 0x0f1b,
+        0xa438, 0x03ac, 0xa438, 0x2744, 0xa438, 0xae09, 0xa438, 0xe08f,
+        0xa438, 0xfee4, 0xa438, 0x8fff, 0xa438, 0x028e, 0xa438, 0x1b02,
+        0xa438, 0x2261, 0xa438, 0xee8f, 0xa438, 0xe700, 0xa438, 0xbf8f,
+        0xa438, 0x8702, 0xa438, 0x744a, 0xa438, 0xbf8f, 0xa438, 0x8d02,
+        0xa438, 0x744a, 0xa438, 0xbf8f, 0xa438, 0x9302, 0xa438, 0x744a,
+        0xa438, 0xbf8f, 0xa438, 0x9902, 0xa438, 0x744a, 0xa438, 0xbf8f,
+        0xa438, 0x8402, 0xa438, 0x7453, 0xa438, 0xbf8f, 0xa438, 0x8a02,
+        0xa438, 0x7453, 0xa438, 0xbf8f, 0xa438, 0x9002, 0xa438, 0x7453,
+        0xa438, 0xbf8f, 0xa438, 0x9602, 0xa438, 0x7453, 0xa438, 0xae1f,
+        0xa438, 0x12e6, 0xa438, 0x8fe8, 0xa438, 0xe08f, 0xa438, 0xffe4,
+        0xa438, 0x8ffe, 0xa438, 0x028d, 0xa438, 0x3e02, 0xa438, 0x8e1b,
+        0xa438, 0x0273, 0xa438, 0xd7ef, 0xa438, 0x47e5, 0xa438, 0x85a6,
+        0xa438, 0xe485, 0xa438, 0xa5ee, 0xa438, 0x8fe7, 0xa438, 0x01ff,
+        0xa438, 0xfeef, 0xa438, 0x96fe, 0xa438, 0xfdfc, 0xa438, 0x04f8,
+        0xa438, 0xf9fa, 0xa438, 0xef69, 0xa438, 0xfafb, 0xa438, 0x1f22,
+        0xa438, 0xee8f, 0xa438, 0xeb00, 0xa438, 0xee8f, 0xa438, 0xec00,
+        0xa438, 0xee8f, 0xa438, 0xed00, 0xa438, 0xee8f, 0xa438, 0xee00,
+        0xa438, 0x1f33, 0xa438, 0xee8f, 0xa438, 0xe500, 0xa438, 0xee8f,
+        0xa438, 0xe600, 0xa438, 0xbf53, 0xa438, 0x7d02, 0xa438, 0x7662,
+        0xa438, 0xef64, 0xa438, 0xbf8f, 0xa438, 0xe5d8, 0xa438, 0x19d9,
+        0xa438, 0xef74, 0xa438, 0x0273, 0xa438, 0xbfef, 0xa438, 0x47dd,
+        0xa438, 0x89dc, 0xa438, 0xd1ff, 0xa438, 0xb1fe, 0xa438, 0x13ad,
+        0xa438, 0x3be0, 0xa438, 0x0d73, 0xa438, 0xbf8f, 0xa438, 0xedd8,
+        0xa438, 0x19d9, 0xa438, 0xef64, 0xa438, 0xef47, 0xa438, 0x0273,
+        0xa438, 0xa4ad, 0xa438, 0x5003, 0xa438, 0xdd89, 0xa438, 0xdcef,
+        0xa438, 0x64bf, 0xa438, 0x8feb, 0xa438, 0xd819, 0xa438, 0xd91a,
+        0xa438, 0x46dd, 0xa438, 0x89dc, 0xa438, 0x12ad, 0xa438, 0x32b0,
+        0xa438, 0x0d42, 0xa438, 0xdc19, 0xa438, 0xddff, 0xa438, 0xfeef,
+        0xa438, 0x96fe, 0xa438, 0xfdfc, 0xa438, 0x04f8, 0xa438, 0xf9fa,
+        0xa438, 0xef69, 0xa438, 0xfafb, 0xa438, 0x1f22, 0xa438, 0xd6ff,
+        0xa438, 0xffef, 0xa438, 0x03bf, 0xa438, 0x8ff3, 0xa438, 0xef32,
+        0xa438, 0x4b02, 0xa438, 0x1a93, 0xa438, 0xef30, 0xa438, 0xd819,
+        0xa438, 0xd9ef, 0xa438, 0x7402, 0xa438, 0x73a4, 0xa438, 0xac50,
+        0xa438, 0x04ef, 0xa438, 0x32ef, 0xa438, 0x64e0, 0xa438, 0x8fe9,
+        0xa438, 0x12ef, 0xa438, 0x121b, 0xa438, 0x10ac, 0xa438, 0x2fd9,
+        0xa438, 0xef03, 0xa438, 0xbf8f, 0xa438, 0xf348, 0xa438, 0x021a,
+        0xa438, 0x90ec, 0xa438, 0xff19, 0xa438, 0xecff, 0xa438, 0xd001,
+        0xa438, 0xae03, 0xa438, 0x0c01, 0xa438, 0x83a3, 0xa438, 0x00fa,
+        0xa438, 0xe18f, 0xa438, 0xff1e, 0xa438, 0x10e5, 0xa438, 0x8fff,
+        0xa438, 0xfffe, 0xa438, 0xef96, 0xa438, 0xfefd, 0xa438, 0xfc04,
+        0xa438, 0x725a, 0xa438, 0x725d, 0xa438, 0x7260, 0xa438, 0x7263,
+        0xa438, 0x71fa, 0xa438, 0x71fd, 0xa438, 0x7200, 0xa438, 0x7203,
+        0xa438, 0x8f4b, 0xa438, 0x8f4e, 0xa438, 0x8f51, 0xa438, 0x8f54,
+        0xa438, 0x8f57, 0xa438, 0x8f5a, 0xa438, 0x8f5d, 0xa438, 0x8f60,
+        0xa438, 0x722a, 0xa438, 0x722d, 0xa438, 0x7230, 0xa438, 0x7233,
+        0xa438, 0x721e, 0xa438, 0x7221, 0xa438, 0x7224, 0xa438, 0x7227,
+        0xa438, 0x7212, 0xa438, 0x7215, 0xa438, 0x7218, 0xa438, 0x721b,
+        0xa438, 0x724e, 0xa438, 0x7251, 0xa438, 0x7254, 0xa438, 0x7257,
+        0xa438, 0x7242, 0xa438, 0x7245, 0xa438, 0x7248, 0xa438, 0x724b,
+        0xa438, 0x7236, 0xa438, 0x7239, 0xa438, 0x723c, 0xa438, 0x723f,
+        0xa438, 0x8f84, 0xa438, 0x8f8a, 0xa438, 0x8f90, 0xa438, 0x8f96,
+        0xa438, 0x8f9c, 0xa438, 0x8fa2, 0xa438, 0x8fa8, 0xa438, 0x8fae,
+        0xa438, 0x8f87, 0xa438, 0x8f8d, 0xa438, 0x8f93, 0xa438, 0x8f99,
+        0xa438, 0x8f9f, 0xa438, 0x8fa5, 0xa438, 0x8fab, 0xa438, 0x8fb1,
+        0xa438, 0x8f63, 0xa438, 0x8f66, 0xa438, 0x8f69, 0xa438, 0x8f6c,
+        0xa438, 0x8f6f, 0xa438, 0x8f72, 0xa438, 0x8f75, 0xa438, 0x8f78,
+        0xa438, 0x8f7b, 0xa438, 0xf8f9, 0xa438, 0xfaef, 0xa438, 0x69fa,
+        0xa438, 0xfbe2, 0xa438, 0x8fff, 0xa438, 0xad30, 0xa438, 0x06d1,
+        0xa438, 0x00d3, 0xa438, 0x00ae, 0xa438, 0x04d1, 0xa438, 0x01d3,
+        0xa438, 0x0fbf, 0xa438, 0x8d99, 0xa438, 0xd700, 0xa438, 0x0802,
+        0xa438, 0x7677, 0xa438, 0xef13, 0xa438, 0xbf8d, 0xa438, 0xa1d7,
+        0xa438, 0x0008, 0xa438, 0x0276, 0xa438, 0x77ad, 0xa438, 0x3106,
+        0xa438, 0xd100, 0xa438, 0xd300, 0xa438, 0xae04, 0xa438, 0xd101,
+        0xa438, 0xd30f, 0xa438, 0xbf8d, 0xa438, 0xa9d7, 0xa438, 0x0008,
+        0xa438, 0x0276, 0xa438, 0x77ef, 0xa438, 0x13bf, 0xa438, 0x8db1,
+        0xa438, 0xd700, 0xa438, 0x0802, 0xa438, 0x7677, 0xa438, 0xad32,
+        0xa438, 0x06d1, 0xa438, 0x00d3, 0xa438, 0x00ae, 0xa438, 0x04d1,
+        0xa438, 0x01d3, 0xa438, 0x03bf, 0xa438, 0x8db9, 0xa438, 0xd700,
+        0xa438, 0x1802, 0xa438, 0x7677, 0xa438, 0xef13, 0xa438, 0xbf8d,
+        0xa438, 0xd1d7, 0xa438, 0x0018, 0xa438, 0x0276, 0xa438, 0x77ad,
+        0xa438, 0x3304, 0xa438, 0xd101, 0xa438, 0xae02, 0xa438, 0xd100,
+        0xa438, 0xd300, 0xa438, 0xbf8d, 0xa438, 0xe9d7, 0xa438, 0x0010,
+        0xa438, 0x0276, 0xa438, 0x77ef, 0xa438, 0x13bf, 0xa438, 0x8df9,
+        0xa438, 0xd700, 0xa438, 0x1002, 0xa438, 0x7677, 0xa438, 0x1f33,
+        0xa438, 0xe38f, 0xa438, 0xfdac, 0xa438, 0x3803, 0xa438, 0xaf8f,
+        0xa438, 0x35ad, 0xa438, 0x3405, 0xa438, 0xe18f, 0xa438, 0xfbae,
+        0xa438, 0x02d1, 0xa438, 0x00bf, 0xa438, 0x8e09, 0xa438, 0xd700,
+        0xa438, 0x1202, 0xa438, 0x7677, 0xa438, 0xad35, 0xa438, 0x06d1,
+        0xa438, 0x01d3, 0xa438, 0x04ae, 0xa438, 0x04d1, 0xa438, 0x00d3,
+        0xa438, 0x00bf, 0xa438, 0x6f8a, 0xa438, 0x0274, 0xa438, 0x76bf,
+        0xa438, 0x6bd0, 0xa438, 0x0274, 0xa438, 0x951a, 0xa438, 0x13bf,
+        0xa438, 0x6bd0, 0xa438, 0x0274, 0xa438, 0x76bf, 0xa438, 0x6d2c,
+        0xa438, 0x0274, 0xa438, 0x95ac, 0xa438, 0x280b, 0xa438, 0xbf6d,
+        0xa438, 0x2f02, 0xa438, 0x7495, 0xa438, 0xac28, 0xa438, 0x02ae,
+        0xa438, 0x0bad, 0xa438, 0x3504, 0xa438, 0xd101, 0xa438, 0xae0d,
+        0xa438, 0xd10f, 0xa438, 0xae09, 0xa438, 0xad35, 0xa438, 0x04d1,
+        0xa438, 0x05ae, 0xa438, 0x02d1, 0xa438, 0x0fbf, 0xa438, 0x8f7e,
+        0xa438, 0x0274, 0xa438, 0x76e3, 0xa438, 0x8ffc, 0xa438, 0xac38,
+        0xa438, 0x05ad, 0xa438, 0x3618, 0xa438, 0xae08, 0xa438, 0xbf71,
+        0xa438, 0x9d02, 0xa438, 0x744a, 0xa438, 0xae0e, 0xa438, 0xd102,
+        0xa438, 0xbf8f, 0xa438, 0x8102, 0xa438, 0x7476, 0xa438, 0xbf71,
+        0xa438, 0x9d02, 0xa438, 0x7476, 0xa438, 0xfffe, 0xa438, 0xef96,
+        0xa438, 0xfefd, 0xa438, 0xfc04, 0xa438, 0xf91f, 0xa438, 0x33e3,
+        0xa438, 0x8ffd, 0xa438, 0xad38, 0xa438, 0x0302, 0xa438, 0x8e1b,
+        0xa438, 0xfd04, 0xa438, 0x55b0, 0xa438, 0x2055, 0xa438, 0xb0a0,
+        0xa438, 0x55b1, 0xa438, 0x2055, 0xa438, 0xb1a0, 0xa438, 0xfcb0,
+        0xa438, 0x22fc, 0xa438, 0xb0a2, 0xa438, 0xfcb1, 0xa438, 0x22fc,
+        0xa438, 0xb1a2, 0xa438, 0xfdad, 0xa438, 0xdaca, 0xa438, 0xadda,
+        0xa438, 0x97ad, 0xa438, 0xda64, 0xa438, 0xadda, 0xa438, 0x20ad,
+        0xa438, 0xdafd, 0xa438, 0xaddc, 0xa438, 0xcaad, 0xa438, 0xdc97,
+        0xa438, 0xaddc, 0xa438, 0x64ad, 0xa438, 0xdca7, 0xa438, 0xbf1e,
+        0xa438, 0x20bc, 0xa438, 0x3299, 0xa438, 0xadfe, 0xa438, 0x85ad,
+        0xa438, 0xfe44, 0xa438, 0xadfe, 0xa438, 0x30ad, 0xa438, 0xfeff,
+        0xa438, 0xae00, 0xa438, 0xebae, 0xa438, 0x00aa, 0xa438, 0xae00,
+        0xa438, 0x96ae, 0xa438, 0x00dd, 0xa438, 0xad94, 0xa438, 0xccad,
+        0xa438, 0x9499, 0xa438, 0xad94, 0xa438, 0x88ad, 0xa438, 0x94ff,
+        0xa438, 0xad94, 0xa438, 0xeead, 0xa438, 0x94bb, 0xa438, 0xad94,
+        0xa438, 0xaaad, 0xa438, 0x94f9, 0xa438, 0xe28f, 0xa438, 0xffee,
+        0xa438, 0x8fff, 0xa438, 0x00e3, 0xa438, 0x8ffd, 0xa438, 0xee8f,
+        0xa438, 0xfd01, 0xa438, 0xee8f, 0xa438, 0xfc01, 0xa438, 0x028e,
+        0xa438, 0x1be6, 0xa438, 0x8fff, 0xa438, 0xe78f, 0xa438, 0xfdee,
+        0xa438, 0x8ffc, 0xa438, 0x00ee, 0xa438, 0x8fe7, 0xa438, 0x00fd,
+        0xa438, 0x0400, 0xa436, 0xb85e, 0xa438, 0x211C, 0xa436, 0xb860,
+        0xa438, 0x216C, 0xa436, 0xb862, 0xa438, 0x212B, 0xa436, 0xb864,
+        0xa438, 0x4BE8, 0xa436, 0xb886, 0xa438, 0x4209, 0xa436, 0xb888,
+        0xa438, 0x49DA, 0xa436, 0xb88a, 0xa438, 0x085A, 0xa436, 0xb88c,
+        0xa438, 0x3FDF, 0xa436, 0xb838, 0xa438, 0x00ff, 0xb820, 0x0010,
+        0xa466, 0x0003, 0xa436, 0x8528, 0xa438, 0x0000, 0xa436, 0x85f8,
+        0xa438, 0xaf86, 0xa438, 0x10af, 0xa438, 0x8622, 0xa438, 0xaf86,
+        0xa438, 0x4aaf, 0xa438, 0x8658, 0xa438, 0xaf86, 0xa438, 0x64af,
+        0xa438, 0x8685, 0xa438, 0xaf86, 0xa438, 0xc4af, 0xa438, 0x86cf,
+        0xa438, 0xa104, 0xa438, 0x0ce0, 0xa438, 0x8394, 0xa438, 0xad20,
+        0xa438, 0x03af, 0xa438, 0x2b67, 0xa438, 0xaf2a, 0xa438, 0xf0af,
+        0xa438, 0x2b8d, 0xa438, 0xbf6b, 0xa438, 0x7202, 0xa438, 0x72dc,
+        0xa438, 0xa106, 0xa438, 0x19e1, 0xa438, 0x8164, 0xa438, 0xbf6d,
+        0xa438, 0x5b02, 0xa438, 0x72bd, 0xa438, 0x0d13, 0xa438, 0xbf6d,
+        0xa438, 0x5802, 0xa438, 0x72bd, 0xa438, 0x0d13, 0xa438, 0xbf6d,
+        0xa438, 0x6a02, 0xa438, 0x72bd, 0xa438, 0x0275, 0xa438, 0x12af,
+        0xa438, 0x380d, 0xa438, 0x0d55, 0xa438, 0x5d07, 0xa438, 0xffbf,
+        0xa438, 0x8b09, 0xa438, 0x0272, 0xa438, 0x91af, 0xa438, 0x3ee2,
+        0xa438, 0x023d, 0xa438, 0xffbf, 0xa438, 0x8b09, 0xa438, 0x0272,
+        0xa438, 0x9aaf, 0xa438, 0x41a6, 0xa438, 0x0223, 0xa438, 0x24f8,
+        0xa438, 0xfaef, 0xa438, 0x69bf, 0xa438, 0x6b9c, 0xa438, 0x0272,
+        0xa438, 0xdce0, 0xa438, 0x8f7a, 0xa438, 0x1f01, 0xa438, 0x9e06,
+        0xa438, 0xe58f, 0xa438, 0x7a02, 0xa438, 0x7550, 0xa438, 0xef96,
+        0xa438, 0xfefc, 0xa438, 0xaf06, 0xa438, 0x8702, 0xa438, 0x1cac,
+        0xa438, 0xf8f9, 0xa438, 0xfaef, 0xa438, 0x69fb, 0xa438, 0xd78f,
+        0xa438, 0x97ae, 0xa438, 0x00bf, 0xa438, 0x6d4f, 0xa438, 0x0272,
+        0xa438, 0x91d3, 0xa438, 0x00a3, 0xa438, 0x1202, 0xa438, 0xae1b,
+        0xa438, 0xbf6d, 0xa438, 0x52ef, 0xa438, 0x1302, 0xa438, 0x72bd,
+        0xa438, 0xef97, 0xa438, 0xd9bf, 0xa438, 0x6d55, 0xa438, 0x0272,
+        0xa438, 0xbd17, 0xa438, 0x13ae, 0xa438, 0xe6bf, 0xa438, 0x6d4f,
+        0xa438, 0x0272, 0xa438, 0x9aff, 0xa438, 0xef96, 0xa438, 0xfefd,
+        0xa438, 0xfcaf, 0xa438, 0x1c05, 0xa438, 0x0000, 0xa438, 0x021b,
+        0xa438, 0xf202, 0xa438, 0x8700, 0xa438, 0xaf1b, 0xa438, 0x73ad,
+        0xa438, 0x2003, 0xa438, 0x0206, 0xa438, 0x6ead, 0xa438, 0x2108,
+        0xa438, 0xe280, 0xa438, 0x51f7, 0xa438, 0x30e6, 0xa438, 0x8051,
+        0xa438, 0xe180, 0xa438, 0x421e, 0xa438, 0x10e5, 0xa438, 0x8042,
+        0xa438, 0xe0ff, 0xa438, 0xeee1, 0xa438, 0x8043, 0xa438, 0x1e10,
+        0xa438, 0xe580, 0xa438, 0x43e0, 0xa438, 0xffef, 0xa438, 0xad20,
+        0xa438, 0x04ee, 0xa438, 0x804f, 0xa438, 0x1eaf, 0xa438, 0x0661,
+        0xa438, 0xf8fa, 0xa438, 0xef69, 0xa438, 0xe080, 0xa438, 0x4fac,
+        0xa438, 0x2417, 0xa438, 0xe080, 0xa438, 0x44ad, 0xa438, 0x241a,
+        0xa438, 0x0287, 0xa438, 0x2fe0, 0xa438, 0x8044, 0xa438, 0xac24,
+        0xa438, 0x11bf, 0xa438, 0x8b0c, 0xa438, 0x0272, 0xa438, 0x9aae,
+        0xa438, 0x0902, 0xa438, 0x88c8, 0xa438, 0x028a, 0xa438, 0x9502,
+        0xa438, 0x8a8a, 0xa438, 0xef96, 0xa438, 0xfefc, 0xa438, 0x04f8,
+        0xa438, 0xe08f, 0xa438, 0x96a0, 0xa438, 0x0005, 0xa438, 0x0288,
+        0xa438, 0x6cae, 0xa438, 0x38a0, 0xa438, 0x0105, 0xa438, 0x0287,
+        0xa438, 0x75ae, 0xa438, 0x30a0, 0xa438, 0x0205, 0xa438, 0x0287,
+        0xa438, 0xb3ae, 0xa438, 0x28a0, 0xa438, 0x0305, 0xa438, 0x0287,
+        0xa438, 0xc9ae, 0xa438, 0x20a0, 0xa438, 0x0405, 0xa438, 0x0287,
+        0xa438, 0xd6ae, 0xa438, 0x18a0, 0xa438, 0x0505, 0xa438, 0x0288,
+        0xa438, 0x1aae, 0xa438, 0x10a0, 0xa438, 0x0605, 0xa438, 0x0288,
+        0xa438, 0x27ae, 0xa438, 0x08a0, 0xa438, 0x0705, 0xa438, 0x0288,
+        0xa438, 0x48ae, 0xa438, 0x00fc, 0xa438, 0x04f8, 0xa438, 0xfaef,
+        0xa438, 0x69e0, 0xa438, 0x8018, 0xa438, 0xad25, 0xa438, 0x2c02,
+        0xa438, 0x8a67, 0xa438, 0xe184, 0xa438, 0x5de5, 0xa438, 0x8f92,
+        0xa438, 0xe58f, 0xa438, 0x93e5, 0xa438, 0x8f94, 0xa438, 0xe58f,
+        0xa438, 0x9502, 0xa438, 0x88e6, 0xa438, 0xe184, 0xa438, 0xf759,
+        0xa438, 0x0fe5, 0xa438, 0x8f7b, 0xa438, 0xe58f, 0xa438, 0x7ce5,
+        0xa438, 0x8f7d, 0xa438, 0xe58f, 0xa438, 0x7eee, 0xa438, 0x8f96,
+        0xa438, 0x02ae, 0xa438, 0x0302, 0xa438, 0x8a8a, 0xa438, 0xef96,
+        0xa438, 0xfefc, 0xa438, 0x04f9, 0xa438, 0x0289, 0xa438, 0x19ac,
+        0xa438, 0x3009, 0xa438, 0xee8f, 0xa438, 0x9603, 0xa438, 0x0288,
+        0xa438, 0x8eae, 0xa438, 0x04ee, 0xa438, 0x8f96, 0xa438, 0x04fd,
+        0xa438, 0x04fb, 0xa438, 0x0288, 0xa438, 0x55ad, 0xa438, 0x5004,
+        0xa438, 0xee8f, 0xa438, 0x9602, 0xa438, 0xff04, 0xa438, 0xf902,
+        0xa438, 0x8943, 0xa438, 0xe28f, 0xa438, 0x920c, 0xa438, 0x245a,
+        0xa438, 0xf0e3, 0xa438, 0x84f7, 0xa438, 0x5bf0, 0xa438, 0x1b23,
+        0xa438, 0x9e0f, 0xa438, 0x028a, 0xa438, 0x52ee, 0xa438, 0x8f96,
+        0xa438, 0x0502, 0xa438, 0x888e, 0xa438, 0x0287, 0xa438, 0xffae,
+        0xa438, 0x04ee, 0xa438, 0x8f96, 0xa438, 0x06fd, 0xa438, 0x04f8,
+        0xa438, 0xf9fa, 0xa438, 0xef69, 0xa438, 0xfa1f, 0xa438, 0x44d2,
+        0xa438, 0x04bf, 0xa438, 0x8f7f, 0xa438, 0xdc19, 0xa438, 0xdd19,
+        0xa438, 0x829f, 0xa438, 0xf9fe, 0xa438, 0xef96, 0xa438, 0xfefd,
+        0xa438, 0xfc04, 0xa438, 0xfb02, 0xa438, 0x8855, 0xa438, 0xad50,
+        0xa438, 0x04ee, 0xa438, 0x8f96, 0xa438, 0x04ff, 0xa438, 0x04f8,
+        0xa438, 0xf9fa, 0xa438, 0xef69, 0xa438, 0x0289, 0xa438, 0x19ac,
+        0xa438, 0x3009, 0xa438, 0xee8f, 0xa438, 0x9607, 0xa438, 0x0288,
+        0xa438, 0x8eae, 0xa438, 0x0702, 0xa438, 0x8a8a, 0xa438, 0xee8f,
+        0xa438, 0x9601, 0xa438, 0xef96, 0xa438, 0xfefd, 0xa438, 0xfc04,
+        0xa438, 0xfb02, 0xa438, 0x8855, 0xa438, 0xad50, 0xa438, 0x04ee,
+        0xa438, 0x8f96, 0xa438, 0x06ff, 0xa438, 0x04f8, 0xa438, 0xfae0,
+        0xa438, 0x8457, 0xa438, 0xe184, 0xa438, 0x58ef, 0xa438, 0x64e1,
+        0xa438, 0x8f90, 0xa438, 0xd000, 0xa438, 0xef74, 0xa438, 0x0271,
+        0xa438, 0xfffe, 0xa438, 0xfc04, 0xa438, 0xf8fa, 0xa438, 0xef69,
+        0xa438, 0xee8f, 0xa438, 0x9601, 0xa438, 0xee8f, 0xa438, 0x9004,
+        0xa438, 0xee8f, 0xa438, 0x8f40, 0xa438, 0xbf8b, 0xa438, 0x0f02,
+        0xa438, 0x72dc, 0xa438, 0xe584, 0xa438, 0x5dee, 0xa438, 0x8f91,
+        0xa438, 0x77ef, 0xa438, 0x96fe, 0xa438, 0xfc04, 0xa438, 0xf8fa,
+        0xa438, 0xfbef, 0xa438, 0x69e1, 0xa438, 0x8f92, 0xa438, 0xbf8b,
+        0xa438, 0x0f02, 0xa438, 0x72bd, 0xa438, 0xe18f, 0xa438, 0x93bf,
+        0xa438, 0x8b12, 0xa438, 0x0272, 0xa438, 0xbde1, 0xa438, 0x8f94,
+        0xa438, 0xbf8b, 0xa438, 0x1502, 0xa438, 0x72bd, 0xa438, 0xe18f,
+        0xa438, 0x95bf, 0xa438, 0x8b18, 0xa438, 0x0272, 0xa438, 0xbd02,
+        0xa438, 0x71e4, 0xa438, 0xef47, 0xa438, 0xe484, 0xa438, 0x57e5,
+        0xa438, 0x8458, 0xa438, 0xef96, 0xa438, 0xfffe, 0xa438, 0xfc04,
+        0xa438, 0xf8e0, 0xa438, 0x8018, 0xa438, 0xad25, 0xa438, 0x15ee,
+        0xa438, 0x8f96, 0xa438, 0x00d0, 0xa438, 0x08e4, 0xa438, 0x8f92,
+        0xa438, 0xe48f, 0xa438, 0x93e4, 0xa438, 0x8f94, 0xa438, 0xe48f,
+        0xa438, 0x9502, 0xa438, 0x888e, 0xa438, 0xfc04, 0xa438, 0xf9e2,
+        0xa438, 0x845d, 0xa438, 0xe38f, 0xa438, 0x910d, 0xa438, 0x345b,
+        0xa438, 0x0f1a, 0xa438, 0x32ac, 0xa438, 0x3c09, 0xa438, 0x0c34,
+        0xa438, 0x5bf0, 0xa438, 0xe784, 0xa438, 0xf7ae, 0xa438, 0x04ee,
+        0xa438, 0x84f7, 0xa438, 0xf0e3, 0xa438, 0x8f91, 0xa438, 0x5b0f,
+        0xa438, 0x1b23, 0xa438, 0xac37, 0xa438, 0x0ae3, 0xa438, 0x84f7,
+        0xa438, 0x1e32, 0xa438, 0xe784, 0xa438, 0xf7ae, 0xa438, 0x00fd,
+        0xa438, 0x04f8, 0xa438, 0xfaef, 0xa438, 0x69fa, 0xa438, 0xfbd2,
+        0xa438, 0x01d3, 0xa438, 0x04d6, 0xa438, 0x8f92, 0xa438, 0xd78f,
+        0xa438, 0x7bef, 0xa438, 0x97d9, 0xa438, 0xef96, 0xa438, 0xd81b,
+        0xa438, 0x109e, 0xa438, 0x0480, 0xa438, 0xdcd2, 0xa438, 0x0016,
+        0xa438, 0x1783, 0xa438, 0x9fed, 0xa438, 0xfffe, 0xa438, 0xef96,
+        0xa438, 0xfefc, 0xa438, 0x04f8, 0xa438, 0xf9fa, 0xa438, 0xfbef,
+        0xa438, 0x79fb, 0xa438, 0xcffb, 0xa438, 0xd200, 0xa438, 0xbe00,
+        0xa438, 0x00ef, 0xa438, 0x1229, 0xa438, 0x40d0, 0xa438, 0x041c,
+        0xa438, 0x081a, 0xa438, 0x10bf, 0xa438, 0x8b27, 0xa438, 0x0272,
+        0xa438, 0xbd02, 0xa438, 0x89ee, 0xa438, 0xbf8f, 0xa438, 0x7fef,
+        0xa438, 0x1249, 0xa438, 0x021a, 0xa438, 0x91d8, 0xa438, 0x19d9,
+        0xa438, 0xef74, 0xa438, 0x0271, 0xa438, 0xccef, 0xa438, 0x47dd,
+        0xa438, 0x89dc, 0xa438, 0x18a8, 0xa438, 0x0002, 0xa438, 0xd202,
+        0xa438, 0x8990, 0xa438, 0x12a2, 0xa438, 0x04c8, 0xa438, 0xffc7,
+        0xa438, 0xffef, 0xa438, 0x97ff, 0xa438, 0xfefd, 0xa438, 0xfc04,
+        0xa438, 0xf8f9, 0xa438, 0xfafb, 0xa438, 0xef79, 0xa438, 0xfbbf,
+        0xa438, 0x8f7f, 0xa438, 0xef12, 0xa438, 0x4902, 0xa438, 0x1a91,
+        0xa438, 0xd819, 0xa438, 0xd9ef, 0xa438, 0x64bf, 0xa438, 0x8f87,
+        0xa438, 0xef12, 0xa438, 0x4902, 0xa438, 0x1a91, 0xa438, 0xd819,
+        0xa438, 0xd9ef, 0xa438, 0x7489, 0xa438, 0x0271, 0xa438, 0xb1ad,
+        0xa438, 0x502c, 0xa438, 0xef46, 0xa438, 0xdc19, 0xa438, 0xdda2,
+        0xa438, 0x0006, 0xa438, 0xbf8b, 0xa438, 0x0f02, 0xa438, 0x72dc,
+        0xa438, 0xa201, 0xa438, 0x06bf, 0xa438, 0x8b12, 0xa438, 0x0272,
+        0xa438, 0xdca2, 0xa438, 0x0206, 0xa438, 0xbf8b, 0xa438, 0x1502,
+        0xa438, 0x72dc, 0xa438, 0xbf8b, 0xa438, 0x1802, 0xa438, 0x72dc,
+        0xa438, 0xbf8f, 0xa438, 0x7b1a, 0xa438, 0x92dd, 0xa438, 0xffef,
+        0xa438, 0x97ff, 0xa438, 0xfefd, 0xa438, 0xfc04, 0xa438, 0xf9f8,
+        0xa438, 0xfbef, 0xa438, 0x79fb, 0xa438, 0x028a, 0xa438, 0xa0bf,
+        0xa438, 0x8b1b, 0xa438, 0x0272, 0xa438, 0x9a16, 0xa438, 0xbf8b,
+        0xa438, 0x1e02, 0xa438, 0x72dc, 0xa438, 0xac28, 0xa438, 0x02ae,
+        0xa438, 0xf4d6, 0xa438, 0x0000, 0xa438, 0xbf8b, 0xa438, 0x1b02,
+        0xa438, 0x7291, 0xa438, 0xae03, 0xa438, 0x028a, 0xa438, 0x8ad2,
+        0xa438, 0x00d7, 0xa438, 0x0000, 0xa438, 0xe18f, 0xa438, 0x8f1b,
+        0xa438, 0x12a1, 0xa438, 0x0004, 0xa438, 0xef67, 0xa438, 0xae1d,
+        0xa438, 0xef12, 0xa438, 0xbf8b, 0xa438, 0x2102, 0xa438, 0x72bd,
+        0xa438, 0x12bf, 0xa438, 0x8b24, 0xa438, 0x0272, 0xa438, 0xdcef,
+        0xa438, 0x64ad, 0xa438, 0x4f04, 0xa438, 0x7eff, 0xa438, 0xff16,
+        0xa438, 0x0271, 0xa438, 0xccae, 0xa438, 0xd7bf, 0xa438, 0x8b2d,
+        0xa438, 0x0272, 0xa438, 0x91ff, 0xa438, 0xef97, 0xa438, 0xfffc,
+        0xa438, 0xfd04, 0xa438, 0xf8fa, 0xa438, 0xef69, 0xa438, 0xd104,
+        0xa438, 0xbf8f, 0xa438, 0x92d8, 0xa438, 0x10dc, 0xa438, 0x1981,
+        0xa438, 0x9ff9, 0xa438, 0xef96, 0xa438, 0xfefc, 0xa438, 0x04f8,
+        0xa438, 0xfbfa, 0xa438, 0xef69, 0xa438, 0xbf8f, 0xa438, 0x87d0,
+        0xa438, 0x08d1, 0xa438, 0xff02, 0xa438, 0x8a7c, 0xa438, 0xef96,
+        0xa438, 0xfeff, 0xa438, 0xfc04, 0xa438, 0xf8fa, 0xa438, 0xef69,
+        0xa438, 0xdd19, 0xa438, 0x809f, 0xa438, 0xfbef, 0xa438, 0x96fe,
+        0xa438, 0xfc04, 0xa438, 0xf8e0, 0xa438, 0x8044, 0xa438, 0xf624,
+        0xa438, 0xe480, 0xa438, 0x44fc, 0xa438, 0x04f8, 0xa438, 0xe080,
+        0xa438, 0x4ff6, 0xa438, 0x24e4, 0xa438, 0x804f, 0xa438, 0xfc04,
+        0xa438, 0xf8fa, 0xa438, 0xfbef, 0xa438, 0x79fb, 0xa438, 0xbf8b,
+        0xa438, 0x2a02, 0xa438, 0x7291, 0xa438, 0xbf8b, 0xa438, 0x3302,
+        0xa438, 0x7291, 0xa438, 0xd68b, 0xa438, 0x2dd7, 0xa438, 0x8b30,
+        0xa438, 0x0116, 0xa438, 0xad50, 0xa438, 0x0cbf, 0xa438, 0x8b2a,
+        0xa438, 0x0272, 0xa438, 0x9abf, 0xa438, 0x8b33, 0xa438, 0x0272,
+        0xa438, 0x9aff, 0xa438, 0xef97, 0xa438, 0xfffe, 0xa438, 0xfc04,
+        0xa438, 0xf8f9, 0xa438, 0xfaef, 0xa438, 0x49f8, 0xa438, 0xccf8,
+        0xa438, 0xef96, 0xa438, 0x0272, 0xa438, 0x9a1f, 0xa438, 0x22c7,
+        0xa438, 0xbd02, 0xa438, 0x72dc, 0xa438, 0xac28, 0xa438, 0x16ac,
+        0xa438, 0x3008, 0xa438, 0x0271, 0xa438, 0xe4ef, 0xa438, 0x6712,
+        0xa438, 0xaeee, 0xa438, 0xd700, 0xa438, 0x0202, 0xa438, 0x71ff,
+        0xa438, 0xac50, 0xa438, 0x05ae, 0xa438, 0xe3d7, 0xa438, 0x0000,
+        0xa438, 0xfcc4, 0xa438, 0xfcef, 0xa438, 0x94fe, 0xa438, 0xfdfc,
+        0xa438, 0x04cc, 0xa438, 0xc010, 0xa438, 0x44ac, 0xa438, 0x0030,
+        0xa438, 0xbce0, 0xa438, 0x74bc, 0xa438, 0xe0b8, 0xa438, 0xbce0,
+        0xa438, 0xfcbc, 0xa438, 0xe011, 0xa438, 0xacb4, 0xa438, 0xddac,
+        0xa438, 0xb6fa, 0xa438, 0xacb4, 0xa438, 0xf0ac, 0xa438, 0xba92,
+        0xa438, 0xacb4, 0xa438, 0xffac, 0xa438, 0x5600, 0xa438, 0xacb4,
+        0xa438, 0xccac, 0xa438, 0xb6ff, 0xa438, 0xb034, 0xa436, 0xb818,
+        0xa438, 0x2ae4, 0xa436, 0xb81a, 0xa438, 0x380A, 0xa436, 0xb81c,
+        0xa438, 0x3EDD, 0xa436, 0xb81e, 0xa438, 0x41A3, 0xa436, 0xb850,
+        0xa438, 0x0684, 0xa436, 0xb852, 0xa438, 0x1C02, 0xa436, 0xb878,
+        0xa438, 0x1B70, 0xa436, 0xb884, 0xa438, 0x0633, 0xa436, 0xb832,
+        0xa438, 0x00ff, 0xa436, 0xacfc, 0xa438, 0x0100, 0xa436, 0xacfe,
+        0xa438, 0x8000, 0xa436, 0xad00, 0xa438, 0x27ff, 0xa436, 0xad02,
+        0xa438, 0x3c67, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x000f, 0xa436, 0xad00,
+        0xa438, 0x47ff, 0xa436, 0xad02, 0xa438, 0x3e67, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x000f, 0xa436, 0xad00, 0xa438, 0x67ff, 0xa436, 0xad02,
+        0xa438, 0x3067, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x000f, 0xa436, 0xad00,
+        0xa438, 0x87ff, 0xa436, 0xad02, 0xa438, 0x3267, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x000f, 0xa436, 0xad00, 0xa438, 0xa7ff, 0xa436, 0xad02,
+        0xa438, 0x3467, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x000f, 0xa436, 0xad00,
+        0xa438, 0xcfff, 0xa436, 0xad02, 0xa438, 0x3667, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x000f, 0xa436, 0xad00, 0xa438, 0xefff, 0xa436, 0xad02,
+        0xa438, 0x3867, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x000f, 0xa436, 0xad00,
+        0xa438, 0x0fff, 0xa436, 0xad02, 0xa438, 0x3a67, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x000f, 0xa436, 0xad00, 0xa438, 0x2fff, 0xa436, 0xad02,
+        0xa438, 0x3ce7, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x4fff, 0xa436, 0xad02, 0xa438, 0x3ee7, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x6fff, 0xa436, 0xad02,
+        0xa438, 0x30e7, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x8fff, 0xa436, 0xad02, 0xa438, 0x32e7, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xafff, 0xa436, 0xad02,
+        0xa438, 0x34e7, 0xa436, 0xad04, 0xa438, 0x1008, 0xa436, 0xad06,
+        0xa438, 0xfff4, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0x36ff, 0xa436, 0xad04,
+        0xa438, 0x1048, 0xa436, 0xad06, 0xa438, 0xfff5, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0x38ff, 0xa436, 0xad04, 0xa438, 0x1088, 0xa436, 0xad06,
+        0xa438, 0xfff6, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0x3aff, 0xa436, 0xad04,
+        0xa438, 0x10c8, 0xa436, 0xad06, 0xa438, 0xf417, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xffff, 0xa436, 0xad04, 0xa438, 0x1109, 0xa436, 0xad06,
+        0xa438, 0xf434, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x0207, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x1149, 0xa436, 0xad06, 0xa438, 0x0455, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x2227, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x1189, 0xa436, 0xad06,
+        0xa438, 0x1476, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x4247, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x11c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x6267, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x1209, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x0007, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x1249, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x2027, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x1289, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x4047, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x12c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x6067, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x1309, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x8087, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x1349, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xa0a7, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x1389, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xc0c7, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x13c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xe0e7, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x140b, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x0107, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0x144b, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x2127, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0x148b, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x4147, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0x14cb, 0xa436, 0xad06, 0xa438, 0x2417, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x6167, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0x5109, 0xa436, 0xad06,
+        0xa438, 0x3434, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x8287, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x5149, 0xa436, 0xad06, 0xa438, 0x0455, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xa2a7, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x5189, 0xa436, 0xad06,
+        0xa438, 0x1476, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xc2c7, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x51c9, 0xa436, 0xad06, 0xa438, 0x2417, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xe2e7, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x5009, 0xa436, 0xad06,
+        0xa438, 0x3434, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x0a0f, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x5049, 0xa436, 0xad06, 0xa438, 0x0455, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x2a2f, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x5089, 0xa436, 0xad06,
+        0xa438, 0x1476, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x4a4f, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x50c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x6a6f, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x5209, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x080f, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x5249, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x282f, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x5289, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x484f, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x52c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x686f, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x5309, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x888f, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x5349, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xa8af, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x5389, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xc8cf, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x53c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xe8ef, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x550b, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x090f, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0x554b, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x292f, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0x558b, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x494f, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0x55cb, 0xa436, 0xad06, 0xa438, 0x2417, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x696f, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0x9209, 0xa436, 0xad06,
+        0xa438, 0x3434, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x8a8f, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x9249, 0xa436, 0xad06, 0xa438, 0x0455, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xaaaf, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x9289, 0xa436, 0xad06,
+        0xa438, 0x1476, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xcacf, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x92c9, 0xa436, 0xad06, 0xa438, 0x2417, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xeaef, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x9009, 0xa436, 0xad06,
+        0xa438, 0x3434, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x1217, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x9049, 0xa436, 0xad06, 0xa438, 0x0455, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x3237, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x9089, 0xa436, 0xad06,
+        0xa438, 0x1476, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x5257, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x90c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x7277, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x9109, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x1017, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x9149, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x3037, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x9189, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x5057, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x91c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x7077, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x9309, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x9097, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x9349, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xb0b7, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x9389, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xd0d7, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0x93c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xf0f7, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0x960b, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x1117, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0x964b, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x3137, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0x968b, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x5157, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0x96cb, 0xa436, 0xad06, 0xa438, 0x2417, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x7177, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0xd309, 0xa436, 0xad06,
+        0xa438, 0x3434, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x9297, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0xd349, 0xa436, 0xad06, 0xa438, 0x0455, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xb2b7, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0xd389, 0xa436, 0xad06,
+        0xa438, 0x1476, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xd2d7, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0xd3c9, 0xa436, 0xad06, 0xa438, 0x2417, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xf2f7, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0xd009, 0xa436, 0xad06,
+        0xa438, 0x3434, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x1a1f, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0xd049, 0xa436, 0xad06, 0xa438, 0x0455, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x3a3f, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0xd089, 0xa436, 0xad06,
+        0xa438, 0x1476, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x5a5f, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0xd0c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x7a7f, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0xd109, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x181f, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0xd149, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x383f, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0xd189, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x585f, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0xd1c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x787f, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0xd209, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x989f, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0xd249, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xb8bf, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0xd289, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xd8df, 0xa436, 0xad02, 0xa438, 0xffe0, 0xa436, 0xad04,
+        0xa438, 0xd2c9, 0xa436, 0xad06, 0xa438, 0x2517, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xf8ff, 0xa436, 0xad02,
+        0xa438, 0xffe0, 0xa436, 0xad04, 0xa438, 0xd70b, 0xa436, 0xad06,
+        0xa438, 0x3534, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x191f, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0xd74b, 0xa436, 0xad06, 0xa438, 0x0555, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x393f, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0xd78b, 0xa436, 0xad06,
+        0xa438, 0x1576, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x595f, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0xd7cb, 0xa436, 0xad06, 0xa438, 0x2417, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0x797f, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0x000d, 0xa436, 0xad06,
+        0xa438, 0x3434, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x9a9f, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x004d, 0xa436, 0xad06, 0xa438, 0x0455, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xbabf, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x008d, 0xa436, 0xad06,
+        0xa438, 0x1476, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xdadf, 0xa436, 0xad02, 0xa438, 0xffe2, 0xa436, 0xad04,
+        0xa438, 0x00cd, 0xa436, 0xad06, 0xa438, 0x2c17, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xfaf8, 0xa436, 0xad02,
+        0xa438, 0xffe2, 0xa436, 0xad04, 0xa438, 0x400d, 0xa436, 0xad06,
+        0xa438, 0x3c34, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x8187, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0x404d, 0xa436, 0xad06, 0xa438, 0x0c55, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xa1a7, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0x408d, 0xa436, 0xad06,
+        0xa438, 0x1c76, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xc1c7, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0x40cd, 0xa436, 0xad06, 0xa438, 0x2c97, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xe1e7, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0x800d, 0xa436, 0xad06,
+        0xa438, 0x3cb4, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x898f, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0x804d, 0xa436, 0xad06, 0xa438, 0x0cd5, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xa9af, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0x808d, 0xa436, 0xad06,
+        0xa438, 0x1cf6, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xc9cf, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0x80cd, 0xa436, 0xad06, 0xa438, 0x2d17, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xe9ef, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0xc00d, 0xa436, 0xad06,
+        0xa438, 0x3d34, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x9197, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0xc04d, 0xa436, 0xad06, 0xa438, 0x0d55, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xb1b7, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0xc08d, 0xa436, 0xad06,
+        0xa438, 0x1d76, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xd1d7, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0xc0cd, 0xa436, 0xad06, 0xa438, 0x2d97, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xf1f7, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0x3dbf, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0x999f, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x0ddf, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xb9bf, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0x1dff, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xd9df, 0xa436, 0xad02, 0xa438, 0xffe1, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x2fff, 0xa436, 0xad08,
+        0xa438, 0x0002, 0xa436, 0xad00, 0xa438, 0xf9ff, 0xa436, 0xad02,
+        0xa438, 0xffe1, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0x3fff, 0xa436, 0xad08, 0xa438, 0x0002, 0xa436, 0xad00,
+        0xa438, 0xd7ff, 0xa436, 0xad02, 0xa438, 0xffe7, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xf7ff, 0xa436, 0xad02,
+        0xa438, 0xffe7, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x17ff, 0xa436, 0xad02, 0xa438, 0xffe7, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x37ff, 0xa436, 0xad02,
+        0xa438, 0x3d67, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x57ff, 0xa436, 0xad02, 0xa438, 0x3f67, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x77ff, 0xa436, 0xad02,
+        0xa438, 0x3167, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x97ff, 0xa436, 0xad02, 0xa438, 0x3367, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xb7ff, 0xa436, 0xad02,
+        0xa438, 0x3567, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xdfff, 0xa436, 0xad02, 0xa438, 0x3767, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0x3967, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x1fff, 0xa436, 0xad02, 0xa438, 0x3b67, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x3fff, 0xa436, 0xad02,
+        0xa438, 0x3de7, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x5fff, 0xa436, 0xad02, 0xa438, 0x3fe7, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x7fff, 0xa436, 0xad02,
+        0xa438, 0x31e7, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x9fff, 0xa436, 0xad02, 0xa438, 0x33e7, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xbfff, 0xa436, 0xad02,
+        0xa438, 0x35e7, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x07ff, 0xa436, 0xad02, 0xa438, 0x37e6, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x27ff, 0xa436, 0xad02,
+        0xa438, 0x39e6, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x47ff, 0xa436, 0xad02, 0xa438, 0x3be6, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x67ff, 0xa436, 0xad02,
+        0xa438, 0x2066, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x07ff, 0xa436, 0xad02, 0xa438, 0x2264, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x27ff, 0xa436, 0xad02,
+        0xa438, 0x2464, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x47ff, 0xa436, 0xad02, 0xa438, 0x2664, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x67ff, 0xa436, 0xad02,
+        0xa438, 0x0064, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x87ff, 0xa436, 0xad02, 0xa438, 0x0264, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xa7ff, 0xa436, 0xad02,
+        0xa438, 0x0464, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xc7ff, 0xa436, 0xad02, 0xa438, 0x0664, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xe7ff, 0xa436, 0xad02,
+        0xa438, 0x0864, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x07ff, 0xa436, 0xad02, 0xa438, 0x0a65, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x27ff, 0xa436, 0xad02,
+        0xa438, 0x0c65, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x47ff, 0xa436, 0xad02, 0xa438, 0x0e65, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x67ff, 0xa436, 0xad02,
+        0xa438, 0x1065, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x87ff, 0xa436, 0xad02, 0xa438, 0x1266, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xa7ff, 0xa436, 0xad02,
+        0xa438, 0x1466, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xc7ff, 0xa436, 0xad02, 0xa438, 0x1666, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xe7ff, 0xa436, 0xad02,
+        0xa438, 0x2866, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x0fff, 0xa436, 0xad02, 0xa438, 0x2a66, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x2fff, 0xa436, 0xad02,
+        0xa438, 0x2c66, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x4fff, 0xa436, 0xad02, 0xa438, 0x2e66, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x6fff, 0xa436, 0xad02,
+        0xa438, 0x20e6, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x0fff, 0xa436, 0xad02, 0xa438, 0x22e4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x2fff, 0xa436, 0xad02,
+        0xa438, 0x24e4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x4fff, 0xa436, 0xad02, 0xa438, 0x26e4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x6fff, 0xa436, 0xad02,
+        0xa438, 0x00e4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x8fff, 0xa436, 0xad02, 0xa438, 0x02e4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xafff, 0xa436, 0xad02,
+        0xa438, 0x04e4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xcfff, 0xa436, 0xad02, 0xa438, 0x06e4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xefff, 0xa436, 0xad02,
+        0xa438, 0x08e4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x0fff, 0xa436, 0xad02, 0xa438, 0x0ae5, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x2fff, 0xa436, 0xad02,
+        0xa438, 0x0ce5, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x4fff, 0xa436, 0xad02, 0xa438, 0x0ee5, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x6fff, 0xa436, 0xad02,
+        0xa438, 0x10e5, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x8fff, 0xa436, 0xad02, 0xa438, 0x12e6, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xafff, 0xa436, 0xad02,
+        0xa438, 0x14e6, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xcfff, 0xa436, 0xad02, 0xa438, 0x16e6, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xefff, 0xa436, 0xad02,
+        0xa438, 0x28e6, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x17ff, 0xa436, 0xad02, 0xa438, 0x2ae6, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x37ff, 0xa436, 0xad02,
+        0xa438, 0x2ce6, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x57ff, 0xa436, 0xad02, 0xa438, 0x2ee6, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x77ff, 0xa436, 0xad02,
+        0xa438, 0x2166, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x17ff, 0xa436, 0xad02, 0xa438, 0x2364, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x37ff, 0xa436, 0xad02,
+        0xa438, 0x2564, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x57ff, 0xa436, 0xad02, 0xa438, 0x2764, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x77ff, 0xa436, 0xad02,
+        0xa438, 0x0164, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x97ff, 0xa436, 0xad02, 0xa438, 0x0364, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xb7ff, 0xa436, 0xad02,
+        0xa438, 0x0564, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xd7ff, 0xa436, 0xad02, 0xa438, 0x0764, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xf7ff, 0xa436, 0xad02,
+        0xa438, 0x0964, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x17ff, 0xa436, 0xad02, 0xa438, 0x0b65, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x37ff, 0xa436, 0xad02,
+        0xa438, 0x0d65, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x57ff, 0xa436, 0xad02, 0xa438, 0x0f65, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x77ff, 0xa436, 0xad02,
+        0xa438, 0x1165, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x97ff, 0xa436, 0xad02, 0xa438, 0x1366, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xb7ff, 0xa436, 0xad02,
+        0xa438, 0x1566, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xd7ff, 0xa436, 0xad02, 0xa438, 0x1766, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xf7ff, 0xa436, 0xad02,
+        0xa438, 0x2966, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x1fff, 0xa436, 0xad02, 0xa438, 0x2b66, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x3fff, 0xa436, 0xad02,
+        0xa438, 0x2d66, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x5fff, 0xa436, 0xad02, 0xa438, 0x2f66, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x7fff, 0xa436, 0xad02,
+        0xa438, 0x21e6, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x1fff, 0xa436, 0xad02, 0xa438, 0x23e4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x3fff, 0xa436, 0xad02,
+        0xa438, 0x25e4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x5fff, 0xa436, 0xad02, 0xa438, 0x27e4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x7fff, 0xa436, 0xad02,
+        0xa438, 0x01e4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x9fff, 0xa436, 0xad02, 0xa438, 0x03e4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xbfff, 0xa436, 0xad02,
+        0xa438, 0x05e4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xdfff, 0xa436, 0xad02, 0xa438, 0x07e4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0x09e4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x1fff, 0xa436, 0xad02, 0xa438, 0x0be5, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x3fff, 0xa436, 0xad02,
+        0xa438, 0x0de5, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x5fff, 0xa436, 0xad02, 0xa438, 0x0fe5, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x7fff, 0xa436, 0xad02,
+        0xa438, 0x11e5, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x9fff, 0xa436, 0xad02, 0xa438, 0x13e6, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xbfff, 0xa436, 0xad02,
+        0xa438, 0x15e6, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xdfff, 0xa436, 0xad02, 0xa438, 0x17e6, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0x29e6, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x87ff, 0xa436, 0xad02, 0xa438, 0x2be5, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xa7ff, 0xa436, 0xad02,
+        0xa438, 0x2de5, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xc7ff, 0xa436, 0xad02, 0xa438, 0x2fe5, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xe7ff, 0xa436, 0xad02,
+        0xa438, 0x1865, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x8fff, 0xa436, 0xad02, 0xa438, 0x1a65, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xafff, 0xa436, 0xad02,
+        0xa438, 0x1c65, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xcfff, 0xa436, 0xad02, 0xa438, 0x1e65, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xefff, 0xa436, 0xad02,
+        0xa438, 0x18e5, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x97ff, 0xa436, 0xad02, 0xa438, 0x1ae5, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xb7ff, 0xa436, 0xad02,
+        0xa438, 0x1ce5, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xd7ff, 0xa436, 0xad02, 0xa438, 0x1ee5, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xf7ff, 0xa436, 0xad02,
+        0xa438, 0x1965, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x9fff, 0xa436, 0xad02, 0xa438, 0x1b65, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xbfff, 0xa436, 0xad02,
+        0xa438, 0x1d65, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xdfff, 0xa436, 0xad02, 0xa438, 0x1f65, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0x19e5, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x07ff, 0xa436, 0xad02, 0xa438, 0x1b9c, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x27ff, 0xa436, 0xad02,
+        0xa438, 0x1d9c, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x0fff, 0xa436, 0xad02, 0xa438, 0x1f9c, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x2fff, 0xa436, 0xad02,
+        0xa438, 0x589c, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x17ff, 0xa436, 0xad02, 0xa438, 0x5c9c, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x37ff, 0xa436, 0xad02,
+        0xa438, 0x599c, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x1fff, 0xa436, 0xad02, 0xa438, 0x5d9c, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x3fff, 0xa436, 0xad02,
+        0xa438, 0x5a9c, 0xa436, 0xad04, 0xa438, 0x100e, 0xa436, 0xad06,
+        0xa438, 0xfff6, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0x5eff, 0xa436, 0xad04,
+        0xa438, 0x104e, 0xa436, 0xad06, 0xa438, 0xfff7, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0x5bff, 0xa436, 0xad04, 0xa438, 0x110e, 0xa436, 0xad06,
+        0xa438, 0xfff6, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0x5fff, 0xa436, 0xad04,
+        0xa438, 0x114e, 0xa436, 0xad06, 0xa438, 0xf817, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xffff, 0xa436, 0xad04, 0xa438, 0x120f, 0xa436, 0xad06,
+        0xa438, 0xf836, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xc3c7, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0x124f, 0xa436, 0xad06, 0xa438, 0x0997, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0xe3e7, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0x130f, 0xa436, 0xad06,
+        0xa438, 0x19b6, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x0307, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0x134f, 0xa436, 0xad06, 0xa438, 0x4917, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0x2327, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0x510f, 0xa436, 0xad06,
+        0xa438, 0x5936, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x4347, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0x514f, 0xa436, 0xad06, 0xa438, 0x0997, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0x6367, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0x500f, 0xa436, 0xad06,
+        0xa438, 0x19b6, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x8387, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0x504f, 0xa436, 0xad06, 0xa438, 0x4817, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0xa3a7, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0x520f, 0xa436, 0xad06,
+        0xa438, 0x5836, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0xcbcf, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0x524f, 0xa436, 0xad06, 0xa438, 0x0997, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0xebef, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0x530f, 0xa436, 0xad06,
+        0xa438, 0x19b6, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x0b0f, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0x534f, 0xa436, 0xad06, 0xa438, 0x4917, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0x2b2f, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0x920f, 0xa436, 0xad06,
+        0xa438, 0x5936, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x4b4f, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0x924f, 0xa436, 0xad06, 0xa438, 0x0997, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0x6b6f, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0x900f, 0xa436, 0xad06,
+        0xa438, 0x19b6, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x8b8f, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0x904f, 0xa436, 0xad06, 0xa438, 0x4817, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0xabaf, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0x910f, 0xa436, 0xad06,
+        0xa438, 0x5836, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0xd3d7, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0x914f, 0xa436, 0xad06, 0xa438, 0x0997, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0xf3f7, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0x930f, 0xa436, 0xad06,
+        0xa438, 0x19b6, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x1317, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0x934f, 0xa436, 0xad06, 0xa438, 0x4917, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0x3337, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0xd30f, 0xa436, 0xad06,
+        0xa438, 0x5936, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x5357, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0xd34f, 0xa436, 0xad06, 0xa438, 0x0997, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0x7377, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0xd00f, 0xa436, 0xad06,
+        0xa438, 0x19b6, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x9397, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0xd04f, 0xa436, 0xad06, 0xa438, 0x4817, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0xb3b7, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0xd10f, 0xa436, 0xad06,
+        0xa438, 0x5836, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0xdbdf, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0xd14f, 0xa436, 0xad06, 0xa438, 0x0997, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0xfbff, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0xd20f, 0xa436, 0xad06,
+        0xa438, 0x19b6, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x1b1f, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0xd24f, 0xa436, 0xad06, 0xa438, 0x4917, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0x3b3f, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0x593f, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x5b5f, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x099f, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0x7b7f, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0x19bf, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x9b9f, 0xa436, 0xad02, 0xa438, 0xffe3, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x4fff, 0xa436, 0xad08,
+        0xa438, 0x0004, 0xa436, 0xad00, 0xa438, 0xbbbf, 0xa436, 0xad02,
+        0xa438, 0xffe3, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0x5fff, 0xa436, 0xad08, 0xa438, 0x0004, 0xa436, 0xad00,
+        0xa438, 0x07ff, 0xa436, 0xad02, 0xa438, 0xffa4, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x27ff, 0xa436, 0xad02,
+        0xa438, 0xffa4, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x47ff, 0xa436, 0xad02, 0xa438, 0xffa4, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x67ff, 0xa436, 0xad02,
+        0xa438, 0x58a4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x0fff, 0xa436, 0xad02, 0xa438, 0x5ca4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x2fff, 0xa436, 0xad02,
+        0xa438, 0x50a4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x4fff, 0xa436, 0xad02, 0xa438, 0x54a4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x6fff, 0xa436, 0xad02,
+        0xa438, 0x59a4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x17ff, 0xa436, 0xad02, 0xa438, 0x5da4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x37ff, 0xa436, 0xad02,
+        0xa438, 0x51a4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x57ff, 0xa436, 0xad02, 0xa438, 0x55a4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x77ff, 0xa436, 0xad02,
+        0xa438, 0x5aa4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x1fff, 0xa436, 0xad02, 0xa438, 0x5ea4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x3fff, 0xa436, 0xad02,
+        0xa438, 0x52a4, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0x5fff, 0xa436, 0xad02, 0xa438, 0x56a4, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0x7fff, 0xa436, 0xad02,
+        0xa438, 0x5ba4, 0xa436, 0xad04, 0xa438, 0x2a06, 0xa436, 0xad06,
+        0xa438, 0xfff6, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0x5fff, 0xa436, 0xad04,
+        0xa438, 0x2b06, 0xa436, 0xad06, 0xa438, 0xfff7, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0x53ff, 0xa436, 0xad04, 0xa438, 0x2a06, 0xa436, 0xad06,
+        0xa438, 0xfff4, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0x57ff, 0xa436, 0xad04,
+        0xa438, 0x2b06, 0xa436, 0xad06, 0xa438, 0xf615, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xffff, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0xf63f, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xffff, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x069f, 0xa436, 0xad08,
+        0xa438, 0x0003, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xffff, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0x16bf, 0xa436, 0xad08, 0xa438, 0x0003, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xffff, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x4fff, 0xa436, 0xad08,
+        0xa438, 0x0003, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xd0ff, 0xa436, 0xad04, 0xa438, 0x6a46, 0xa436, 0xad06,
+        0xa438, 0x5ff6, 0xa436, 0xad08, 0xa438, 0x0003, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xd4ff, 0xa436, 0xad04,
+        0xa438, 0x6b46, 0xa436, 0xad06, 0xa438, 0xfff7, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xd8ff, 0xa436, 0xad04, 0xa438, 0x6a46, 0xa436, 0xad06,
+        0xa438, 0xfff4, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xdcff, 0xa436, 0xad04,
+        0xa438, 0x6b46, 0xa436, 0xad06, 0xa438, 0xf615, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xffff, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0xf63f, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xffff, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x069f, 0xa436, 0xad08,
+        0xa438, 0x0003, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xffff, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0x16bf, 0xa436, 0xad08, 0xa438, 0x0003, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xffff, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x4fff, 0xa436, 0xad08,
+        0xa438, 0x0003, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xd1ff, 0xa436, 0xad04, 0xa438, 0xaa86, 0xa436, 0xad06,
+        0xa438, 0x5ff6, 0xa436, 0xad08, 0xa438, 0x0003, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xd5ff, 0xa436, 0xad04,
+        0xa438, 0xab86, 0xa436, 0xad06, 0xa438, 0xfff7, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xd9ff, 0xa436, 0xad04, 0xa438, 0xaa86, 0xa436, 0xad06,
+        0xa438, 0xfff4, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xddff, 0xa436, 0xad04,
+        0xa438, 0xab86, 0xa436, 0xad06, 0xa438, 0xf615, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xffff, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0xf63f, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xffff, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x069f, 0xa436, 0xad08,
+        0xa438, 0x0003, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xffff, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0x16bf, 0xa436, 0xad08, 0xa438, 0x0003, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xffff, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x4fff, 0xa436, 0xad08,
+        0xa438, 0x0003, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xd2ff, 0xa436, 0xad04, 0xa438, 0xeac6, 0xa436, 0xad06,
+        0xa438, 0x5ff6, 0xa436, 0xad08, 0xa438, 0x0003, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xd6ff, 0xa436, 0xad04,
+        0xa438, 0xebc6, 0xa436, 0xad06, 0xa438, 0xfff7, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xdaff, 0xa436, 0xad04, 0xa438, 0xeac6, 0xa436, 0xad06,
+        0xa438, 0xfff4, 0xa436, 0xad08, 0xa438, 0x0007, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xdeff, 0xa436, 0xad04,
+        0xa438, 0xebc6, 0xa436, 0xad06, 0xa438, 0xf615, 0xa436, 0xad08,
+        0xa438, 0x0007, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xffff, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0xf63f, 0xa436, 0xad08, 0xa438, 0x0017, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xffff, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x069f, 0xa436, 0xad08,
+        0xa438, 0x0013, 0xa436, 0xad00, 0xa438, 0xffff, 0xa436, 0xad02,
+        0xa438, 0xffff, 0xa436, 0xad04, 0xa438, 0xffff, 0xa436, 0xad06,
+        0xa438, 0x16bf, 0xa436, 0xad08, 0xa438, 0x0013, 0xa436, 0xad00,
+        0xa438, 0xffff, 0xa436, 0xad02, 0xa438, 0xffff, 0xa436, 0xad04,
+        0xa438, 0xffff, 0xa436, 0xad06, 0xa438, 0x4fff, 0xa436, 0xad08,
+        0xa438, 0x0013, 0xa436, 0xad00, 0xa438, 0xfffa, 0xa436, 0xad02,
+        0xa438, 0xd3ff, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0x5fff, 0xa436, 0xad08, 0xa438, 0x0013, 0xa436, 0xad00,
+        0xa438, 0xc7ff, 0xa436, 0xad02, 0xa438, 0xd7e7, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0017, 0xa436, 0xad00, 0xa438, 0xe7ff, 0xa436, 0xad02,
+        0xa438, 0xdbe7, 0xa436, 0xad04, 0xa438, 0xfffe, 0xa436, 0xad06,
+        0xa438, 0xffff, 0xa436, 0xad08, 0xa438, 0x0017, 0xa436, 0xad00,
+        0xa438, 0x07ff, 0xa436, 0xad02, 0xa438, 0xdfe7, 0xa436, 0xad04,
+        0xa438, 0xfffe, 0xa436, 0xad06, 0xa438, 0xffff, 0xa436, 0xad08,
+        0xa438, 0x0017, 0xa436, 0xacfc, 0xa438, 0x0000, 0xa436, 0xaccc,
+        0xa438, 0x2000, 0xa436, 0xacce, 0xa438, 0x6000, 0xa436, 0xaccc,
+        0xa438, 0x2001, 0xa436, 0xacce, 0xa438, 0x6008, 0xa436, 0xaccc,
+        0xa438, 0x2002, 0xa436, 0xacce, 0xa438, 0x6010, 0xa436, 0xaccc,
+        0xa438, 0x2003, 0xa436, 0xacce, 0xa438, 0x6020, 0xa436, 0xaccc,
+        0xa438, 0x2004, 0xa436, 0xacce, 0xa438, 0x6060, 0xa436, 0xaccc,
+        0xa438, 0x2005, 0xa436, 0xacce, 0xa438, 0x60a0, 0xa436, 0xaccc,
+        0xa438, 0x2006, 0xa436, 0xacce, 0xa438, 0x60e0, 0xa436, 0xaccc,
+        0xa438, 0x2007, 0xa436, 0xacce, 0xa438, 0x6128, 0xa436, 0xaccc,
+        0xa438, 0x2008, 0xa436, 0xacce, 0xa438, 0x6178, 0xa436, 0xaccc,
+        0xa438, 0x2009, 0xa436, 0xacce, 0xa438, 0x61a8, 0xa436, 0xaccc,
+        0xa438, 0x200a, 0xa436, 0xacce, 0xa438, 0x61f0, 0xa436, 0xaccc,
+        0xa438, 0x200b, 0xa436, 0xacce, 0xa438, 0x6248, 0xa436, 0xaccc,
+        0xa438, 0x200c, 0xa436, 0xacce, 0xa438, 0x6258, 0xa436, 0xaccc,
+        0xa438, 0x200d, 0xa436, 0xacce, 0xa438, 0x6268, 0xa436, 0xaccc,
+        0xa438, 0x200e, 0xa436, 0xacce, 0xa438, 0x6270, 0xa436, 0xaccc,
+        0xa438, 0x200f, 0xa436, 0xacce, 0xa438, 0x6274, 0xa436, 0xaccc,
+        0xa438, 0x2010, 0xa436, 0xacce, 0xa438, 0x627c, 0xa436, 0xaccc,
+        0xa438, 0x2011, 0xa436, 0xacce, 0xa438, 0x6284, 0xa436, 0xaccc,
+        0xa438, 0x2012, 0xa436, 0xacce, 0xa438, 0x6294, 0xa436, 0xaccc,
+        0xa438, 0x2013, 0xa436, 0xacce, 0xa438, 0x629c, 0xa436, 0xaccc,
+        0xa438, 0x2014, 0xa436, 0xacce, 0xa438, 0x62ac, 0xa436, 0xaccc,
+        0xa438, 0x2015, 0xa436, 0xacce, 0xa438, 0x62bc, 0xa436, 0xaccc,
+        0xa438, 0x2016, 0xa436, 0xacce, 0xa438, 0x62c4, 0xa436, 0xaccc,
+        0xa438, 0x2017, 0xa436, 0xacce, 0xa438, 0x7000, 0xa436, 0xaccc,
+        0xa438, 0x2018, 0xa436, 0xacce, 0xa438, 0x6000, 0xa436, 0xaccc,
+        0xa438, 0x2019, 0xa436, 0xacce, 0xa438, 0x6000, 0xa436, 0xaccc,
+        0xa438, 0x201a, 0xa436, 0xacce, 0xa438, 0x6000, 0xa436, 0xaccc,
+        0xa438, 0x201b, 0xa436, 0xacce, 0xa438, 0x6000, 0xa436, 0xaccc,
+        0xa438, 0x201c, 0xa436, 0xacce, 0xa438, 0x6000, 0xa436, 0xaccc,
+        0xa438, 0x201d, 0xa436, 0xacce, 0xa438, 0x6000, 0xa436, 0xaccc,
+        0xa438, 0x201e, 0xa436, 0xacce, 0xa438, 0x6000, 0xa436, 0xaccc,
+        0xa438, 0x201f, 0xa436, 0xacce, 0xa438, 0x6000, 0xa436, 0xacce,
+        0xa438, 0x0000, 0xa436, 0x0000, 0xa438, 0x0000, 0xb82e, 0x0000,
+        0xa436, 0x8023, 0xa438, 0x0000, 0xa436, 0x801E, 0xa438, 0x0027,
+        0xB820, 0x0000, 0xFFFF, 0xFFFF
+};
+
+static const u_int16_t phy_mcu_ram_code_8126a_2_3[] = {
+        0xb892, 0x0000, 0xb88e, 0xC15C, 0xb890, 0x0303, 0xb890, 0x0506,
+        0xb890, 0x0807, 0xb890, 0x090B, 0xb890, 0x0E12, 0xb890, 0x1617,
+        0xb890, 0x1C24, 0xb890, 0x2B37, 0xb890, 0x0203, 0xb890, 0x0304,
+        0xb890, 0x0504, 0xb890, 0x0506, 0xb890, 0x0708, 0xb890, 0x090A,
+        0xb890, 0x0B0E, 0xb890, 0x1013, 0xb890, 0x1519, 0xb890, 0x1D22,
+        0xb890, 0x282E, 0xb890, 0x363E, 0xb890, 0x474B, 0xb88e, 0xC196,
+        0xb890, 0x3F5E, 0xb890, 0xF834, 0xb890, 0x6C01, 0xb890, 0xA67F,
+        0xb890, 0xA06C, 0xb890, 0x043B, 0xb890, 0x6190, 0xb890, 0x88DB,
+        0xb890, 0x9ECD, 0xb890, 0x4DBC, 0xb890, 0x6E0E, 0xb890, 0x9F2D,
+        0xb890, 0x2C18, 0xb890, 0x5E8C, 0xb890, 0x5BFE, 0xb890, 0x183C,
+        0xb890, 0x23C9, 0xb890, 0x3E84, 0xb890, 0x3C20, 0xb890, 0xCC56,
+        0xb890, 0x3480, 0xb890, 0x0040, 0xb88e, 0xC00F, 0xb890, 0x3502,
+        0xb890, 0x0203, 0xb890, 0x0303, 0xb890, 0x0404, 0xb890, 0x0506,
+        0xb890, 0x0607, 0xb890, 0x080A, 0xb890, 0x0B0D, 0xb890, 0x0E10,
+        0xb890, 0x1114, 0xb890, 0x171B, 0xb890, 0x1F22, 0xb890, 0x2832,
+        0xb890, 0x0101, 0xb890, 0x0101, 0xb890, 0x0202, 0xb890, 0x0303,
+        0xb890, 0x0404, 0xb890, 0x0506, 0xb890, 0x0709, 0xb890, 0x0A0D,
+        0xb88e, 0xC047, 0xb890, 0x365F, 0xb890, 0xBE10, 0xb890, 0x84E4,
+        0xb890, 0x60E9, 0xb890, 0xA86A, 0xb890, 0xF1E3, 0xb890, 0xF73F,
+        0xb890, 0x5C02, 0xb890, 0x9547, 0xb890, 0xC30C, 0xb890, 0xB064,
+        0xb890, 0x079A, 0xb890, 0x1E23, 0xb890, 0x1B5D, 0xb890, 0x92E7,
+        0xb890, 0x4BAF, 0xb890, 0x2386, 0xb890, 0x01B6, 0xb890, 0x6F82,
+        0xb890, 0xDC1C, 0xb890, 0x8C92, 0xb88e, 0xC110, 0xb890, 0x0C7F,
+        0xb890, 0x1014, 0xb890, 0x231D, 0xb890, 0x2023, 0xb890, 0x2628,
+        0xb890, 0x2A2D, 0xb890, 0x2D2C, 0xb890, 0x2C2E, 0xb890, 0x320D,
+        0xb88e, 0xC186, 0xb890, 0x0306, 0xb890, 0x0804, 0xb890, 0x0406,
+        0xb890, 0x0707, 0xb890, 0x0709, 0xb890, 0x0B0F, 0xb890, 0x161D,
+        0xb890, 0x202A, 0xb890, 0x3F5E, 0xb88e, 0xC1C1, 0xb890, 0x0040,
+        0xb890, 0x5920, 0xb890, 0x88CD, 0xb890, 0x1CA1, 0xb890, 0x3D20,
+        0xb890, 0x3AE4, 0xb890, 0x6A43, 0xb890, 0x30AF, 0xb890, 0xDD16,
+        0xb88e, 0xC283, 0xb890, 0x1611, 0xb890, 0x161C, 0xb890, 0x2127,
+        0xb890, 0x2C32, 0xb890, 0x373D, 0xb890, 0x4247, 0xb890, 0x4D52,
+        0xb890, 0x585A, 0xb890, 0x0004, 0xb890, 0x080C, 0xb890, 0x1014,
+        0xb890, 0x181B, 0xb890, 0x1F23, 0xb890, 0x272B, 0xb890, 0x2F33,
+        0xb890, 0x363A, 0xb890, 0x3E42, 0xb890, 0x464A, 0xb890, 0x4D51,
+        0xb890, 0x5559, 0xb890, 0x5D65, 0xb890, 0xE769, 0xb890, 0xEB56,
+        0xb890, 0xC04B, 0xb890, 0xD502, 0xb890, 0x2FB1, 0xb890, 0x33B5,
+        0xb890, 0x37F8, 0xb890, 0xBB98, 0xb890, 0x7450, 0xb890, 0x4C48,
+        0xb890, 0x12DC, 0xb890, 0xDCDC, 0xb890, 0x934A, 0xb890, 0x3E33,
+        0xb890, 0xE496, 0xb890, 0x724E, 0xb890, 0x2B07, 0xb890, 0xE4C0,
+        0xb890, 0x9C79, 0xb890, 0x5512, 0xb88e, 0xC212, 0xb890, 0x2020,
+        0xb890, 0x2020, 0xb890, 0x2020, 0xb890, 0x2020, 0xb890, 0x2020,
+        0xb890, 0x2019, 0xb88e, 0xC24D, 0xb890, 0x8400, 0xb890, 0x0000,
+        0xb890, 0x0000, 0xb890, 0x0000, 0xb890, 0x0000, 0xb890, 0x0000,
+        0xb88e, 0xC2D3, 0xb890, 0x5524, 0xb890, 0x2526, 0xb890, 0x2728,
+        0xb88e, 0xC2E3, 0xb890, 0x3323, 0xb890, 0x2324, 0xb890, 0x2425,
+        0xFFFF, 0xFFFF
+};
+
 static void
 re_real_set_phy_mcu_8125b_1(struct re_softc *sc)
 {
@@ -24189,6 +28223,89 @@ re_set_phy_mcu_8125b_2(struct re_softc *sc)
         re_set_phy_mcu_patch_request(sc);
 
         re_real_set_phy_mcu_8125b_2(sc);
+
+        re_clear_phy_mcu_patch_request(sc);
+}
+
+static void
+re_real_set_phy_mcu_8126a_1_1(struct re_softc *sc)
+{
+        re_set_phy_mcu_ram_code(sc,
+                                phy_mcu_ram_code_8126a_1_1,
+                                ARRAY_SIZE(phy_mcu_ram_code_8126a_1_1)
+                               );
+}
+
+static void
+re_real_set_phy_mcu_8126a_1_2(struct re_softc *sc)
+{
+        re_set_phy_mcu_ram_code(sc,
+                                phy_mcu_ram_code_8126a_1_2,
+                                ARRAY_SIZE(phy_mcu_ram_code_8126a_1_2)
+                               );
+}
+
+static void
+re_real_set_phy_mcu_8126a_1_3(struct re_softc *sc)
+{
+        re_set_phy_mcu_ram_code(sc,
+                                phy_mcu_ram_code_8126a_1_3,
+                                ARRAY_SIZE(phy_mcu_ram_code_8126a_1_3)
+                               );
+}
+
+static void
+re_set_phy_mcu_8126a_1(struct re_softc *sc)
+{
+        re_set_phy_mcu_patch_request(sc);
+
+        re_real_set_phy_mcu_8126a_1_1(sc);
+
+        re_clear_phy_mcu_patch_request(sc);
+
+        re_set_phy_mcu_patch_request(sc);
+
+        re_real_set_phy_mcu_8126a_1_2(sc);
+
+        re_clear_phy_mcu_patch_request(sc);
+
+        re_set_phy_mcu_patch_request(sc);
+
+        re_real_set_phy_mcu_8126a_1_3(sc);
+
+        re_clear_phy_mcu_patch_request(sc);
+}
+
+static void
+re_real_set_phy_mcu_8126a_2_1(struct re_softc *sc)
+{
+        re_set_phy_mcu_ram_code(sc,
+                                phy_mcu_ram_code_8126a_2_1,
+                                ARRAY_SIZE(phy_mcu_ram_code_8126a_2_1)
+                               );
+}
+
+static void
+re_real_set_phy_mcu_8126a_2_3(struct re_softc *sc)
+{
+        re_set_phy_mcu_ram_code(sc,
+                                phy_mcu_ram_code_8126a_2_3,
+                                ARRAY_SIZE(phy_mcu_ram_code_8126a_2_3)
+                               );
+}
+
+static void
+re_set_phy_mcu_8126a_2(struct re_softc *sc)
+{
+        re_set_phy_mcu_patch_request(sc);
+
+        re_real_set_phy_mcu_8126a_2_1(sc);
+
+        re_clear_phy_mcu_patch_request(sc);
+
+        re_set_phy_mcu_patch_request(sc);
+
+        re_real_set_phy_mcu_8126a_2_3(sc);
 
         re_clear_phy_mcu_patch_request(sc);
 }
@@ -24238,10 +28355,13 @@ static void re_init_hw_phy_mcu(struct re_softc *sc)
                 re_set_phy_mcu_8168h_1(sc);
                 break;
         case MACFG_69:
+        case MACFG_76:
                 re_set_phy_mcu_8168h_2(sc);
                 break;
         case MACFG_74:
                 re_set_phy_mcu_8168h_3(sc);
+                break;
+        case MACFG_75:
                 break;
         case MACFG_80:
                 re_set_phy_mcu_8125a_1(sc);
@@ -24254,6 +28374,14 @@ static void re_init_hw_phy_mcu(struct re_softc *sc)
                 break;
         case MACFG_83:
                 re_set_phy_mcu_8125b_2(sc);
+                break;
+        case MACFG_90:
+                re_set_phy_mcu_8126a_1(sc);
+                break;
+        case MACFG_91:
+                re_set_phy_mcu_8126a_2(sc);
+                break;
+        case MACFG_92:
                 break;
         }
 
@@ -24299,8 +28427,7 @@ static void re_hw_phy_config(struct re_softc *sc)
         u_int16_t Data, PhyRegValue, TmpUshort;
         u_int32_t Data_u32;
         u_int16_t dout_tapbin;
-        int	i;
-        struct ifnet *ifp = RE_GET_IFNET(sc);
+        int i;
 
         switch (sc->re_type) {
         case MACFG_59:
@@ -24314,6 +28441,8 @@ static void re_hw_phy_config(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
+        case MACFG_75:
+        case MACFG_76:
         case MACFG_80:
         case MACFG_81:
         case MACFG_82:
@@ -26754,6 +30883,11 @@ static void re_hw_phy_config(struct re_softc *sc)
                 MP_WritePhyUshort(sc, 0x06, Data);
                 MP_WritePhyUshort(sc, 0x1F, 0x0000);
 
+                MP_WritePhyUshort(sc, 0x1F, 0x0007);
+                MP_WritePhyUshort(sc, 0x1E, 0x0023);
+                ClearEthPhyBit(sc, 0x17, BIT_1);
+                MP_WritePhyUshort(sc, 0x1F, 0x0000);
+
                 MP_WritePhyUshort(sc, 0x1F, 0x0005);
                 MP_WritePhyUshort(sc, 0x05, 0x8B85);
                 Data = MP_ReadPhyUshort(sc, 0x06);
@@ -28825,7 +32959,7 @@ static void re_hw_phy_config(struct re_softc *sc)
                 MP_WritePhyUshort(sc, 0x1F, 0x0A40);
                 MP_WritePhyUshort(sc, 0x1F, 0x0000);
                 MP_WritePhyUshort(sc, 0x00, 0x9200);
-        } else if (sc->re_type == MACFG_69) {
+        } else if (sc->re_type == MACFG_69 || sc->re_type == MACFG_76) {
                 MP_WritePhyUshort(sc, 0x1F, 0x0A43);
                 MP_WritePhyUshort(sc, 0x13, 0x808A);
                 ClearAndSetEthPhyBit(sc,
@@ -28869,6 +33003,39 @@ static void re_hw_phy_config(struct re_softc *sc)
                         MP_WritePhyUshort(sc, 0x1F, 0x0000);
                 }
 
+                {
+                        MP_WritePhyUshort(sc, 0x1F, 0x0A43);
+                        MP_WritePhyUshort(sc, 0x13, 0x85FE);
+                        ClearAndSetEthPhyBit(
+                                sc,
+                                0x14,
+                                BIT_15|BIT_14|BIT_13|BIT_12|BIT_11|BIT_10|BIT_8,
+                                BIT_9);
+                        MP_WritePhyUshort(sc, 0x13, 0x85FF);
+                        ClearAndSetEthPhyBit(
+                                sc,
+                                0x14,
+                                BIT_15|BIT_14|BIT_13|BIT_12,
+                                BIT_11|BIT_10|BIT_9|BIT_8);
+                        MP_WritePhyUshort(sc, 0x13, 0x814B);
+                        ClearAndSetEthPhyBit(
+                                sc,
+                                0x14,
+                                BIT_15|BIT_14|BIT_13|BIT_11|BIT_10|BIT_9|BIT_8,
+                                BIT_12);
+                }
+
+
+                MP_WritePhyUshort(sc, 0x1F, 0x0C41);
+                ClearEthPhyBit(sc, 0x15, BIT_1);
+                MP_WritePhyUshort(sc, 0x1F, 0x0000);
+
+
+                MP_WritePhyUshort(sc, 0x1F, 0x0A43);
+                SetEthPhyBit(sc, 0x10, BIT_0);
+                MP_WritePhyUshort(sc, 0x1F, 0x0000);
+
+
                 if (phy_power_saving == 1) {
                         MP_WritePhyUshort(sc, 0x1F, 0x0A43);
                         SetEthPhyBit(sc, 0x10, BIT_2);
@@ -28879,26 +33046,6 @@ static void re_hw_phy_config(struct re_softc *sc)
                         MP_WritePhyUshort(sc, 0x1F, 0x0000);
                         DELAY(20000);
                 }
-
-                MP_WritePhyUshort(sc, 0x1F, 0x0A43);
-                MP_WritePhyUshort(sc, 0x13, 0x85FE);
-                ClearAndSetEthPhyBit(
-                        sc,
-                        0x14,
-                        BIT_15|BIT_14|BIT_13|BIT_12|BIT_11|BIT_10|BIT_8,
-                        BIT_9);
-                MP_WritePhyUshort(sc, 0x13, 0x85FF);
-                ClearAndSetEthPhyBit(
-                        sc,
-                        0x14,
-                        BIT_15|BIT_14|BIT_13|BIT_12,
-                        BIT_11|BIT_10|BIT_9|BIT_8);
-                MP_WritePhyUshort(sc, 0x13, 0x814B);
-                ClearAndSetEthPhyBit(
-                        sc,
-                        0x14,
-                        BIT_15|BIT_14|BIT_13|BIT_11|BIT_10|BIT_9|BIT_8,
-                        BIT_12);
 
                 MP_WritePhyUshort(sc, 0x1F, 0x0A43);
                 MP_WritePhyUshort(sc, 0x13, 0x8045);
@@ -29026,7 +33173,7 @@ static void re_hw_phy_config(struct re_softc *sc)
 
                 MP_WritePhyUshort(sc, 0x1F, 0x0A43);
                 MP_WritePhyUshort(sc, 0x13, 0x8011);
-                SetEthPhyBit(sc, 0x14, BIT_11);
+                ClearEthPhyBit(sc, 0x14, BIT_11);
                 MP_WritePhyUshort(sc, 0x1F, 0x0000);
 
                 MP_WritePhyUshort(sc, 0x1F, 0x0A44);
@@ -29066,6 +33213,121 @@ static void re_hw_phy_config(struct re_softc *sc)
                 SetEthPhyBit(sc, 0x11, BIT_11);
                 MP_WritePhyUshort(sc, 0x1F, 0x0000);
 
+
+                MP_WritePhyUshort(sc, 0x1F, 0x0A4C);
+                ClearEthPhyBit(sc, 0x15, (BIT_14 | BIT_13));
+                MP_WritePhyUshort(sc, 0x1F, 0x0000);
+
+
+                MP_WritePhyUshort(sc, 0x1F, 0x0A43);
+                MP_WritePhyUshort(sc, 0x13, 0x81B9);
+                MP_WritePhyUshort(sc, 0x14, 0x2000);
+                MP_WritePhyUshort(sc, 0x1F, 0x0000);
+
+
+                MP_WritePhyUshort(sc, 0x1F, 0x0A43);
+                MP_WritePhyUshort(sc, 0x13, 0x81D4);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0x14,
+                                        0xFF00,
+                                        0x6600);
+                MP_WritePhyUshort(sc, 0x13, 0x81CB);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0x14,
+                                        0xFF00,
+                                        0x3500);
+                MP_WritePhyUshort(sc, 0x1F, 0x0000);
+
+
+                MP_WritePhyUshort(sc, 0x1F, 0x0A80);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0x16,
+                                        0x000F,
+                                        0x0005);
+                MP_WritePhyUshort(sc, 0x1F, 0x0A43);
+                MP_WritePhyUshort(sc, 0x13, 0x8016);
+                SetEthPhyBit(sc, 0x14, BIT_13);
+                MP_WritePhyUshort(sc, 0x1F, 0x0000);
+
+
+                MP_WritePhyUshort(sc, 0x1F, 0x0A43);
+                MP_WritePhyUshort(sc, 0x13, 0x811E);
+                MP_WritePhyUshort(sc, 0x14, 0xDECA);
+
+
+                MP_WritePhyUshort(sc, 0x13, 0x811C);
+                MP_WritePhyUshort(sc, 0x14, 0x8008);
+                MP_WritePhyUshort(sc, 0x13, 0x8118);
+                MP_WritePhyUshort(sc, 0x14, 0xF8B4);
+                MP_WritePhyUshort(sc, 0x13, 0x811A);
+                MP_WritePhyUshort(sc, 0x14, 0x1A04);
+
+
+                MP_WritePhyUshort(sc, 0x13, 0x8134);
+                MP_WritePhyUshort(sc, 0x14, 0xDECA);
+                MP_WritePhyUshort(sc, 0x13, 0x8132);
+                MP_WritePhyUshort(sc, 0x14, 0xA008);
+                MP_WritePhyUshort(sc, 0x13, 0x812E);
+                MP_WritePhyUshort(sc, 0x14, 0x00B5);
+                MP_WritePhyUshort(sc, 0x13, 0x8130);
+                MP_WritePhyUshort(sc, 0x14, 0x1A04);
+
+
+                MP_WritePhyUshort(sc, 0x13, 0x8112);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0x14,
+                                        0xFF00,
+                                        0x7300);
+                MP_WritePhyUshort(sc, 0x13, 0x8106);
+                MP_WritePhyUshort(sc, 0x14, 0xA209);
+                MP_WritePhyUshort(sc, 0x13, 0x8108);
+                MP_WritePhyUshort(sc, 0x14, 0x13B0);
+                MP_WritePhyUshort(sc, 0x13, 0x8103);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0x14,
+                                        0xF800,
+                                        0xB800);
+                MP_WritePhyUshort(sc, 0x13, 0x8105);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0x14,
+                                        0xFF00,
+                                        0x0A00);
+
+
+                MP_WritePhyUshort(sc, 0x1F, 0x0A43);
+                MP_WritePhyUshort(sc, 0x13, 0x87EB);
+                MP_WritePhyUshort(sc, 0x14, 0x0018);
+                MP_WritePhyUshort(sc, 0x13, 0x87EB);
+                MP_WritePhyUshort(sc, 0x14, 0x0018);
+                MP_WritePhyUshort(sc, 0x13, 0x87ED);
+                MP_WritePhyUshort(sc, 0x14, 0x0733);
+                MP_WritePhyUshort(sc, 0x13, 0x87EF);
+                MP_WritePhyUshort(sc, 0x14, 0x08DC);
+                MP_WritePhyUshort(sc, 0x13, 0x87F1);
+                MP_WritePhyUshort(sc, 0x14, 0x08DF);
+                MP_WritePhyUshort(sc, 0x13, 0x87F3);
+                MP_WritePhyUshort(sc, 0x14, 0x0C79);
+                MP_WritePhyUshort(sc, 0x13, 0x87F5);
+                MP_WritePhyUshort(sc, 0x14, 0x0D93);
+                MP_WritePhyUshort(sc, 0x13, 0x87F9);
+                MP_WritePhyUshort(sc, 0x14, 0x0010);
+                MP_WritePhyUshort(sc, 0x13, 0x87FB);
+                MP_WritePhyUshort(sc, 0x14, 0x0800);
+                MP_WritePhyUshort(sc, 0x13, 0x8015);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0x14,
+                                        0x7000,
+                                        0x7000);
+
+
+                MP_WritePhyUshort(sc, 0x1F, 0x0A43);
+                MP_WritePhyUshort(sc, 0x13, 0x8111);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0x14,
+                                        0xFF00,
+                                        0x7C00);
+                MP_WritePhyUshort(sc, 0x1F, 0x0000);
+
                 if (phy_power_saving == 1) {
                         MP_WritePhyUshort(sc, 0x1F, 0x0A43);
                         SetEthPhyBit(sc, 0x10, BIT_2);
@@ -29076,7 +33338,27 @@ static void re_hw_phy_config(struct re_softc *sc)
                         MP_WritePhyUshort(sc, 0x1F, 0x0000);
                         DELAY(20000);
                 }
+        } else if (sc->re_type == MACFG_75) {
+                MP_WritePhyUshort(sc, 0x1F, 0x0A44);
+                SetEthPhyBit(sc, 0x11, BIT_11);
+                MP_WritePhyUshort(sc, 0x1F, 0x0000);
 
+
+                MP_WritePhyUshort(sc, 0x1F, 0x0C41);
+                ClearEthPhyBit(sc, 0x15, BIT_1);
+                MP_WritePhyUshort(sc, 0x1F, 0x0000);
+
+
+                if (phy_power_saving == 1) {
+                        MP_WritePhyUshort(sc, 0x1F, 0x0A43);
+                        SetEthPhyBit(sc, 0x10, BIT_2);
+                        MP_WritePhyUshort(sc, 0x1F, 0x0000);
+                } else {
+                        MP_WritePhyUshort(sc, 0x1F, 0x0A43);
+                        ClearEthPhyBit(sc, 0x10, BIT_2);
+                        MP_WritePhyUshort(sc, 0x1F, 0x0000);
+                        DELAY(20000);
+                }
         } else if (sc->re_type == MACFG_80) {
                 ClearAndSetEthPhyOcpBit(sc,
                                         0xAD40,
@@ -29267,9 +33549,6 @@ static void re_hw_phy_config(struct re_softc *sc)
                                         0xFF00,
                                         0x0700
                                        );
-
-
-                CSR_WRITE_2(sc, RE_EEE_TXIDLE_TIMER_8125, ifp->if_mtu + ETHER_HDR_LEN + 0x20);
 
 
                 MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x80A2);
@@ -29678,9 +33957,6 @@ static void re_hw_phy_config(struct re_softc *sc)
                 MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x050E);
 
 
-                CSR_WRITE_2(sc, RE_EEE_TXIDLE_TIMER_8125, ifp->if_mtu + ETHER_HDR_LEN + 0x20);
-
-
                 MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x816C);
                 MP_RealWritePhyOcpRegWord(sc, 0xA438, 0xC4A0);
                 MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x8170);
@@ -29863,8 +34139,6 @@ static void re_hw_phy_config(struct re_softc *sc)
                                        );
 
 
-                CSR_WRITE_2(sc, RE_EEE_TXIDLE_TIMER_8125, ifp->if_mtu + ETHER_HDR_LEN + 0x20);
-
                 MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x80F5);
                 MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x760E);
                 MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8107);
@@ -29909,6 +34183,7 @@ static void re_hw_phy_config(struct re_softc *sc)
 
 
                 SetEthPhyOcpBit(sc, 0xA4CA, BIT_6);
+                ClearEthPhyOcpBit(sc, 0xA4CA, BIT_14 | BIT_13);
 
 
                 ClearAndSetEthPhyOcpBit(sc,
@@ -29947,6 +34222,488 @@ static void re_hw_phy_config(struct re_softc *sc)
                         ClearEthPhyOcpBit(sc, 0xA430, BIT_2);
                         DELAY(20000);
                 }
+        } else if (sc->re_type == MACFG_90) {
+                SetEthPhyOcpBit(sc, 0xA442, BIT_11);
+
+                if (phy_power_saving == 1) {
+                        SetEthPhyOcpBit(sc, 0xA430, BIT_2);
+                } else {
+                        ClearEthPhyOcpBit(sc, 0xA430, BIT_2);
+                        DELAY(20000);
+                }
+        } else if (sc->re_type == MACFG_91) {
+                SetEthPhyOcpBit(sc, 0xA442, BIT_11);
+
+
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x80BF);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xA438,
+                                        0xFF00,
+                                        0xED00);
+
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x80CD);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xA438,
+                                        0xFF00,
+                                        0x1000);
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x80D1);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xA438,
+                                        0xFF00,
+                                        0xC800);
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x80D4);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xA438,
+                                        0xFF00,
+                                        0xC800);
+
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x80E1);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x10CC);
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x80E5);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x4F0C);
+
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x8387);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xA438,
+                                        0xFF00,
+                                        0x4700);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xA80C,
+                                        BIT_7 | BIT_6,
+                                        BIT_7);
+
+
+                ClearEthPhyOcpBit(sc, 0xAC90, BIT_4);
+                ClearEthPhyOcpBit(sc, 0xAD2C, BIT_15);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8321);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x1100);
+                SetEthPhyOcpBit(sc, 0xACF8, (BIT_3 | BIT_2));
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x8183);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xA438,
+                                        0xFF00,
+                                        0x5900);
+                SetEthPhyOcpBit(sc, 0xAD94, BIT_5);
+                ClearEthPhyOcpBit(sc, 0xA654, BIT_11);
+                SetEthPhyOcpBit(sc, 0xB648, BIT_14);
+
+
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x839E);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x2F00);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x83F2);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0800);
+                SetEthPhyOcpBit(sc, 0xADA0, BIT_1);
+
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x80F3);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x9900);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8126);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0xC100);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x893A);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x8080);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8647);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0xE600);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x862C);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x1200);
+
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x864A);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0xE600);
+
+
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x80A0);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0xBCBC);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x805E);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0xBCBC);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8056);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x3077);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8058);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x5A00);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8098);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x3077);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x809A);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x5A00);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8052);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x3733);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8094);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x3733);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x807F);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x7C75);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x803D);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x7C75);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8036);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x3000);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8078);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x3000);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8031);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x3300);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8073);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x3300);
+
+
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xAE06,
+                                        0xFC00,
+                                        0x7C00);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x89D1);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0004);
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x8FBD);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xA438,
+                                        0xFF00,
+                                        0x0A00);
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x8FBE);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x0D09);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x89CD);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0F0F);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x89CF);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0F0F);
+
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x83A4);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x6600);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x83A6);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x6601);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x83C0);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x6600);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x83C2);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x6601);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8414);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x6600);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8416);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x6601);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x83F8);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x6600);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x83FA);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x6601);
+
+
+                re_set_phy_mcu_patch_request(sc);
+
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xBD96,
+                                        0x1F00,
+                                        0x1000);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xBF1C,
+                                        0x0007,
+                                        0x0007);
+                ClearEthPhyOcpBit(sc, 0xBFBE, BIT_15);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xBF40,
+                                        0x0380,
+                                        0x0280);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xBF90,
+                                        BIT_7,
+                                        (BIT_6 | BIT_5));
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xBF90,
+                                        BIT_4,
+                                        BIT_3 | BIT_2);
+
+                re_clear_phy_mcu_patch_request(sc);
+
+
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x843B);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xA438,
+                                        0xFF00,
+                                        0x2000);
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x843D);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xA438,
+                                        0xFF00,
+                                        0x2000);
+
+
+                ClearEthPhyOcpBit(sc, 0xB516, 0x7F);
+
+
+                ClearEthPhyOcpBit(sc, 0xBF80, (BIT_5 | BIT_4));
+
+
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x8188);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x0044);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x00A8);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x00D6);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x00EC);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x00F6);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x00FC);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x00FE);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x00FE);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x00BC);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x0058);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x002A);
+
+
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8015);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0800);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8FFD);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0000);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8FFF);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x7F00);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8FFB);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0100);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8FE9);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0002);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8FEF);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x00A5);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8FF1);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0106);
+
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8FE1);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0102);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8FE3);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0400);
+
+
+                SetEthPhyOcpBit(sc, 0xA654, BIT_11);
+                ClearEthPhyOcpBit(sc, 0XA65A, (BIT_1 | BIT_0));
+
+                MP_RealWritePhyOcpRegWord(sc, 0xAC3A, 0x5851);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0XAC3C,
+                                        BIT_15 | BIT_14 | BIT_12,
+                                        BIT_13);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xAC42,
+                                        BIT_9,
+                                        BIT_8 | BIT_7 | BIT_6);
+                ClearEthPhyOcpBit(sc, 0xAC3E, BIT_15 | BIT_14 | BIT_13);
+                ClearEthPhyOcpBit(sc, 0xAC42, BIT_5 | BIT_4 | BIT_3);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xAC42,
+                                        BIT_1,
+                                        BIT_2 | BIT_0);
+
+                MP_RealWritePhyOcpRegWord(sc, 0xAC1A, 0x00DB);
+                MP_RealWritePhyOcpRegWord(sc, 0xADE4, 0x01B5);
+                ClearEthPhyOcpBit(sc, 0xAD9C, BIT_11 | BIT_10);
+
+
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x814B);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x1100);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x814D);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x1100);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x814F);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0B00);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8142);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0100);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8144);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0100);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8150);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0100);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8118);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0700);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x811A);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0700);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x811C);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0500);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x810F);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0100);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8111);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0100);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x811D);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0100);
+
+                SetEthPhyOcpBit(sc, 0xAC36, BIT_12);
+                ClearEthPhyOcpBit(sc, 0xAD1C, BIT_8);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xADE8,
+                                        0xFFC0,
+                                        0x1400);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x864B);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x9D00);
+
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x8F97);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x003F);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x3F02);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x023C);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x3B0A);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x1C00);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x0000);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x0000);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x0000);
+                MP_RealWritePhyOcpRegWord(sc, 0xA438, 0x0000);
+
+
+                SetEthPhyOcpBit(sc, 0xAD9C, BIT_5);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8122);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0C00);
+
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x82C8);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03ED);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03FF);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0009);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03FE);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x000B);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0021);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03F7);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03B8);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03E0);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0049);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0049);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03E0);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03B8);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03F7);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0021);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x000B);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03FE);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0009);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03FF);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03ED);
+
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x80EF);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0C00);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x82A0);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x000E);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03FE);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03ED);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0006);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x001A);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03F1);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03D8);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0023);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0054);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0322);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x00DD);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03AB);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03DC);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0027);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x000E);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03E5);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03F9);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0012);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x0001);
+                MP_RealWritePhyOcpRegWord(sc, 0xB87E, 0x03F1);
+
+
+                MP_RealWritePhyOcpRegWord(sc, 0xA436, 0x8018);
+                SetEthPhyOcpBit(sc, 0xA438, BIT_13);
+
+
+                MP_RealWritePhyOcpRegWord(sc, 0xB87C, 0x8FE4);
+                ClearAndSetEthPhyOcpBit(sc,
+                                        0xB87E,
+                                        0xFF00,
+                                        0x0000);
+
+
+                if (phy_power_saving == 1) {
+                        SetEthPhyOcpBit(sc, 0xA430, BIT_2);
+                } else {
+                        ClearEthPhyOcpBit(sc, 0xA430, BIT_2);
+                        DELAY(20000);
+                }
+        } else if (sc->re_type == MACFG_92) {
+                SetEthPhyOcpBit(sc, 0xA442, BIT_11);
+
+                if (phy_power_saving == 1) {
+                        SetEthPhyOcpBit(sc, 0xA430, BIT_2);
+                } else {
+                        ClearEthPhyOcpBit(sc, 0xA430, BIT_2);
+                        DELAY(20000);
+                }
         }
 
 #ifdef ENABLE_FIBER_SUPPORT
@@ -29970,7 +34727,7 @@ static void re_hw_phy_config(struct re_softc *sc)
                 MP_WritePhyUshort(sc, 0x14, 0x1065);
                 MP_WritePhyUshort(sc, 0x1F, 0x0000);
         } else if (sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
-                   sc->re_type == MACFG_74) {
+                   sc->re_type == MACFG_74 || sc->re_type == MACFG_75) {
                 //enable EthPhyPPSW
                 MP_WritePhyUshort(sc, 0x1F, 0x0A44);
                 SetEthPhyBit(sc, 0x11, BIT_7);
@@ -29993,10 +34750,8 @@ static void re_hw_phy_config(struct re_softc *sc)
         case MACFG_72:
         case MACFG_73:
         case MACFG_74:
-        case MACFG_80:
-        case MACFG_81:
-        case MACFG_82:
-        case MACFG_83:
+        case MACFG_75:
+        case MACFG_76:
                 if (phy_mdix_mode == RE_ETH_PHY_FORCE_MDI) {
                         //Force MDI
                         MP_WritePhyUshort(sc, 0x1F, 0x0A43);
@@ -30024,9 +34779,10 @@ static void re_hw_phy_config(struct re_softc *sc)
         case MACFG_81:
         case MACFG_82:
         case MACFG_83:
-                MP_WritePhyUshort(sc, 0x1F, 0x0A5B);
-                ClearEthPhyBit(sc, 0x12, BIT_15);
-                MP_WritePhyUshort(sc, 0x1F, 0x0000);
+        case MACFG_90:
+        case MACFG_91:
+        case MACFG_92:
+                ClearEthPhyOcpBit(sc, 0xA5B4, BIT_15);
                 break;
         }
 
@@ -30043,6 +34799,8 @@ static void re_hw_phy_config(struct re_softc *sc)
                 case MACFG_72:
                 case MACFG_73:
                 case MACFG_74:
+                case MACFG_75:
+                case MACFG_76:
                         re_enable_ocp_phy_power_saving(sc);
                         break;
                 case MACFG_80:
@@ -30091,9 +34849,11 @@ void MP_WritePhyUshort(struct re_softc *sc,u_int8_t RegAddr,u_int16_t RegData)
                    sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
                    sc->re_type == MACFG_70 || sc->re_type == MACFG_71 ||
                    sc->re_type == MACFG_72 || sc->re_type == MACFG_73 ||
-                   sc->re_type == MACFG_74 || sc->re_type == MACFG_80 ||
+                   sc->re_type == MACFG_74 || sc->re_type == MACFG_75 ||
+                   sc->re_type == MACFG_76 || sc->re_type == MACFG_80 ||
                    sc->re_type == MACFG_81 || sc->re_type == MACFG_82 ||
-                   sc->re_type == MACFG_83) {
+                   sc->re_type == MACFG_83 || sc->re_type == MACFG_90 ||
+                   sc->re_type == MACFG_91 || sc->re_type == MACFG_92) {
                 if (RegAddr == 0x1F) {
                         return;
                 }
@@ -30156,9 +34916,11 @@ u_int16_t MP_ReadPhyUshort(struct re_softc *sc,u_int8_t RegAddr)
                    sc->re_type == MACFG_68 || sc->re_type == MACFG_69 ||
                    sc->re_type == MACFG_70 || sc->re_type == MACFG_71 ||
                    sc->re_type == MACFG_72 || sc->re_type == MACFG_73 ||
-                   sc->re_type == MACFG_74 || sc->re_type == MACFG_80 ||
+                   sc->re_type == MACFG_74 || sc->re_type == MACFG_75 ||
+                   sc->re_type == MACFG_76 || sc->re_type == MACFG_80 ||
                    sc->re_type == MACFG_81 || sc->re_type == MACFG_82 ||
-                   sc->re_type == MACFG_83) {
+                   sc->re_type == MACFG_83 || sc->re_type == MACFG_90 ||
+                   sc->re_type == MACFG_91 || sc->re_type == MACFG_92) {
                 RegData = MP_ReadPhyOcpRegWord(sc, sc->cur_page, RegAddr);
         } else {
                 if (sc->re_type == MACFG_65 || sc->re_type == MACFG_66)
@@ -30184,7 +34946,23 @@ u_int16_t MP_ReadPhyUshort(struct re_softc *sc,u_int8_t RegAddr)
         return RegData;
 }
 
-void MP_WriteEPhyUshort(struct re_softc *sc, u_int8_t RegAddr, u_int16_t RegData)
+static u_int8_t RtCheckPciEPhyAddr(struct re_softc *sc, int RegAddr)
+{
+        if (sc->re_type != MACFG_74 && sc->re_type != MACFG_75)
+                goto exit;
+
+        if (RegAddr & (BIT_6 | BIT_5))
+                ClearAndSetMcuAccessRegBit(sc, 0xDE28,
+                                           (BIT_1 | BIT_0),
+                                           (RegAddr >> 5) & (BIT_1 | BIT_0));
+
+        RegAddr &= 0x1F;
+
+exit:
+        return RegAddr;
+}
+
+static void _MP_WriteEPhyUshort(struct re_softc *sc, u_int8_t RegAddr, u_int16_t RegData)
 {
         u_int32_t		TmpUlong=0x80000000;
         u_int32_t		Timeout=0;
@@ -30201,7 +34979,12 @@ void MP_WriteEPhyUshort(struct re_softc *sc, u_int8_t RegAddr, u_int16_t RegData
         }
 }
 
-u_int16_t MP_ReadEPhyUshort(struct re_softc *sc, u_int8_t RegAddr)
+void MP_WriteEPhyUshort(struct re_softc *sc, u_int8_t RegAddr, u_int16_t RegData)
+{
+        _MP_WriteEPhyUshort(sc, RtCheckPciEPhyAddr(sc, RegAddr), RegData);
+}
+
+static u_int16_t _MP_ReadEPhyUshort(struct re_softc *sc, u_int8_t RegAddr)
 {
         u_int16_t		RegData;
         u_int32_t		TmpUlong;
@@ -30221,6 +35004,11 @@ u_int16_t MP_ReadEPhyUshort(struct re_softc *sc, u_int8_t RegAddr)
         RegData = (u_int16_t)(TmpUlong & 0x0000ffff);
 
         return RegData;
+}
+
+u_int16_t MP_ReadEPhyUshort(struct re_softc *sc, u_int8_t RegAddr)
+{
+        return _MP_ReadEPhyUshort(sc, RtCheckPciEPhyAddr(sc, RegAddr));
 }
 
 static u_int8_t re_calc_efuse_dummy_bit(u_int16_t reg)
@@ -30418,6 +35206,8 @@ u_int32_t MP_ReadOtherFunPciEConfigSpace(
                 ReadDone = CSR_READ_4(sc, RE_CSIAR);
                 Timeout++;
         } while (((ReadDone & 0x80000000) == 0)&& (Timeout < WaitCount));
+
+        RetVal = CSR_READ_4(sc, RE_CSIDR);
 
         DELAY(50);
 

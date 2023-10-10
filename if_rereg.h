@@ -32,6 +32,8 @@
  * $FreeBSD: src/sys/dev/re/if_rereg.h,v 1.14.2.1 2001/07/19 18:33:07 wpaul Exp $
  */
 
+#include <netinet/tcp_lro.h>
+
 /*#define VERSION(_MainVer,_MinorVer)	((_MainVer)*10+(_MinorVer))*/
 /*#define OS_VER	VERSION(5,1)*/
 #if __FreeBSD_version < 500000
@@ -86,6 +88,9 @@
 #define RE_MAR5		0x000D
 #define RE_MAR6		0x000E
 #define RE_MAR7		0x000F
+
+#define RE_DUMPSTATS_LO         0x0010  /* counter dump command register */
+#define RE_DUMPSTATS_HI         0x0014  /* counter dump command register */
 
 #define RE_TXSTAT0	0x0010		/* status of TX descriptor 0 */
 #define RE_TXSTAT1	0x0014		/* status of TX descriptor 1 */
@@ -153,7 +158,11 @@
 #define	RE_CMAC_IBCR2     	0x00F9
 #define	RE_CMAC_IBIMR0    	0x00FA
 #define	RE_CMAC_IBISR0   	0x00FB
+/* MAC OCP */
+#define RE_EEE_TXIDLE_TIMER_8168 0xE048
 //8125
+#define RE_INT_CFG0_8125 0x34
+#define RE_INT_CFG1_8125 0x7A
 #define RE_IMR0_8125 0x38
 #define RE_ISR0_8125 0x3C
 #define RE_TPPOLL_8125 0x90
@@ -399,10 +408,15 @@
 #define RL_CFG5_WOL_LANWAKE     0x02
 #define RL_CFG5_PME_STS         0x01
 
+/* RL_DUMPSTATS_LO register */
+#define RE_DUMPSTATS_START      0x00000008
+
 /*
  * PHY Status register
  */
 #define RL_PHY_STATUS_500MF 0x80000
+#define RL_PHY_STATUS_5000MF 0x1000
+#define RL_PHY_STATUS_5000MF_LITE 0x800
 #define RL_PHY_STATUS_2500MF 0x400
 #define RL_PHY_STATUS_1250MF 0x200
 #define RL_PHY_STATUS_CABLE_PLUG 0x80
@@ -446,6 +460,53 @@
 #define RE_ETH_PHY_AUTO_MDI_MDIX	2
 
 /*
+ * Statistics counter structure
+ */
+struct re_stats {
+        uint64_t                re_tx_pkts;
+        uint64_t                re_rx_pkts;
+        uint64_t                re_tx_errs;
+        uint32_t                re_rx_errs;
+        uint16_t                re_missed_pkts;
+        uint16_t                re_rx_framealign_errs;
+        uint32_t                re_tx_onecoll;
+        uint32_t                re_tx_multicolls;
+        uint64_t                re_rx_ucasts;
+        uint64_t                re_rx_bcasts;
+        uint32_t                re_rx_mcasts;
+        uint16_t                re_tx_aborts;
+        uint16_t                re_rx_underruns;
+
+        /* extended */
+        uint64_t                re_tx_octets;
+        uint64_t                re_rx_octets;
+        uint64_t                re_rx_multicast64;
+        uint64_t                re_tx_unicast64;
+        uint64_t                re_tx_broadcast64;
+        uint64_t                re_tx_multicast64;
+        uint32_t                re_tx_pause_on;
+        uint32_t                re_tx_pause_off;
+        uint32_t                re_tx_pause_all;
+        uint32_t                re_tx_deferred;
+        uint32_t                re_tx_late_collision;
+        uint32_t                re_tx_all_collision;
+        uint32_t                re_tx_aborted32;
+        uint32_t                re_align_errors32;
+        uint32_t                re_rx_frame_too_long;
+        uint32_t                re_rx_runt;
+        uint32_t                re_rx_pause_on;
+        uint32_t                re_rx_pause_off;
+        uint32_t                re_rx_pause_all;
+        uint32_t                re_rx_unknown_opcode;
+        uint32_t                re_rx_mac_error;
+        uint32_t                re_tx_underrun32;
+        uint32_t                re_rx_mac_missed;
+        uint32_t                re_rx_tcam_dropped;
+        uint32_t                re_tdu;
+        uint32_t                re_rdu;
+};
+
+/*
  * The RealTek doesn't use a fragment-based descriptor mechanism.
  * Instead, there are only four register sets, each or which represents
  * one 'descriptor.' Basically, each TX descriptor is just a contiguous
@@ -467,20 +528,24 @@
 #define RE_RX_BUF_SZ		RE_RXBUF_64
 #define RE_RXBUFLEN		(1 << ((RE_RX_BUF_SZ >> 11) + 13))
 #define RE_TX_LIST_CNT		4		/*  C mode Tx buffer number */
-#define RE_TX_BUF_NUM		256		/* Tx buffer number */
-#define RE_RX_BUF_NUM		256		/* Rx buffer number */
+#define RE_TX_BUF_NUM		1024		/* Tx buffer number */
+#define RE_RX_BUF_NUM		1024		/* Rx buffer number */
 #define RE_BUF_SIZE		9216		/* Buffer size of descriptor buffer */
 #define RE_MIN_FRAMELEN		60
 #define RE_TXREV(x)		((x) << 11)
 #define RE_RX_RESVERED		RE_RXRESVERED
 #define RE_RX_MAXDMA		RE_RXDMA_UNLIMITED
 #define RE_TX_MAXDMA		RE_TXDMA_2048BYTES
-#define	RE_NTXSEGS		32
+#define RE_NTXSEGS		35
+#define RE_TX_MAXSIZE_32K (32 * 1024)
+#define RE_TX_MAXSIZE_64K (64 * 1024)
+#define RE_RX_BUDGET (64)
 
 #define RE_TXCFG_CONFIG		0x03000780 //(RE_TXCFG_IFG|RE_TX_MAXDMA)
 
 #define RE_DESC_ALIGN	256		/* descriptor alignment */
 #define RE_RX_BUFFER_ALIGN	8		/* descriptor alignment */
+#define RE_DUMP_ALIGN           64
 
 #ifdef RE_FIXUP_RX
 #define	RE_ETHER_ALIGN	RE_RX_BUFFER_ALIGN
@@ -497,13 +562,13 @@
 #define Jumbo_Frame_8k	((8 * 1024) - ETHER_VLAN_ENCAP_LEN - ETHER_HDR_LEN - ETHER_CRC_LEN)
 #define Jumbo_Frame_9k	((9 * 1024) - ETHER_VLAN_ENCAP_LEN - ETHER_HDR_LEN - ETHER_CRC_LEN)
 struct re_chain_data {
-        u_int16_t		cur_rx;
+        u_int32_t		cur_rx;
         caddr_t			re_rx_buf;
         caddr_t			re_rx_buf_ptr;
 
         struct mbuf		*re_tx_chain[RE_TX_LIST_CNT];
-        u_int8_t		last_tx;	/* Previous Tx OK */
-        u_int8_t		cur_tx;		/* Next to TX */
+        u_int32_t		last_tx;	/* Previous Tx OK */
+        u_int32_t		cur_tx;		/* Next to TX */
 };
 
 #define HW_SUPPORT_MAC_MCU(_M)        ((_M)->HwSuppMacMcuVer > 0)
@@ -539,22 +604,14 @@ struct re_chain_data {
 #define	RL_TDESC_CMD_UDPCSUMV2	0x80000000
 #define	RL_TDESC_CMD_TCPCSUMV2	0x40000000
 #define	RL_TDESC_CMD_IPCSUMV2	0x20000000
+#define	RL_TDESC_CMD_CSUM_TCPHO_SHIFT	18
 #define	RL_TDESC_CMD_MSSVALV2	0x1FFC0000
 #define	RL_TDESC_CMD_MSSVALV2_SHIFT	18
+#define	RL_TDESC_CMD_GTSEND_TCPHO_SHIFT	18
+#define	RL_TDESC_CMD_GTSENDV6	0x02000000	/* TCP giant send enb */
+#define	RL_TDESC_CMD_GTSENDV4	0x04000000	/* TCP giant send enb */
 
 #define	RL_TDESC_CMD_BUFLEN	0x0000FFFF
-
-/*
- * Error bits are valid only on the last descriptor of a frame
- * (i.e. RL_TDESC_CMD_EOF == 1)
- */
-
-#define	RL_TDESC_STAT_COLCNT	0x000F0000	/* collision count */
-#define	RL_TDESC_STAT_EXCESSCOL	0x00100000	/* excessive collisions */
-#define	RL_TDESC_STAT_LINKFAIL	0x00200000	/* link faulure */
-#define	RL_TDESC_STAT_OWINCOL	0x00400000	/* out-of-window collision */
-#define	RL_TDESC_STAT_TXERRSUM	0x00800000	/* transmit error summary */
-#define	RL_TDESC_STAT_UNDERRUN	0x02000000	/* TX underrun occured */
 #define	RL_TDESC_STAT_OWN	0x80000000
 
 /*
@@ -593,6 +650,7 @@ struct re_chain_data {
 						   (rl_vlandata valid)*/
 #define	RL_RDESC_VLANCTL_DATA	0x0000FFFF	/* TAG data */
 /* RTL8168C/RTL8168CP/RTL8111C/RTL8111CP */
+#define	RL_RDESC_RES		0x00200000
 #define	RL_RDESC_IPV6		0x80000000
 #define	RL_RDESC_IPV4		0x40000000
 
@@ -660,8 +718,7 @@ union RxDesc {
 #else
 #error  "what endian is this machine?"
 #endif
-                u_int32_t RxBuffL;
-                u_int32_t RxBuffH;
+                u_int64_t RxBuff;
         } so0;	/* symbol owner=0 */
 };
 
@@ -707,19 +764,17 @@ union TxDesc {
 #else
 #error  "what endian is this machine?"
 #endif
-                u_int32_t TxBuffL;
-                u_int32_t TxBuffH;
+                u_int64_t TxBuff;
         } so1;	/* symbol owner=1 */
 };
 
 struct re_descriptor {
-        u_int8_t		rx_cur_index;
-        u_int8_t		rx_last_index;
+        u_int32_t		rx_cur_index;
         union RxDesc 		*rx_desc;	/* 8 bits alignment */
         struct mbuf		*rx_buf[RE_RX_BUF_NUM];
 
-        u_int8_t		tx_cur_index;
-        u_int8_t		tx_last_index;
+        u_int32_t		tx_cur_index;
+        u_int32_t		tx_last_index;
         union TxDesc		*tx_desc;	/* 8 bits alignment */
         struct mbuf		*tx_buf[RE_TX_BUF_NUM];
         bus_dma_tag_t		rx_desc_tag;
@@ -731,6 +786,13 @@ struct re_descriptor {
         bus_dmamap_t		tx_desc_dmamap;
         bus_dma_tag_t		re_tx_mtag;	/* mbuf TX mapping tag */
         bus_dmamap_t		re_tx_dmamap[RE_TX_BUF_NUM];
+};
+
+struct re_tally_counter {
+        bus_dma_tag_t           re_stag;        /* stats mapping tag */
+        bus_dmamap_t            re_smap;        /* stats map */
+        struct re_stats         *re_stats;
+        bus_addr_t              re_stats_addr;
 };
 
 #define RE_INC(x)		(x = (x + 1) % RE_TX_LIST_CNT)
@@ -771,23 +833,30 @@ struct re_mii_frame {
 #define RL_FLAG_PHYWAKE_PM      0x00000004
 #define RL_FLAG_DESCV2          0x00000040
 #define	RL_FLAG_MSIX		    0x00000800
+#define RL_FLAG_8168G_PLUS      0x00040000
 #define RL_FLAG_MAGIC_PACKET_V2 0x20000000
 #define RL_FLAG_PCIE            0x40000000
 #define RL_FLAG_MAGIC_PACKET_V3 0x80000000
 
-#define RL_ProtoIP  	((1<<17)|(1<<18))
-//#define RL_ProtoIP  	((1<<16)|(1<<17))
-#define RL_TCPT 		(1<<17)
-#define RL_UDPT 		(1<<18)
+#define RL_PID0 		(1<<17)
+#define RL_PID1 		(1<<18)
+#define RL_ProtoUDP  	(RL_PID1)
+#define RL_ProtoTCP  	(RL_PID0)
+#define RL_ProtoIP  	(RL_PID0|RL_PID1)
+#define RL_ProtoMASK  	(RL_PID0|RL_PID1)
+#define RL_TCPT 		(1<<17) /* TCP, 8168C/CP, 8111C/CP */
+#define RL_UDPT 		(1<<18) /* UDP, 8168C/CP, 8111C/CP */
 #define RL_IPF		(1<<16)
 #define RL_UDPF		(1<<15)
 #define RL_TCPF		(1<<14)
-#define RL_V4F         	(1<<30)
+#define RL_V4F		(1<<30) /* IPv4, 8168C/CP, 8111C/CP */
+#define RL_V6F		(1<<31) /* IPv6, 8168C/CP, 8111C/CP */
 
-#define RL_IPV4CS      (1<<29)
-#define RL_TCPCS		(1<<30)
+#define RL_CS_V6F	(1<<28) /* IPv6 Frame, 8168C/CP, 8111C/CP */
+#define RL_IPV4CS	(1<<29)
+#define RL_TCPCS	(1<<30)
 #define RL_UDPCS	(1<<31)
-#define RL_IPV4CS1     (1<<18)
+#define RL_IPV4CS1	(1<<18)
 #define RL_TCPCS1	(1<<16)
 #define RL_UDPCS1	(1<<17)
 
@@ -802,12 +871,12 @@ enum  {
 };
 
 enum {
-        MACFG_3 = 0x03,
+        MACFG_3 = 3,
         MACFG_4,
         MACFG_5,
         MACFG_6,
 
-        MACFG_11,
+        MACFG_11 = 11,
         MACFG_12,
         MACFG_13,
         MACFG_14,
@@ -817,7 +886,7 @@ enum {
         MACFG_18,
         MACFG_19,
 
-        MACFG_21,
+        MACFG_21 = 21,
         MACFG_22,
         MACFG_23,
         MACFG_24,
@@ -826,20 +895,20 @@ enum {
         MACFG_27,
         MACFG_28,
 
-        MACFG_31,
+        MACFG_31 = 31,
         MACFG_32,
         MACFG_33,
 
-        MACFG_36,
+        MACFG_36 = 36,
         MACFG_37,
         MACFG_38,
         MACFG_39,
 
-        MACFG_41,
+        MACFG_41 = 41,
         MACFG_42,
         MACFG_43,
 
-        MACFG_50,
+        MACFG_50 = 50,
         MACFG_51,
         MACFG_52,
         MACFG_53,
@@ -864,11 +933,17 @@ enum {
         MACFG_72,
         MACFG_73,
         MACFG_74,
+        MACFG_75,
+        MACFG_76,
 
-        MACFG_80,
+        MACFG_80 = 80,
         MACFG_81,
         MACFG_82,
         MACFG_83,
+
+        MACFG_90 = 90,
+        MACFG_91,
+        MACFG_92,
 
         MACFG_FF = 0xFF
 };
@@ -902,7 +977,7 @@ struct re_softc {
 
         u_int8_t		re_unit;			/* interface number */
         u_int8_t		re_type;
-        u_int8_t		re_stats_no_timeout;
+        //u_int8_t		re_stats_no_timeout;
         u_int8_t		re_revid;
         u_int16_t		re_vendor_id;
         u_int16_t		re_device_id;
@@ -911,6 +986,7 @@ struct re_softc {
 
         struct re_chain_data	re_cdata;		/* Tx buffer chain, Used only in ~C+ mode */
         struct re_descriptor	re_desc;			/* Descriptor, Used only in C+ mode */
+        struct re_tally_counter	re_tally;			/* Tally Counter */
 #ifdef RE_USE_NEW_CALLOUT_FUN
         struct callout	re_stat_ch;
 #else
@@ -935,6 +1011,10 @@ struct re_softc {
         u_int8_t RequireAdjustUpsTxLinkPulseTiming;
         u_int16_t SwrCnt1msIni;
 
+        u_int8_t org_mac_addr[ETHER_ADDR_LEN];
+
+        u_int8_t random_mac;
+
         u_int8_t RequiredSecLanDonglePatch;
 
         u_int8_t RequirePhyMdiSwapPatch;
@@ -945,6 +1025,7 @@ struct re_softc {
         u_int16_t re_hw_ram_code_ver;
 #if OS_VER>=VERSION(7,0)
         struct task		re_inttask;
+        struct task		re_inttask_poll;
 #endif
         u_int16_t cur_page;
 
@@ -973,8 +1054,12 @@ struct re_softc {
         u_int32_t HwFiberModeVer;
         u_int32_t HwFiberStat;
 
+        u_int8_t HwSuppExtendTallyCounterVer;
+
         u_int8_t HwSuppMacMcuVer;
         u_int16_t MacMcuPageSize;
+
+        struct lro_ctrl		 re_lro;
 
         int (*ifmedia_upd)(struct ifnet *);
         void (*ifmedia_sts)(struct ifnet *, struct ifmediareq *);
@@ -984,6 +1069,7 @@ struct re_softc {
         int (*intr)(void *);
 #endif //OS_VER < VERSION(7,0)
         void (*int_task)(void *, int);
+        void (*int_task_poll)(void *, int);
         void (*hw_start_unlock)(struct re_softc *);
 };
 
@@ -1072,6 +1158,7 @@ enum bits {
 #define RT_DEVICEID_8162			0x8162		/* For RTL8168KB */
 #define RT_DEVICEID_8136			0x8136		/* For RTL8101E */
 #define RT_DEVICEID_8125			0x8125		/* For RTL8125 */
+#define RT_DEVICEID_8126			0x8126		/* For RTL8126 */
 
 /*
  * Accton PCI vendor ID
@@ -1147,12 +1234,18 @@ enum bits {
 #define RE_PME_EN		0x0010
 #define RE_PME_STATUS		0x8000
 
-#define RE_WOL_LINK_SPEED_10M_FIRST ( 0 )
-#define RE_WOL_LINK_SPEED_100M_FIRST ( 1 )
+#define RE_WOL_LINK_SPEED_10M_FIRST (0)
+#define RE_WOL_LINK_SPEED_100M_FIRST (1)
 
 #define RTK_ADVERTISE_2500FULL  0x80
+#define RTK_ADVERTISE_5000FULL  0x100
 
 #define RTL8125_MAC_MCU_PAGE_SIZE 256 //256 words
+
+#define RTL8125_INT_CFG0_ENABLE_8125 (0x0001)
+#define RTL8125_INT_CFG0_TIMEOUT0_BYPASS (0x0002)
+#define RTL8125_INT_CFG0_MITIGATION_BYPASS (0x0004)
+#define RTL8126_INT_CFG0_RDU_BYPASS (0x0010)
 
 //Ram Code Version
 #define NIC_RAMCODE_VERSION_8168E (0x0057)
@@ -1163,13 +1256,17 @@ enum bits {
 #define NIC_RAMCODE_VERSION_8168GU (0x0001)
 #define NIC_RAMCODE_VERSION_8168EP (0x0019)
 #define NIC_RAMCODE_VERSION_8411B (0x0012)
-#define NIC_RAMCODE_VERSION_8168H (0x0055)
-#define NIC_RAMCODE_VERSION_8168H_6838 (0x0010)
+#define NIC_RAMCODE_VERSION_8168H (0x0083)
+#define NIC_RAMCODE_VERSION_8168H_6838 (0x0027)
+#define NIC_RAMCODE_VERSION_8168H_6878B (0x0000)
 #define NIC_RAMCODE_VERSION_8168FP (0x0003)
 #define NIC_RAMCODE_VERSION_8125A_REV_A (0x0B11)
 #define NIC_RAMCODE_VERSION_8125A_REV_B (0x0B33)
 #define NIC_RAMCODE_VERSION_8125B_REV_A (0x0B17)
 #define NIC_RAMCODE_VERSION_8125B_REV_B (0x0B74)
+#define NIC_RAMCODE_VERSION_8126A_REV_A (0x0023)
+#define NIC_RAMCODE_VERSION_8126A_REV_B (0x0033)
+#define NIC_RAMCODE_VERSION_8126A_REV_C (0x0001)
 
 #ifdef __alpha__
 #undef vtophys
