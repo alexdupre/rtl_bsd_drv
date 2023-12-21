@@ -4079,9 +4079,9 @@ re_sysctl_driver_variable(SYSCTL_HANDLER_ARGS)
                 printf("HwSuppExtendTallyCounterVer\t%d\n", sc->HwSuppExtendTallyCounterVer);
                 printf("HwSuppMacMcuVer\t%d\n", sc->HwSuppMacMcuVer);
                 printf("MacMcuPageSize\t%d\n", sc->MacMcuPageSize);
-                printf("rx_desc_tag maxsize\t%ld\n", sc->re_desc.rx_desc_tag->common.maxsize);
-                printf("tx_desc_tag maxsize\t%ld\n", sc->re_desc.tx_desc_tag->common.maxsize);
-                printf("re_tally maxsize\t%ld\n", sc->re_tally.re_stag->common.maxsize);
+                printf("rx_desc_tag maxsize\t%zd\n", sc->re_desc.rx_desc_tag->common.maxsize);
+                printf("tx_desc_tag maxsize\t%zd\n", sc->re_desc.tx_desc_tag->common.maxsize);
+                printf("re_tally maxsize\t%zd\n", sc->re_tally.re_stag->common.maxsize);
                 printf("random_mac\t%d\n", sc->random_mac);
                 printf("org_mac_addr\t%6D\n", sc->org_mac_addr, ":");
 #if OS_VER < VERSION(6,0)
