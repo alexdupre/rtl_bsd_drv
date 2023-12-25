@@ -9,12 +9,15 @@
 This is the official FreeBSD driver from Realtek Semiconductor corp. with a few
 patches to improve stability and performance under high load.
 
-The main issue is the unconditional use of the 9k jumbo clusters regardless of
+The first issue is the unconditional use of the 9k jumbo clusters regardless of
 the configured MTU. After sufficient fragmentation of the physical memory, new
 allocations are impossible and the machine hangs in contigmalloc() looping for
 rx ring mbuf refill, and other processes get stuck in a lock cascade for the
 `re` driver lock. This patched driver adds the `hw.re.max_rx_mbuf_sz` tunable
 to decrease the rx mbuf size.
+
+The second issue is that multiple `re` devices share the same task queue for
+processing interrupts. This patched driver creates a new task queue per device.
 
 The link speed and duplexmode can be changed by using following command.
 	1. For auto negotiation,
