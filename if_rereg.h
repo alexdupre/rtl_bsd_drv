@@ -1071,6 +1071,7 @@ struct re_softc {
         void (*int_task)(void *, int);
         void (*int_task_poll)(void *, int);
         void (*hw_start_unlock)(struct re_softc *);
+        struct taskqueue *re_tq;
 };
 
 enum bits {
