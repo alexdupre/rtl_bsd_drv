@@ -32,6 +32,7 @@
  * $FreeBSD: src/sys/dev/re/if_rereg.h,v 1.14.2.1 2001/07/19 18:33:07 wpaul Exp $
  */
 
+#include <netinet/in.h>
 #include <netinet/tcp_lro.h>
 
 /*#define VERSION(_MainVer,_MinorVer)	((_MainVer)*10+(_MinorVer))*/

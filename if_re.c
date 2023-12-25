@@ -3970,6 +3970,10 @@ re_add_sysctls(struct re_softc *sc)
         ctx = device_get_sysctl_ctx(sc->dev);
         children = SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev));
 
+#ifndef CTLFLAG_NEEDGIANT
+#define CTLFLAG_NEEDGIANT 0
+#endif
+
         SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "driver_var",
                         CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
                         re_sysctl_driver_variable, "I", "Driver Variables Information");
