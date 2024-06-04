@@ -1237,6 +1237,7 @@ struct re_dma_map_arg {
 #define RT_DEVICEID_8162			0x8162		/* For RTL8168KB */
 #define RT_DEVICEID_8136			0x8136		/* For RTL8101E */
 #define RT_DEVICEID_8125			0x8125		/* For RTL8125 */
+#define RT_DEVICEID_3000			0x3000		/* For Killer E3000/E3100 with RTL8125 */
 #define RT_DEVICEID_8126			0x8126		/* For RTL8126 */
 #define RT_DEVICEID_8127			0x8127		/* For RTL8127 */
 

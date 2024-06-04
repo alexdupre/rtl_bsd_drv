@@ -170,6 +170,10 @@ static struct re_type re_devs[] = {
                 "Realtek PCIe 2.5GbE Family Controller"
         },
         {
+                RT_VENDORID, RT_DEVICEID_3000,
+                "Killer PCIe 3x00 2.5GbE Family Controller"
+        },
+        {
                 RT_VENDORID, RT_DEVICEID_8126,
                 "Realtek PCIe 5GbE Family Controller"
         },
@@ -4071,6 +4075,7 @@ static int re_check_mac_version(struct re_softc *sc)
         case RT_DEVICEID_8161:
         case RT_DEVICEID_8162:
         case RT_DEVICEID_8125:
+        case RT_DEVICEID_3000:
         case RT_DEVICEID_8126:
         case RT_DEVICEID_8127:
                 //do nothing
@@ -4123,6 +4128,7 @@ static void re_init_software_variable(struct re_softc *sc)
         case RT_DEVICEID_8162:
         case RT_DEVICEID_8136:
         case RT_DEVICEID_8125:
+        case RT_DEVICEID_3000:
         case RT_DEVICEID_8126:
         case RT_DEVICEID_8127:
                 sc->re_if_flags |= RL_FLAG_PCIE;
@@ -6159,6 +6165,7 @@ static int re_attach(device_t dev)
                 ifp->if_baudrate = 50000000000;
                 break;
         case RT_DEVICEID_8125:
+        case RT_DEVICEID_3000:
                 ifp->if_baudrate = 25000000000;
                 break;
         case RT_DEVICEID_8169:
@@ -6224,6 +6231,7 @@ static int re_attach(device_t dev)
         ifmedia_add(&sc->media, IFM_ETHER | IFM_100_TX | IFM_FDX, 0, NULL);
         switch(sc->re_device_id) {
         case RT_DEVICEID_8125:
+        case RT_DEVICEID_3000:
         case RT_DEVICEID_8126:
         case RT_DEVICEID_8127:
         case RT_DEVICEID_8169:
@@ -6238,6 +6246,7 @@ static int re_attach(device_t dev)
         }
         switch(sc->re_device_id) {
         case RT_DEVICEID_8125:
+        case RT_DEVICEID_3000:
         case RT_DEVICEID_8126:
         case RT_DEVICEID_8127:
                 ifmedia_add(&sc->media, IFM_ETHER | IFM_2500_T | IFM_FDX, 0, NULL);
@@ -8480,6 +8489,7 @@ re_set_wol_linkspeed(struct re_softc *sc)
                 re_clear_eth_ocp_phy_bit(sc, 0xA5D4, RTK_ADVERTISE_5000FULL);
         /*	FALLTHROUGH */
         case RT_DEVICEID_8125:
+        case RT_DEVICEID_3000:
         case RT_DEVICEID_8162:
                 re_clear_eth_ocp_phy_bit(sc, 0xA5D4, RTK_ADVERTISE_2500FULL);
         /*	FALLTHROUGH */
@@ -8499,6 +8509,7 @@ re_set_wol_linkspeed(struct re_softc *sc)
         case RT_DEVICEID_8127:
         case RT_DEVICEID_8126:
         case RT_DEVICEID_8125:
+        case RT_DEVICEID_3000:
         case RT_DEVICEID_8162:
         case RT_DEVICEID_8169:
         case RT_DEVICEID_8169SC:
@@ -8842,8 +8853,9 @@ static void re_start_locked(struct ifnet *ifp, u_int32_t qid)
                         break;
                 }
 
-                if (sc->re_type == MACFG_80 || sc->re_type == MACFG_81 ||
-                    sc->re_type == MACFG_82 || sc->re_type == MACFG_83) {
+                if ((sc->re_type == MACFG_80 || sc->re_type == MACFG_81 ||
+                    sc->re_type == MACFG_82 || sc->re_type == MACFG_83) &&
+                    sc->re_device_id != RT_DEVICEID_3000) {
                         if (re_8125_pad(sc, m_head) != 0) {
                                 IFQ_DRV_PREPEND(&ifp->if_snd, m_head);
                                 ifp->if_drv_flags |= IFF_DRV_OACTIVE;
