@@ -105,6 +105,9 @@ The link speed and duplexmode can be changed by using following command.
 	8. For 5000Mbps full-duplex,
 		#ifconfig re<device_num> media 5000Base-T mediaopt full-duplex
 
+	9. For 10Gbps full-duplex,
+		#ifconfig re<device_num> media 10Gbase-T mediaopt full-duplex
+
 The checksum offload can be changed by using following command.
 	1.For enable checksum offload
 		# ifconfig re<device_num> rxcsum rxcsum6
