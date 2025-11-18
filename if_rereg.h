@@ -158,6 +158,8 @@
 #define	RE_CMAC_IBCR2     	0x00F9
 #define	RE_CMAC_IBIMR0    	0x00FA
 #define	RE_CMAC_IBISR0   	0x00FB
+#define RE_EPHY_EXT_ADDR	0x0FFE
+#define RE_AVB_CTRL		0x1000
 /* MAC OCP */
 #define RE_EEE_TXIDLE_TIMER_8168 0xE048
 //8125
@@ -189,6 +191,9 @@
 #define	RE_IB2SOC_CMD	0x0018
 #define	RE_IB2SOC_IMR	0x001C
 
+/* AVB */
+#define RE_AVB_MODE_ENABLE BIT_0
+#define RE_DVLAN_MODE_ENABLE BIT_1
 
 /* Direct PHY access registers only available on 8139 */
 #define RE_BMCR		0x0062		/* PHY basic mode control */
@@ -265,6 +270,40 @@
 	RE_ISR_RX_OVERRUN|RE_ISR_PKT_UNDERRUN|RE_ISR_TDU|	\
 	RE_ISR_PCS_TIMEOUT|RE_ISR_SYSTEM_ERR)
 
+#define RE_8125B_ISR_RXQ0_OK	0x00000001
+#define RE_8125B_ISR_TXQ0_OK	0x00010000
+#define RE_8125B_ISR_LINKCHG	0x00200000
+#define RE_INTRS_8125B	\
+	(RE_8125B_ISR_RXQ0_OK|RE_8125B_ISR_TXQ0_OK)
+
+#define RE_8126_ISR_TRXQ0_OK	0x00000001
+#define RE_8126_ISR_LINKCHG	0x00200000
+#define RE_INTRS_8126	\
+	(RE_8126_ISR_TRXQ0_OK)
+
+#define RE_8125BP_ISR_TRXQ0_OK	0x00000001
+#define RE_8125BP_ISR_LINKCHG	0x20000000
+#define RE_INTRS_8125BP	\
+	(RE_8125BP_ISR_TRXQ0_OK)
+
+#define RE_8125CP_ISR_RXQ0_OK	0x00000001
+#define RE_8125CP_ISR_TXQ0_OK	0x08000000
+#define RE_8125CP_ISR_LINKCHG	0x20000000
+#define RE_INTRS_8125CP	\
+	(RE_8125CP_ISR_RXQ0_OK|RE_8125CP_ISR_TXQ0_OK)
+
+#define RE_8125D_ISR_RXQ0_OK	0x00000001
+#define RE_8125D_ISR_TXQ0_OK	0x00010000
+#define RE_8125D_ISR_LINKCHG	0x00040000
+#define RE_INTRS_8125D	\
+	(RE_8125D_ISR_RXQ0_OK|RE_8125D_ISR_TXQ0_OK)
+
+#define RE_8127_ISR_RXQ0_OK	0x00000001
+#define RE_8127_ISR_TXQ0_OK	0x00000100
+#define RE_8127_ISR_LINKCHG	0x20000000
+#define RE_8127_L2_ISR		0x80000000
+#define RE_INTRS_8127	\
+	(RE_8127_ISR_RXQ0_OK|RE_8127_ISR_TXQ0_OK)
 /*
  * Media status register. (8139 only)
  */
@@ -304,6 +343,8 @@
 #define RE_RXBUF_64		0x00001800
 
 #define RE_RXRESVERED		0x0000E000
+
+#define RE_RX_ACPT_VLAN_PF	0x00008000
 
 /*
  * Bits in RX status header (included with RX'ed packet
@@ -418,6 +459,8 @@
  * PHY Status register
  */
 #define RL_PHY_STATUS_500MF 0x80000
+#define RL_PHY_STATUS_10000MF 0x4000
+#define RL_PHY_STATUS_10000MF_LITE 0x2000
 #define RL_PHY_STATUS_5000MF 0x1000
 #define RL_PHY_STATUS_5000MF_LITE 0x800
 #define RL_PHY_STATUS_2500MF 0x400
@@ -772,24 +815,27 @@ union TxDesc {
         } so1;	/* symbol owner=1 */
 };
 
+#define RL_TX_QUEUE_NUM (1)
+#define RL_RX_QUEUE_NUM (1)
+
 struct re_descriptor {
-        u_int32_t		rx_cur_index;
-        union RxDesc 		*rx_desc;	/* 8 bits alignment */
-        struct mbuf		*rx_buf[RE_RX_BUF_NUM];
+        u_int32_t		rx_cur_index[RL_RX_QUEUE_NUM];
+        union RxDesc 		*rx_desc[RL_RX_QUEUE_NUM];	/* 8 bits alignment */
+        struct mbuf		*rx_buf[RL_RX_QUEUE_NUM][RE_RX_BUF_NUM];
 
-        u_int32_t		tx_cur_index;
-        u_int32_t		tx_last_index;
-        union TxDesc		*tx_desc;	/* 8 bits alignment */
-        struct mbuf		*tx_buf[RE_TX_BUF_NUM];
-        bus_dma_tag_t		rx_desc_tag;
-        bus_dmamap_t		rx_desc_dmamap;
-        bus_dma_tag_t		re_rx_mtag;	/* mbuf RX mapping tag */
-        bus_dmamap_t		re_rx_dmamap[RE_RX_BUF_NUM];
+        u_int32_t		tx_cur_index[RL_TX_QUEUE_NUM];
+        u_int32_t		tx_last_index[RL_TX_QUEUE_NUM];
+        union TxDesc		*tx_desc[RL_TX_QUEUE_NUM];	/* 8 bits alignment */
+        struct mbuf		*tx_buf[RL_TX_QUEUE_NUM][RE_TX_BUF_NUM];
+        bus_dma_tag_t		rx_desc_tag[RL_RX_QUEUE_NUM];
+        bus_dmamap_t		rx_desc_dmamap[RL_RX_QUEUE_NUM];
+        bus_dma_tag_t		re_rx_mtag[RL_RX_QUEUE_NUM];	/* mbuf RX mapping tag */
+        bus_dmamap_t		re_rx_dmamap[RL_RX_QUEUE_NUM][RE_RX_BUF_NUM];
 
-        bus_dma_tag_t		tx_desc_tag;
-        bus_dmamap_t		tx_desc_dmamap;
-        bus_dma_tag_t		re_tx_mtag;	/* mbuf TX mapping tag */
-        bus_dmamap_t		re_tx_dmamap[RE_TX_BUF_NUM];
+        bus_dma_tag_t		tx_desc_tag[RL_TX_QUEUE_NUM];
+        bus_dmamap_t		tx_desc_dmamap[RL_TX_QUEUE_NUM];
+        bus_dma_tag_t		re_tx_mtag[RL_TX_QUEUE_NUM];	/* mbuf TX mapping tag */
+        bus_dmamap_t		re_tx_dmamap[RL_TX_QUEUE_NUM][RE_TX_BUF_NUM];
 };
 
 struct re_tally_counter {
@@ -948,10 +994,14 @@ enum {
         MACFG_85,
         MACFG_86,
         MACFG_87,
+        MACFG_88,
 
         MACFG_90 = 90,
         MACFG_91,
         MACFG_92,
+
+        MACFG_100 = 100,
+        MACFG_101,
 
         MACFG_FF = 0xFF
 };
@@ -1073,6 +1123,11 @@ struct re_softc {
 
         u_int8_t HwSuppMacMcuVer;
         u_int16_t MacMcuPageSize;
+        u_int64_t HwMcuPatchCodeVer;
+        u_int64_t BinMcuPatchCodeVer;
+
+        u_int8_t HwSuppIsrVer;
+        u_int8_t use_new_intr_mapping;
 
         struct lro_ctrl		 re_lro;
 
@@ -1121,6 +1176,11 @@ enum bits {
         BIT_29 = (1 << 29),
         BIT_30 = (1 << 30),
         BIT_31 = (1 << 31)
+};
+
+struct re_dma_map_arg {
+        struct re_softc *sc;
+        u_int32_t qid;
 };
 
 #define RE_LOCK(_sc)		mtx_lock(&(_sc)->mtx)
@@ -1178,6 +1238,7 @@ enum bits {
 #define RT_DEVICEID_8136			0x8136		/* For RTL8101E */
 #define RT_DEVICEID_8125			0x8125		/* For RTL8125 */
 #define RT_DEVICEID_8126			0x8126		/* For RTL8126 */
+#define RT_DEVICEID_8127			0x8127		/* For RTL8127 */
 
 /*
  * Accton PCI vendor ID
@@ -1258,14 +1319,24 @@ enum bits {
 
 #define RTK_ADVERTISE_2500FULL  0x80
 #define RTK_ADVERTISE_5000FULL  0x100
+#define RTK_ADVERTISE_10GFULL  0x1000
 
 #define RTL8125_MAC_MCU_PAGE_SIZE 256 //256 words
+
+#define RE_IMR_V2_CLEAR_REG_8125 0x0D00
+#define RE_IMR_V2_SET_REG_8125 0x0D0C
+#define RE_ISR_V2_8125 0x0D04
+#define RE_IMR_V4_L2_CLEAR_REG_8125 0x0D10
+#define RE_IMR_V4_L2_SET_REG_8125 0x0D18
+#define RE_ISR_V4_L2_8125 0x0D14
 
 #define RTL8125_INT_CFG0_ENABLE_8125 (0x0001)
 #define RTL8125_INT_CFG0_TIMEOUT0_BYPASS (0x0002)
 #define RTL8125_INT_CFG0_MITIGATION_BYPASS (0x0004)
 #define RTL8126_INT_CFG0_RDU_BYPASS (0x0010)
 #define RTL8125_INT_CFG0_MSIX_ENTRY_NUM_MODE (0x0020)
+#define RTL8125_INT_CFG0_AUTO_CLR_IMR (0x0020)
+#define RTL8125_INT_CFG0_AVOID_MISS_INTR (0x0040)
 
 //Ram Code Version
 #define NIC_RAMCODE_VERSION_8168E (0x0057)
@@ -1286,11 +1357,14 @@ enum bits {
 #define NIC_RAMCODE_VERSION_8125B_REV_B (0x0B99)
 #define NIC_RAMCODE_VERSION_8125BP_REV_A (0x0013)
 #define NIC_RAMCODE_VERSION_8125BP_REV_B (0x0001)
+#define NIC_RAMCODE_VERSION_8125CP_REV_A (0x0008)
+#define NIC_RAMCODE_VERSION_8125D_REV_A (0x0027)
+#define NIC_RAMCODE_VERSION_8125D_REV_B (0x0031)
 #define NIC_RAMCODE_VERSION_8126A_REV_A (0x0023)
 #define NIC_RAMCODE_VERSION_8126A_REV_B (0x0033)
-#define NIC_RAMCODE_VERSION_8126A_REV_C (0x0051)
-#define NIC_RAMCODE_VERSION_8125D_REV_A (0x0016)
-#define NIC_RAMCODE_VERSION_8125D_REV_B (0x0001)
+#define NIC_RAMCODE_VERSION_8126A_REV_C (0x0060)
+#define NIC_RAMCODE_VERSION_8127 (0x0015)
+#define NIC_RAMCODE_VERSION_8127_REV_A (0x0015)
 
 #ifdef __alpha__
 #undef vtophys

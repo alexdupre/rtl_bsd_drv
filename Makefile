@@ -4,7 +4,7 @@ enable_fiber_support = n
 enable_s5wol = n
 enable_eee = n
 enable_s0_magic_packet = n
-config_soc_lan = n
+config_soc_lan = y
 interrupt_mitigation = y
 
 .PATH:	${.CURDIR}/../../dev/re
