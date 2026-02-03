@@ -108,6 +108,10 @@ __FBSDID("$FreeBSD: src/sys/dev/re/if_re.c,v " RE_VERSION __DATE__ " " __TIME__ 
 #include <net/if_vlan_var.h>
 #endif
 
+#if OS_VER >= VERSION(15,0)
+#include <net/if_private.h>
+#endif
+
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
