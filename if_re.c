@@ -7341,8 +7341,8 @@ static int re_attach(device_t dev)
                 ifp->if_baudrate = 100000000;
                 break;
         }
-        IFQ_SET_MAXLEN(&ifp->if_snd, IFQ_MAXLEN);
-        ifp->if_snd.ifq_drv_maxlen = IFQ_MAXLEN;
+        IFQ_SET_MAXLEN(&ifp->if_snd, RE_TX_BUF_NUM - 1);
+        ifp->if_snd.ifq_drv_maxlen = RE_TX_BUF_NUM - 1;
         IFQ_SET_READY(&ifp->if_snd);
 
         error = re_config_soft_lro(sc);
