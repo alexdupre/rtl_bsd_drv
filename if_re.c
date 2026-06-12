@@ -7441,14 +7441,8 @@ static int re_attach(device_t dev)
 #endif
 
 fail_intr:
-        if (error) {
+        if (error)
                 device_printf(dev, "couldn't set up interrupt handler\n");
-#if OS_VER < VERSION(4,9)
-                ether_ifdetach(ifp, ETHER_BPF_SUPPORTED);
-#else
-                ether_ifdetach(ifp);
-#endif
-        }
 
 fail:
         if (error)
