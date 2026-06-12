@@ -383,6 +383,9 @@ static int interrupt_mitigation = 0;
 #endif
 SYSCTL_INT(_hw_re, OID_AUTO, interrupt_mitigation, CTLFLAG_RDTUN,
     &interrupt_mitigation, 0, "");
+static int max_rx_mbuf_sz = MJUM16BYTES;
+SYSCTL_INT(_hw_re, OID_AUTO, max_rx_mbuf_sz, CTLFLAG_RDTUN,
+    &max_rx_mbuf_sz, 0, "");
 
 static int default_tx_qid = 0;
 
@@ -4934,9 +4937,14 @@ static void re_init_software_variable(struct re_softc *sc)
                 }
         }
 
-        if (sc->re_rx_mbuf_sz > MJUM16BYTES) {
-                sc->max_jumbo_frame_size -= (sc->re_rx_mbuf_sz - MJUM16BYTES);
-                sc->re_rx_mbuf_sz = MJUM16BYTES;
+        if (max_rx_mbuf_sz > MJUM16BYTES)
+                max_rx_mbuf_sz = MJUM16BYTES;
+        else if (max_rx_mbuf_sz < MCLBYTES)
+                max_rx_mbuf_sz = MCLBYTES;
+
+        if (sc->re_rx_mbuf_sz > max_rx_mbuf_sz) {
+                sc->max_jumbo_frame_size -= (sc->re_rx_mbuf_sz - max_rx_mbuf_sz);
+                sc->re_rx_mbuf_sz = max_rx_mbuf_sz;
         }
 
         switch(sc->re_type) {
