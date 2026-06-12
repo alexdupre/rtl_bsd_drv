@@ -10281,6 +10281,9 @@ static void re_start_locked(struct ifnet *ifp, u_int32_t qid)
         if ((sc->driver_detach == 1) || (sc->rx_fifo_overflow != 0))
                 return;
 
+        if ((ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
+                return;
+
         tx_cur_index = sc->re_desc.tx_cur_index[qid];
         for (queued = 0; !IFQ_DRV_IS_EMPTY(&ifp->if_snd);) {
                 int fs = 1, ls = 0;
