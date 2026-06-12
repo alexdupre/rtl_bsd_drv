@@ -7484,6 +7484,8 @@ static int re_detach(device_t dev)
 #endif
         }
 
+        ifmedia_removeall(&sc->media);
+
         if (HW_DASH_SUPPORT_DASH(sc) && sc->re_res) {
                 RE_LOCK(sc);
                 re_driver_stop(sc);
