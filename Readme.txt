@@ -2,7 +2,7 @@
 =  Realtek 8169S/8169SB/8169SC/8168B/8168C/8168CP/8168D/8168DP/8168E/8168F      =
 =  8168FB/8168G/818GU/8168H/8168EP/8411/8168FP                                  =
 =  8101E/8102E/8103E/8401/8105E/8106E/8402                                      =
-=  8125/8126 Driver                                                             =
+=  8125/8126/8127 Driver                                                        =
 =  for FreeBSD v4.x/5.x/6.x/7.x/8.x/9.x/10.x/11.x/12.x/13.x/14.x                =
 =================================================================================
 
@@ -136,6 +136,10 @@ Dump mac io.
 	# sysctl dev.re.<interface_num>.registers=1
 	# dmesg
 
+Dump mac mcu bp.
+	# sysctl dev.re.<interface_num>.mac_mcu_bp=1
+	# dmesg
+
 Dump pcie phy.
 	# sysctl dev.re.<interface_num>.pcie_phy=1
 	# dmesg
@@ -163,4 +167,16 @@ Dump msix table.
 
 Dump driver variables.
 	# sysctl dev.re.<interface_num>.driver_var=1
+	# dmesg
+
+Dump eee status.
+	# sysctl dev.re.<interface_num>.eee=1
+	# dmesg
+
+Dump MAC MCU BPs.
+	# sysctl dev.re.<interface_num>.mac_mcu_bp=1
+	# dmesg
+
+Dump parity error.
+	# sysctl dev.re.<interface_num>.parity_err=1
 	# dmesg

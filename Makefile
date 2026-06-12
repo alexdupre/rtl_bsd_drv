@@ -4,6 +4,7 @@ enable_fiber_support = n
 enable_s5wol = n
 enable_eee = n
 enable_s0_magic_packet = n
+enable_aspm = n
 config_soc_lan = y
 interrupt_mitigation = y
 
@@ -26,6 +27,10 @@ CFLAGS	+= -DENABLE_EEE
 
 .if $(enable_s0_magic_packet) == y
 CFLAGS	+= -DENABLE_S0_MAGIC_PACKET
+.endif
+
+.if $(enable_aspm) == y
+CFLAGS	+= -DENABLE_ASPM
 .endif
 
 .if $(config_soc_lan) == y

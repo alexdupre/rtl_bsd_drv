@@ -160,6 +160,9 @@
 #define	RE_CMAC_IBISR0   	0x00FB
 #define RE_EPHY_EXT_ADDR	0x0FFE
 #define RE_AVB_CTRL		0x1000
+#define RE_RADMFIFO_PROT	0x0402
+#define RE_USE_OLD_RADMFIFO_PROTECT 0x0404
+#define RE_TXCFG_V2	0x60B0		/* transmit config v2 */
 /* MAC OCP */
 #define RE_EEE_TXIDLE_TIMER_8168 0xE048
 //8125
@@ -585,6 +588,7 @@ struct re_stats {
 #define RE_NTXSEGS		35
 #define RE_TX_MAXSIZE_32K (32 * 1024)
 #define RE_TX_MAXSIZE_64K (64 * 1024)
+#define RE_LSO_OFFLOAD_64K 64000
 #define RE_RX_BUDGET (64)
 
 #define RE_TXCFG_CONFIG		0x03000780 //(RE_TXCFG_IFG|RE_TX_MAXDMA)
@@ -607,6 +611,7 @@ struct re_stats {
 #define Jumbo_Frame_7k	((7 * 1024) - ETHER_VLAN_ENCAP_LEN - ETHER_HDR_LEN - ETHER_CRC_LEN)
 #define Jumbo_Frame_8k	((8 * 1024) - ETHER_VLAN_ENCAP_LEN - ETHER_HDR_LEN - ETHER_CRC_LEN)
 #define Jumbo_Frame_9k	((9 * 1024) - ETHER_VLAN_ENCAP_LEN - ETHER_HDR_LEN - ETHER_CRC_LEN)
+#define Jumbo_Frame_16k	((16 * 1024) - ETHER_VLAN_ENCAP_LEN - ETHER_HDR_LEN - ETHER_CRC_LEN)
 struct re_chain_data {
         u_int32_t		cur_rx;
         caddr_t			re_rx_buf;
@@ -618,7 +623,10 @@ struct re_chain_data {
 };
 
 #define HW_SUPPORT_MAC_MCU(_M)        ((_M)->HwSuppMacMcuVer > 0)
+#define HW_SUPPORT_MAC_MCU_BP_EN(_M)        ((_M)->HwSuppMacMcuBpEnVer > 0)
 #define HW_SUPPORT_OCP_CHANNEL(_M)    ((_M)->HwSuppOcpChannelVer > 0)
+#define HW_SUPPORT_OBFF_LTR(_M)        ((_M)->HwSuppObffLtrVer > 0)
+#define HW_SUPPORT_L1_OFF(_M)        ((_M)->HwSuppL1OffVer > 0)
 
 //+++ From FreeBSD 9.0 +++
 
@@ -995,6 +1003,7 @@ enum {
         MACFG_86,
         MACFG_87,
         MACFG_88,
+        MACFG_89,
 
         MACFG_90 = 90,
         MACFG_91,
@@ -1002,6 +1011,8 @@ enum {
 
         MACFG_100 = 100,
         MACFG_101,
+
+        MACFG_120 = 120,
 
         MACFG_FF = 0xFF
 };
@@ -1079,6 +1090,10 @@ struct re_softc {
 
         u_int8_t RequirePhyMdiSwapPatch;
 
+        u_int8_t RequireEEEPlus10MPatch;
+
+        bool recheck_desc_ownbit;
+
         u_int8_t  re_efuse_ver;
 
         u_int16_t re_sw_ram_code_ver;
@@ -1101,8 +1116,17 @@ struct re_softc {
 
         u_int8_t	re_hw_supp_now_is_oob_ver;
 
-        u_int8_t 	hw_hw_supp_serdes_phy_ver;
+        u_int8_t 	hw_supp_serdes_phy_ver;
         u_int8_t	HwSuppOcpChannelVer;
+
+        u_int8_t HwSuppObffLtrVer;
+        u_int8_t backup_obff_ltr_cap;
+        bool ltr_en;
+
+        u_int8_t HwSuppL1OffVer;
+        u_int8_t backup_l1_off_cap;
+        u_int16_t l1_off_reg_offset;
+        bool l1_off_en;
 
         u_int8_t HwSuppDashVer;
         u_int8_t	re_dash;
@@ -1122,14 +1146,19 @@ struct re_softc {
         u_int8_t HwSuppExtendTallyCounterVer;
 
         u_int8_t HwSuppMacMcuVer;
+        u_int8_t HwSuppMacMcuBpEnVer;
         u_int16_t MacMcuPageSize;
         u_int64_t HwMcuPatchCodeVer;
         u_int64_t BinMcuPatchCodeVer;
+        u_int16_t HwMcuPatchCodeBpEn;
+        u_int16_t SwMcuPatchCodeBpEn;
 
         u_int8_t HwSuppIsrVer;
         u_int8_t use_new_intr_mapping;
 
         struct lro_ctrl		 re_lro;
+
+        u_int32_t re_tso_flags;
 
         int (*ifmedia_upd)(struct ifnet *);
         void (*ifmedia_sts)(struct ifnet *, struct ifmediareq *);
@@ -1141,6 +1170,7 @@ struct re_softc {
         void (*int_task)(void *, int);
         void (*int_task_poll)(void *, int);
         void (*hw_start_unlock)(struct re_softc *);
+        void (*hw_common)(struct re_softc *);
 };
 
 enum bits {
@@ -1357,14 +1387,15 @@ struct re_dma_map_arg {
 #define NIC_RAMCODE_VERSION_8125B_REV_B (0x0B99)
 #define NIC_RAMCODE_VERSION_8125BP_REV_A (0x0013)
 #define NIC_RAMCODE_VERSION_8125BP_REV_B (0x0001)
-#define NIC_RAMCODE_VERSION_8125CP_REV_A (0x0008)
+#define NIC_RAMCODE_VERSION_8125CP_REV_A (0x0024)
 #define NIC_RAMCODE_VERSION_8125D_REV_A (0x0027)
-#define NIC_RAMCODE_VERSION_8125D_REV_B (0x0031)
+#define NIC_RAMCODE_VERSION_8125D_REV_B (0x0034)
+#define NIC_RAMCODE_VERSION_9151A_REV_A (0x0003)
 #define NIC_RAMCODE_VERSION_8126A_REV_A (0x0023)
 #define NIC_RAMCODE_VERSION_8126A_REV_B (0x0033)
 #define NIC_RAMCODE_VERSION_8126A_REV_C (0x0060)
 #define NIC_RAMCODE_VERSION_8127 (0x0015)
-#define NIC_RAMCODE_VERSION_8127_REV_A (0x0015)
+#define NIC_RAMCODE_VERSION_8127_REV_A (0x0051)
 
 #ifdef __alpha__
 #undef vtophys
@@ -1400,7 +1431,7 @@ struct re_dma_map_arg {
                                                   HW_DASH_SUPPORT_TYPE_3(_M) || \
                                                   HW_DASH_SUPPORT_TYPE_4(_M))
 
-#define HW_SUPP_SERDES_PHY(_M)        ((_M)->hw_hw_supp_serdes_phy_ver > 0)
+#define HW_SUPP_SERDES_PHY(_M)        ((_M)->hw_supp_serdes_phy_ver > 0)
 #define HW_HAS_WRITE_PHY_MCU_RAM_CODE(_M)        ((_M)->re_hw_ram_code_ver == (_M)->re_sw_ram_code_ver)
 
 /*#define RE_DBG*/
