@@ -1188,7 +1188,7 @@ static void re_release_rx_buf(struct re_softc *sc)
         for (int j = 0; j < RL_RX_QUEUE_NUM; j++) {
                 if (sc->re_desc.re_rx_mtag[j]) {
                         for (i = 0; i < RE_RX_BUF_NUM; i++) {
-                                if (sc->re_desc.rx_buf[j][i]!=NULL) {
+                                if (sc->re_desc.re_rx_dmamap[j][i]) {
                                         bus_dmamap_sync(sc->re_desc.re_rx_mtag[j],
                                                         sc->re_desc.re_rx_dmamap[j][i],
                                                         BUS_DMASYNC_POSTREAD);
@@ -1196,6 +1196,9 @@ static void re_release_rx_buf(struct re_softc *sc)
                                                           sc->re_desc.re_rx_dmamap[j][i]);
                                         bus_dmamap_destroy(sc->re_desc.re_rx_mtag[j],
                                                            sc->re_desc.re_rx_dmamap[j][i]);
+                                        sc->re_desc.re_rx_dmamap[j][i] = NULL;
+                                }
+                                if (sc->re_desc.rx_buf[j][i]!=NULL) {
                                         m_freem(sc->re_desc.rx_buf[j][i]);
                                         sc->re_desc.rx_buf[j][i] =NULL;
                                 }
@@ -1214,9 +1217,13 @@ static void re_release_tx_buf(struct re_softc *sc)
         for (int j = 0; j < RL_TX_QUEUE_NUM; j++) {
                 if (sc->re_desc.re_tx_mtag[j]) {
                         for (i = 0; i < RE_TX_BUF_NUM; i++) {
-                                bus_dmamap_destroy(sc->re_desc.re_tx_mtag[j],
-                                                   sc->re_desc.re_tx_dmamap[j][i]);
+                                if (sc->re_desc.re_tx_dmamap[j][i]) {
+                                        bus_dmamap_destroy(sc->re_desc.re_tx_mtag[j],
+                                                           sc->re_desc.re_tx_dmamap[j][i]);
+                                        sc->re_desc.re_tx_dmamap[j][i] = NULL;
+                                }
                                 m_freem(sc->re_desc.tx_buf[j][i]);
+                                sc->re_desc.tx_buf[j][i] = NULL;
                         }
                         bus_dma_tag_destroy(sc->re_desc.re_tx_mtag[j]);
                         sc->re_desc.re_tx_mtag[j] = 0;
@@ -7457,7 +7464,6 @@ static int re_detach(device_t dev)
         struct re_softc		*sc;
         struct ifnet		*ifp;
         /*int			s;*/
-        int			i;
         int			rid;
 
         /*s = splimp();*/
@@ -7528,36 +7534,7 @@ static int re_detach(device_t dev)
         if (HW_DASH_SUPPORT_TYPE_3(sc) && sc->re_dash)
                 bus_space_unmap(sc->re_cmac_tag, sc->re_mapped_cmac_handle, RE_REGS_SIZE);
 
-        for (int j = 0; j < RL_RX_QUEUE_NUM; j++) {
-                if (sc->re_desc.re_rx_mtag[j]) {
-                        for (i = 0; i < RE_RX_BUF_NUM; i++) {
-                                if (sc->re_desc.rx_buf[j][i]!=NULL) {
-                                        bus_dmamap_sync(sc->re_desc.re_rx_mtag[j],
-                                                        sc->re_desc.re_rx_dmamap[j][i],
-                                                        BUS_DMASYNC_POSTREAD);
-                                        bus_dmamap_unload(sc->re_desc.re_rx_mtag[j],
-                                                          sc->re_desc.re_rx_dmamap[j][i]);
-                                        bus_dmamap_destroy(sc->re_desc.re_rx_mtag[j],
-                                                           sc->re_desc.re_rx_dmamap[j][i]);
-                                        m_freem(sc->re_desc.rx_buf[j][i]);
-                                        sc->re_desc.rx_buf[j][i] =NULL;
-                                }
-                        }
-                        bus_dma_tag_destroy(sc->re_desc.re_rx_mtag[j]);
-                        sc->re_desc.re_rx_mtag[j] =0;
-                }
-        }
-
-        for (int j = 0; j < RL_TX_QUEUE_NUM; j++) {
-                if (sc->re_desc.re_tx_mtag[j]) {
-                        for (int i = 0; i < RE_TX_BUF_NUM; i++) {
-                                bus_dmamap_destroy(sc->re_desc.re_tx_mtag[j],
-                                                   sc->re_desc.re_tx_dmamap[j][i]);
-                        }
-                        bus_dma_tag_destroy(sc->re_desc.re_tx_mtag[j]);
-                        sc->re_desc.re_tx_mtag[j] =0;
-                }
-        }
+        re_release_buf(sc);
 
         for (int i = 0; i < RL_RX_QUEUE_NUM; i++) {
                 if (sc->re_desc.rx_desc_tag[i]) {
@@ -9201,6 +9178,10 @@ static void re_init_unlock(void *xsc)  	/* Software & Hardware Initialize */
         } eaddr;
 
         ifp = RE_GET_IFNET(sc);
+
+        /* Refuse to start without rx buffers (failed MTU change). */
+        if (sc->re_desc.rx_buf[0][0] == NULL)
+                return;
 
         /*
          * Cancel pending I/O and free all RX/TX buffers.
@@ -11559,6 +11540,8 @@ static int re_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
         /*int			s;*/
         int			error = 0;
         int mask, reinit;
+        u_long old_mtu;
+        int was_running;
         /*s = splimp();*/
 
         switch(command) {
@@ -11576,29 +11559,32 @@ static int re_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
                 }
                 RE_LOCK(sc);
                 if (ifp->if_mtu != ifr->ifr_mtu) {
+                        old_mtu = ifp->if_mtu;
+                        was_running = ifp->if_drv_flags & IFF_DRV_RUNNING;
+
                         ifp->if_mtu = ifr->ifr_mtu;
-                        //if running
-                        if (ifp->if_drv_flags & IFF_DRV_RUNNING) {
-                                //printf("set mtu when running\n");
+
+                        if (was_running)
                                 re_stop(sc);
 
+                        re_release_buf(sc);
+                        set_rxbufsize(sc);
+                        error = re_alloc_buf(sc);
+                        if (error) {
+                                /* Roll back to the previous MTU. */
                                 re_release_buf(sc);
+                                ifp->if_mtu = old_mtu;
                                 set_rxbufsize(sc);
-                                error = re_alloc_buf(sc);
+                                if (re_alloc_buf(sc) != 0)
+                                        /* No buffers at all, stay down. */
+                                        was_running = 0;
+                        }
 
-                                if (error == 0) {
-                                        re_init_locked(sc);
-                                }
-                        } else {
-                                //if not running
-                                re_release_buf(sc);
-                                set_rxbufsize(sc);
-                                error = re_alloc_buf(sc);
-                                if (error == 0) {
-                                        /* Init descriptors. */
-                                        re_var_init(sc);
-                                }
-
+                        if (was_running) {
+                                re_init_locked(sc);
+                        } else if (sc->re_desc.rx_buf[0][0] != NULL) {
+                                /* Init descriptors. */
+                                re_var_init(sc);
                         }
 
                         if (ifp->if_mtu > ETHERMTU) {
