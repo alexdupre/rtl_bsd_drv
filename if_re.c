@@ -358,8 +358,8 @@ SYSCTL_INT(_hw_re, OID_AUTO, phy_mdix_mode, CTLFLAG_RDTUN, &phy_mdix_mode,
 static int s5wol = 1;
 #else
 static int s5wol = 0;
-SYSCTL_INT(_hw_re, OID_AUTO, s5wol, CTLFLAG_RDTUN, &s5wol, 0, "");
 #endif
+SYSCTL_INT(_hw_re, OID_AUTO, s5wol, CTLFLAG_RDTUN, &s5wol, 0, "");
 #ifdef ENABLE_S0_MAGIC_PACKET
 static int s0_magic_packet = 1;
 #else
