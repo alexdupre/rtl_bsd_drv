@@ -6933,6 +6933,7 @@ static int re_attach(device_t dev)
         unit = device_get_unit(dev);
         bzero(sc, sizeof(struct re_softc));
         RE_LOCK_INIT(sc,device_get_nameunit(dev));
+        re_init_timer(sc);
         sc->dev = dev;
 
         sc->driver_detach = 0;
@@ -7106,8 +7107,6 @@ static int re_attach(device_t dev)
                         device_printf(dev, "no ASPM capability\n");
         }
 #endif //OS_VER >= VERSION(7,3)
-
-        re_init_timer(sc);
 
         sc->re_unit = unit;
 
