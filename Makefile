@@ -5,7 +5,7 @@ enable_s5wol = n
 enable_eee = n
 enable_s0_magic_packet = n
 enable_aspm = n
-config_soc_lan = y
+config_soc_lan = n
 interrupt_mitigation = y
 
 .PATH:	${.CURDIR}/../../dev/re
