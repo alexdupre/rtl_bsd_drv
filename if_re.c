@@ -5099,7 +5099,7 @@ static void re_init_software_variable(struct re_softc *sc)
                                 if (CmacMemPhysAddress & BIT_2)
                                         CmacMemPhysAddress |=  (u_int64_t)re_csi_other_fun_read(sc, 0, 0xf01c) << 32;
 
-                                CmacMemPhysAddress &=  0xFFFFFFF0;
+                                CmacMemPhysAddress &=  ~(u_int64_t)0xF;
                                 /* ioremap MMIO region */
                                 sc->re_mapped_cmac_tag = X86_BUS_SPACE_MEM;
                                 if (bus_space_map(sc->re_mapped_cmac_tag, CmacMemPhysAddress, RE_REGS_SIZE, 0,
