@@ -7395,7 +7395,10 @@ static int re_attach(device_t dev)
                 sc->media.ifm_media = IFM_ETHER | IFM_AUTO;
         }
 
-#if OS_VER>=VERSION(7,0)
+#if OS_VER >= VERSION(13,0)
+        NET_TASK_INIT(&sc->re_inttask, 0, sc->int_task, sc);
+        NET_TASK_INIT(&sc->re_inttask_poll, 0, sc->int_task_poll, sc);
+#elif OS_VER>=VERSION(7,0)
         TASK_INIT(&sc->re_inttask, 0, sc->int_task, sc);
         TASK_INIT(&sc->re_inttask_poll, 0, sc->int_task_poll, sc);
 #endif
