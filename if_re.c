@@ -6087,10 +6087,10 @@ re_sysctl_driver_variable(SYSCTL_HANDLER_ARGS)
                 printf("HwSuppMacMcuVer\t%d\n", sc->HwSuppMacMcuVer);
                 printf("MacMcuPageSize\t%d\n", sc->MacMcuPageSize);
                 for (int i = 0; i < RL_RX_QUEUE_NUM; i++)
-                        printf("rx_desc_tag maxsize%d\t%ld\n", i, sc->re_desc.rx_desc_tag[i]->common.maxsize);
+                        printf("rx_desc_tag maxsize%d\t%zd\n", i, sc->re_desc.rx_desc_tag[i]->common.maxsize);
                 for (int i = 0; i < RL_TX_QUEUE_NUM; i++)
-                        printf("tx_desc_tag maxsize%d\t%ld\n", i, sc->re_desc.tx_desc_tag[i]->common.maxsize);
-                printf("re_tally maxsize\t%ld\n", sc->re_tally.re_stag->common.maxsize);
+                        printf("tx_desc_tag maxsize%d\t%zd\n", i, sc->re_desc.tx_desc_tag[i]->common.maxsize);
+                printf("re_tally maxsize\t%zd\n", sc->re_tally.re_stag->common.maxsize);
                 printf("random_mac\t%d\n", sc->random_mac);
                 printf("org_mac_addr\t%6D\n", sc->org_mac_addr, ":");
 #if OS_VER < VERSION(6,0)
