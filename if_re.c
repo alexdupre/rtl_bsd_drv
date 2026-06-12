@@ -7122,7 +7122,10 @@ static int re_attach(device_t dev)
                         bus_get_dma_tag(dev),		/* parent */
 #endif
                         1, 0,		/* alignment, boundary */
-                        BUS_SPACE_MAXADDR,		/* lowaddr */
+                        /* 64-bit DMA is broken on the old PCI chips */
+                        (sc->re_if_flags & RL_FLAG_PCIE) ?
+                        BUS_SPACE_MAXADDR :
+                        BUS_SPACE_MAXADDR_32BIT,	/* lowaddr */
                         BUS_SPACE_MAXADDR,		/* highaddr */
                         NULL, NULL,			/* filter, filterarg */
                         BUS_SPACE_MAXSIZE_32BIT,	/* maxsize */
@@ -7131,6 +7134,8 @@ static int re_attach(device_t dev)
                         0,				/* flags */
                         NULL, NULL,			/* lockfunc, lockarg */
                         &sc->re_parent_tag);
+        if (error)
+                goto fail;
 
         rx_list_size = sizeof(union RxDesc) * (RE_RX_BUF_NUM + 1);
         for (int i = 0; i < RL_RX_QUEUE_NUM; i++) {
