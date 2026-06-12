@@ -7403,6 +7403,18 @@ static int re_attach(device_t dev)
         TASK_INIT(&sc->re_inttask_poll, 0, sc->int_task_poll, sc);
 #endif
 
+#if OS_VER>=VERSION(7,0)
+        sc->re_tq = taskqueue_create_fast("re_taskq", M_WAITOK,
+                                          taskqueue_thread_enqueue, &sc->re_tq);
+        if (sc->re_tq == NULL) {
+                error = ENOMEM;
+                goto fail_intr;
+        }
+        error = taskqueue_start_threads(&sc->re_tq, 1, PI_NET, "%s taskq",
+                                        device_get_nameunit(dev));
+        if (error) goto fail_intr;
+#endif
+
 #if OS_VER < VERSION(7,0)
         error = bus_setup_intr(dev, sc->re_irq, INTR_TYPE_NET,
                                sc->intr, sc, &sc->re_intrhand);
@@ -7411,15 +7423,7 @@ static int re_attach(device_t dev)
                                sc->intr, NULL, sc, &sc->re_intrhand);
 #endif
 
-        if (error) {
-#if OS_VER < VERSION(4,9)
-                ether_ifdetach(ifp, ETHER_BPF_SUPPORTED);
-#else
-                ether_ifdetach(ifp);
-#endif
-                device_printf(dev,"couldn't set up irq\n");
-                goto fail;
-        }
+        if (error) goto fail_intr;
 
         RE_LOCK(sc);
         re_setup_msix_tbl(sc);
@@ -7435,6 +7439,16 @@ static int re_attach(device_t dev)
 #else
         ether_ifattach(ifp, eaddr);
 #endif
+
+fail_intr:
+        if (error) {
+                device_printf(dev, "couldn't set up interrupt handler\n");
+#if OS_VER < VERSION(4,9)
+                ether_ifdetach(ifp, ETHER_BPF_SUPPORTED);
+#else
+                ether_ifdetach(ifp);
+#endif
+        }
 
 fail:
         if (error)
@@ -7464,10 +7478,6 @@ static int re_detach(device_t dev)
                 RE_LOCK(sc);
                 re_stop(sc);
                 RE_UNLOCK(sc);
-#if OS_VER>=VERSION(7,0)
-                taskqueue_drain(taskqueue_fast, &sc->re_inttask);
-                taskqueue_drain(taskqueue_fast, &sc->re_inttask_poll);
-#endif
 #if OS_VER < VERSION(4,9)
                 ether_ifdetach(ifp, ETHER_BPF_SUPPORTED);
 #else
@@ -7480,6 +7490,14 @@ static int re_detach(device_t dev)
                 re_driver_stop(sc);
                 RE_UNLOCK(sc);
         }
+
+#if OS_VER>=VERSION(7,0)
+        if (sc->re_tq) {
+                taskqueue_drain(sc->re_tq, &sc->re_inttask);
+                taskqueue_drain(sc->re_tq, &sc->re_inttask_poll);
+                taskqueue_free(sc->re_tq);
+        }
+#endif
 
         bus_generic_detach(dev);
 
@@ -11053,9 +11071,9 @@ static int re_intr(void *arg)  	/* Interrupt Handler */
         re_int_task(arg, 0);
 #else //OS_VER < VERSION(7,0)
 #if OS_VER < VERSION(11,0)
-        taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask);
+        taskqueue_enqueue_fast(sc->re_tq, &sc->re_inttask);
 #else ////OS_VER < VERSION(11,0)
-        taskqueue_enqueue(taskqueue_fast, &sc->re_inttask);
+        taskqueue_enqueue(sc->re_tq, &sc->re_inttask);
 #endif //OS_VER < VERSION(11,0)
         return (FILTER_HANDLED);
 #endif //OS_VER < VERSION(7,0)
@@ -11088,9 +11106,9 @@ static int re_intr_8125(void *arg)  	/* Interrupt Handler */
         re_int_task_8125(arg, 0);
 #else //OS_VER < VERSION(7,0)
 #if OS_VER < VERSION(11,0)
-        taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask);
+        taskqueue_enqueue_fast(sc->re_tq, &sc->re_inttask);
 #else ////OS_VER < VERSION(11,0)
-        taskqueue_enqueue(taskqueue_fast, &sc->re_inttask);
+        taskqueue_enqueue(sc->re_tq, &sc->re_inttask);
 #endif //OS_VER < VERSION(11,0)
         return (FILTER_HANDLED);
 #endif //OS_VER < VERSION(7,0)
@@ -11139,9 +11157,9 @@ static void re_int_task_poll(void *arg, int npending)
 #if OS_VER>=VERSION(7,0)
         if (!re_intr) {
 #if OS_VER < VERSION(11,0)
-                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask_poll);
+                taskqueue_enqueue_fast(sc->re_tq, &sc->re_inttask_poll);
 #else ////OS_VER < VERSION(11,0)
-                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask_poll);
+                taskqueue_enqueue(sc->re_tq, &sc->re_inttask_poll);
 #endif //OS_VER < VERSION(11,0)
                 return;
         }
@@ -11228,9 +11246,9 @@ static void re_int_task(void *arg, int npending)
 #if OS_VER>=VERSION(7,0)
         if (!re_intr) {
 #if OS_VER < VERSION(11,0)
-                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask_poll);
+                taskqueue_enqueue_fast(sc->re_tq, &sc->re_inttask_poll);
 #else ////OS_VER < VERSION(11,0)
-                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask_poll);
+                taskqueue_enqueue(sc->re_tq, &sc->re_inttask_poll);
 #endif //OS_VER < VERSION(11,0)
                 return;
         }
@@ -11283,9 +11301,9 @@ static void re_int_task_8125_poll(void *arg, int npending)
 #if OS_VER>=VERSION(7,0)
         if (!re_intr) {
 #if OS_VER < VERSION(11,0)
-                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask_poll);
+                taskqueue_enqueue_fast(sc->re_tq, &sc->re_inttask_poll);
 #else ////OS_VER < VERSION(11,0)
-                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask_poll);
+                taskqueue_enqueue(sc->re_tq, &sc->re_inttask_poll);
 #endif //OS_VER < VERSION(11,0)
                 return;
         }
@@ -11351,9 +11369,9 @@ static void re_int_task_8125(void *arg, int npending)
 #if OS_VER>=VERSION(7,0)
         if (!re_intr) {
 #if OS_VER < VERSION(11,0)
-                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask_poll);
+                taskqueue_enqueue_fast(sc->re_tq, &sc->re_inttask_poll);
 #else ////OS_VER < VERSION(11,0)
-                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask_poll);
+                taskqueue_enqueue(sc->re_tq, &sc->re_inttask_poll);
 #endif //OS_VER < VERSION(11,0)
                 return;
         }
