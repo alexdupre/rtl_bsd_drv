@@ -590,7 +590,7 @@ struct re_stats {
 #define RE_TX_MAXSIZE_32K (32 * 1024)
 #define RE_TX_MAXSIZE_64K (64 * 1024)
 #define RE_LSO_OFFLOAD_64K 64000
-#define RE_RX_BUDGET (64)
+#define RE_RX_BUDGET (256)
 
 #define RE_TXCFG_CONFIG		0x03000780 //(RE_TXCFG_IFG|RE_TX_MAXDMA)
 
