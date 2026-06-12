@@ -8186,6 +8186,10 @@ static int re_shutdown(device_t dev)	/* The same with re_stop(sc) */
                 re_driver_stop(sc);
         RE_UNLOCK(sc);
 
+        /* PME from soft-off may require the chip to be in D3. */
+        if (s5wol != 0)
+                pci_set_powerstate(dev, PCI_POWERSTATE_D3);
+
         return 0;
 }
 
