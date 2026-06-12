@@ -19,6 +19,10 @@ to decrease the rx mbuf size.
 The second issue is that multiple `re` devices share the same task queue for
 processing interrupts. This patched driver creates a new task queue per device.
 
+This fork also adds the `hw.re.flow_control` tunable to control the 802.3x flow
+control advertisement (enabled by default): setting it to 0 stops 802.3x flow
+negotiating, honoring and sending pause frames.
+
 The link speed and duplexmode can be changed by using following command.
 	1. For auto negotiation,
 		#ifconfig re<device_num> media autoselect

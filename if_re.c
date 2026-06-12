@@ -391,6 +391,9 @@ SYSCTL_INT(_hw_re, OID_AUTO, interrupt_mitigation, CTLFLAG_RDTUN,
 static int max_rx_mbuf_sz = MJUM16BYTES;
 SYSCTL_INT(_hw_re, OID_AUTO, max_rx_mbuf_sz, CTLFLAG_RDTUN,
     &max_rx_mbuf_sz, 0, "");
+static int flow_control = 1;
+SYSCTL_INT(_hw_re, OID_AUTO, flow_control, CTLFLAG_RDTUN,
+    &flow_control, 0, "");
 
 static int default_tx_qid = 0;
 
@@ -12071,7 +12074,8 @@ static int re_ifmedia_upd(struct ifnet *ifp)
                 return(0);
         }
 
-        anar |= ANAR_FC | ANAR_PAUSE_ASYM;
+        if (flow_control)
+                anar |= ANAR_FC | ANAR_PAUSE_ASYM;
 
         if (sc->re_device_id==RT_DEVICEID_8162)
                 re_clear_eth_ocp_phy_bit(sc, 0xA5D4, RTK_ADVERTISE_2500FULL);
@@ -12174,7 +12178,8 @@ static int re_ifmedia_upd_8125(struct ifnet *ifp)
                 return(0);
         }
 
-        anar |= ANAR_FC | ANAR_PAUSE_ASYM;
+        if (flow_control)
+                anar |= ANAR_FC | ANAR_PAUSE_ASYM;
 
         re_mdio_write(sc, 0x1F, 0x0000);
         re_real_ocp_phy_write(sc, 0xA5D4, cr2500);
