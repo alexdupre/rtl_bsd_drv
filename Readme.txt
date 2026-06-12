@@ -19,9 +19,22 @@ to decrease the rx mbuf size.
 The second issue is that multiple `re` devices share the same task queue for
 processing interrupts. This patched driver creates a new task queue per device.
 
+The third issue is that the RTL8125A/B could hang the transmitter due to
+wrong padding when sending IPv6 packets or small UDP packets (e.g. DNS or NTP).
+
 This fork also adds the `hw.re.flow_control` tunable to control the 802.3x flow
 control advertisement (enabled by default): setting it to 0 stops 802.3x flow
 negotiating, honoring and sending pause frames.
+
+It also fixes a number of crashes (kernel panics on device detach and
+on network cable insertion, races on MTU change, error handling on attach
+failure) and resource leaks not yet addressed in the official driver.
+
+Finally, some performance improvements have been applied: the interface send
+queue is sized to the TX descriptor ring instead of the 50-packet system
+default, the receive processing budget per interrupt has been increased, and
+the PCIe Max Read Request Size is programmed on discrete NICs (this can be
+disabled on SoC platforms by setting the `hw.re.config_soc_lan` tunable to 1).
 
 The link speed and duplexmode can be changed by using following command.
 	1. For auto negotiation,
