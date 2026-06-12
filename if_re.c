@@ -116,6 +116,7 @@ __FBSDID("$FreeBSD: src/sys/dev/re/if_re.c,v " RE_VERSION __DATE__ " " __TIME__ 
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
 #include <netinet/tcp.h>
+#include <netinet/udp.h>
 
 #include <machine/in_cksum.h>
 
@@ -10547,42 +10548,92 @@ static int re_encap(struct re_softc *sc,struct mbuf **m_head)
         return(0);
 }
 
-#define MIN_IPV4_PATCH_PKT_LEN (121)
-#define MIN_IPV6_PATCH_PKT_LEN (147)
+#define RE_MIN_PATCH_LEN	(47)
+#define RE_MAX_PATCH_PKT_LEN	(175)	/* 128 + RE_MIN_PATCH_LEN */
 static int re_8125_pad(struct re_softc *sc,struct mbuf *m_head)
 {
-        uint32_t min_pkt_len;
+        struct ether_vlan_header *eh;
+        uint32_t pkt_len = m_head->m_pkthdr.len;
+        uint32_t eth_hdr_len, l4_off, l4_hdr_len, trans_data_len;
+        uint32_t pad_len = 0;
         uint16_t ether_type;
+        uint8_t proto;
 
         if ((m_head->m_pkthdr.csum_flags &
             (CSUM_TCP | CSUM_UDP | CSUM_TCP_IPV6 | CSUM_UDP_IPV6)) != 0)
                 goto out;
 
         ether_type = re_get_eth_type(m_head);
-        min_pkt_len = RE_MIN_FRAMELEN;
+        eh = mtod(m_head, struct ether_vlan_header *);
+        if (m_head->m_len >= ETHER_HDR_LEN &&
+            eh->evl_encap_proto == htons(ETHERTYPE_VLAN))
+                eth_hdr_len = ETHER_HDR_LEN + ETHER_VLAN_ENCAP_LEN;
+        else
+                eth_hdr_len = ETHER_HDR_LEN;
+
+        if (pkt_len >= RE_MAX_PATCH_PKT_LEN)
+                goto min_frame;
+
         if (ether_type == ETHERTYPE_IP) {
-                struct ip *ip = (struct ip *)mtodo(m_head, ETHER_HDR_LEN);
-                if (ip->ip_p == IPPROTO_UDP)
-                        min_pkt_len = MIN_IPV4_PATCH_PKT_LEN;
+                struct ip *ip;
+
+                if (m_head->m_len < eth_hdr_len + sizeof(struct ip))
+                        goto min_frame;
+                ip = (struct ip *)mtodo(m_head, eth_hdr_len);
+                proto = ip->ip_p;
+                l4_off = eth_hdr_len + (ip->ip_hl << 2);
         } else if (ether_type == ETHERTYPE_IPV6) {
-                struct ip6_hdr *ip6 = (struct ip6_hdr *)mtodo(m_head, ETHER_HDR_LEN);
-                if (ip6->ip6_nxt == IPPROTO_UDP)
-                        min_pkt_len = MIN_IPV6_PATCH_PKT_LEN;
+                struct ip6_hdr *ip6;
+
+                if (m_head->m_len < eth_hdr_len + sizeof(struct ip6_hdr))
+                        goto min_frame;
+                ip6 = (struct ip6_hdr *)mtodo(m_head, eth_hdr_len);
+                proto = ip6->ip6_nxt;
+                l4_off = eth_hdr_len + sizeof(struct ip6_hdr);
+        } else
+                goto min_frame;
+
+        if ((proto != IPPROTO_TCP && proto != IPPROTO_UDP) ||
+            l4_off > pkt_len)
+                goto min_frame;
+
+        trans_data_len = pkt_len - l4_off;
+
+        /* The chip corrupts small PTP packets, pad them. */
+        if (proto == IPPROTO_UDP && trans_data_len > 3 &&
+            trans_data_len < RE_MIN_PATCH_LEN &&
+            m_head->m_len >= l4_off + sizeof(struct udphdr)) {
+                struct udphdr *uh = (struct udphdr *)mtodo(m_head, l4_off);
+                uint16_t dport = ntohs(uh->uh_dport);
+
+                if (dport == 319 || dport == 320) {
+                        pad_len = RE_MIN_PATCH_LEN - trans_data_len;
+                        goto min_frame;
+                }
         }
 
-        if (m_head->m_pkthdr.len < min_pkt_len) {
-                static const uint8_t pad[MIN_IPV4_PATCH_PKT_LEN];
-                uint16_t pad_len = min_pkt_len - m_head->m_pkthdr.len;
+        /* Pad truncated L4 headers. */
+        l4_hdr_len = (proto == IPPROTO_TCP) ? 20 : 8;
+        if (trans_data_len < l4_hdr_len)
+                pad_len = l4_hdr_len - trans_data_len;
+
+min_frame:
+        if (pkt_len + pad_len < RE_MIN_FRAMELEN)
+                pad_len = RE_MIN_FRAMELEN - pkt_len;
+
+        if (pad_len > 0) {
+                static const uint8_t pad[RE_MIN_FRAMELEN];
+
                 if (!m_append(m_head, pad_len, pad))
                         return (1);
 
                 if (ether_type == ETHERTYPE_IP &&
                     m_head->m_pkthdr.csum_flags & CSUM_IP) {
                         struct ip *ip;
-                        m_head->m_data += ETHER_HDR_LEN;
+                        m_head->m_data += eth_hdr_len;
                         ip = mtod(m_head, struct ip *);
                         ip->ip_sum = in_cksum(m_head, ip->ip_hl << 2);
-                        m_head->m_data -= ETHER_HDR_LEN;
+                        m_head->m_data -= eth_hdr_len;
                         m_head->m_pkthdr.csum_flags &= ~CSUM_IP;
                 }
         }
