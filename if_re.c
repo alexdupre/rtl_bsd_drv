@@ -10550,7 +10550,8 @@ static int re_8125_pad(struct re_softc *sc,struct mbuf *m_head)
         uint32_t min_pkt_len;
         uint16_t ether_type;
 
-        if ((m_head->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_UDP)) != 0)
+        if ((m_head->m_pkthdr.csum_flags &
+            (CSUM_TCP | CSUM_UDP | CSUM_TCP_IPV6 | CSUM_UDP_IPV6)) != 0)
                 goto out;
 
         ether_type = re_get_eth_type(m_head);
