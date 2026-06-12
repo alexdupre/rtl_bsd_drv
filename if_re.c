@@ -7465,8 +7465,6 @@ static int re_detach(device_t dev)
 
         ifp = RE_GET_IFNET(sc);
 
-        re_free_soft_lro(sc);
-
         /* These should only be active if attach succeeded */
         if (device_is_attached(dev)) {
                 RE_LOCK(sc);
@@ -7485,6 +7483,13 @@ static int re_detach(device_t dev)
                 RE_UNLOCK(sc);
         }
 
+        bus_generic_detach(dev);
+
+        sc->driver_detach = 1;
+
+        if (sc->re_intrhand)
+                bus_teardown_intr(dev, sc->re_irq, sc->re_intrhand);
+
 #if OS_VER>=VERSION(7,0)
         if (sc->re_tq) {
                 taskqueue_drain(sc->re_tq, &sc->re_inttask);
@@ -7493,12 +7498,7 @@ static int re_detach(device_t dev)
         }
 #endif
 
-        bus_generic_detach(dev);
-
-        sc->driver_detach = 1;
-
-        if (sc->re_intrhand)
-                bus_teardown_intr(dev, sc->re_irq, sc->re_intrhand);
+        re_free_soft_lro(sc);
 
 #if OS_VER>=VERSION(6,0)
         if (ifp)
