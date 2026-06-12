@@ -268,6 +268,7 @@ static void re_link_on_patch	__P((struct re_softc *));
 static void re_link_down_patch	__P((struct re_softc *));
 static void re_init_timer	__P((struct re_softc *));
 static void re_stop_timer	__P((struct re_softc *));
+static void re_drain_timer	__P((struct re_softc *));
 static void re_start_timer	__P((struct re_softc *));
 static void re_tick				__P((void *));
 #if OS_VER < VERSION(7,0)
@@ -7498,6 +7499,8 @@ static int re_detach(device_t dev)
         }
 #endif
 
+        re_drain_timer(sc);
+
         re_free_soft_lro(sc);
 
 #if OS_VER>=VERSION(6,0)
@@ -10079,6 +10082,7 @@ static void re_stop(struct re_softc *sc)  	/* Stop Driver */
         ifp->if_timer = 0;
 #endif
 
+        sc->re_link_chg_det = 0;
         re_stop_timer(sc);
 
         re_stop_txrx(sc);
@@ -11916,6 +11920,15 @@ static void re_stop_timer(struct re_softc *sc)
         callout_stop(&sc->re_stat_ch);
 #else
         untimeout(re_tick, sc, sc->re_stat_ch);
+#endif
+}
+
+static void re_drain_timer(struct re_softc *sc)
+{
+#ifdef RE_USE_NEW_CALLOUT_FUN
+        callout_drain(&sc->re_stat_ch);
+#else
+        re_stop_timer(sc);
 #endif
 }
 
