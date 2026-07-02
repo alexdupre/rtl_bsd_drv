@@ -7483,6 +7483,7 @@ static int re_detach(device_t dev)
         /* These should only be active if attach succeeded */
         if (device_is_attached(dev)) {
                 RE_LOCK(sc);
+                sc->re_link_chg_det = 0;
                 re_stop(sc);
                 RE_UNLOCK(sc);
 #if OS_VER < VERSION(4,9)
@@ -9223,6 +9224,8 @@ static void re_init_unlock(void *xsc)  	/* Software & Hardware Initialize */
         /* Init our MAC address */
         re_rar_set(sc, eaddr.eaddr);
 
+        sc->hw_common(sc);
+
         sc->hw_start_unlock(sc);
 
         return;
@@ -10077,7 +10080,6 @@ static void re_stop(struct re_softc *sc)  	/* Stop Driver */
         ifp->if_timer = 0;
 #endif
 
-        sc->re_link_chg_det = 0;
         re_stop_timer(sc);
 
         re_stop_txrx(sc);
