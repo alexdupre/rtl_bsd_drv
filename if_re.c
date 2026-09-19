@@ -10767,7 +10767,12 @@ static void re_txeof(struct re_softc *sc, u_int32_t qid)  	/* Transmit OK/ERR ha
 #ifdef _DEBUG_
                 printf("**** Tx OK  ****\n");
 #endif
-                if (sc->re_desc.tx_buf[entry]!=NULL) {
+                if (sc->re_desc.tx_buf[qid][entry]!=NULL) {
+#if OS_VER < VERSION(11,0)
+                        ifp->if_opackets++;
+#else
+                        if_inc_counter(ifp, IFCOUNTER_OPACKETS, 1);
+#endif
                         bus_dmamap_sync(sc->re_desc.re_tx_mtag[qid],
                                         sc->re_desc.re_tx_dmamap[qid][entry],
                                         BUS_DMASYNC_POSTWRITE);
