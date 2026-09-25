@@ -11303,6 +11303,16 @@ static void re_int_task(void *arg, int npending)
         if (re_intr)
                 sc->recheck_desc_ownbit = true;
 
+        /* Recover TX completions that arrived while interrupts were disabled. */
+        status = CSR_READ_2(sc, RE_ISR);
+        if (status & (RE_ISR_TX_OK | RE_ISR_TX_ERR | RE_ISR_TDU)) {
+                CSR_WRITE_2(sc, RE_ISR,
+                            status & (RE_ISR_TX_OK | RE_ISR_TX_ERR | RE_ISR_TDU));
+                re_txeof(sc, default_tx_qid);
+                if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
+                        re_start_locked(ifp, default_tx_qid);
+        }
+
         RE_UNLOCK(sc);
 
 #if OS_VER>=VERSION(7,0)
@@ -11318,6 +11328,7 @@ static void re_int_task(void *arg, int npending)
 
         /* Re-enable interrupts. */
         CSR_WRITE_2(sc, RE_IMR, RE_INTRS);
+        (void)CSR_READ_2(sc, RE_ISR);
 }
 
 static void re_int_task_8125_poll(void *arg, int npending)
