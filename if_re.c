@@ -12054,16 +12054,34 @@ static void re_tick(void *xsc)
 static void re_tx_watchdog(struct re_softc *sc)
 {
         struct ifnet *ifp;
+        uint16_t isr, imr;
+        uint32_t txcfg;
 
         if (sc->re_tx_watchdog == 0 || --sc->re_tx_watchdog != 0)
                 return;
 
         ifp = RE_GET_IFNET(sc);
+        isr = CSR_READ_2(sc, RE_ISR);
+        imr = CSR_READ_2(sc, RE_IMR);
+        txcfg = CSR_READ_4(sc, RE_TXCFG);
         re_txeof(sc, default_tx_qid);
         if (sc->re_desc.tx_cur_index[default_tx_qid] ==
             sc->re_desc.tx_last_index[default_tx_qid]) {
+                device_printf(sc->dev,
+                              "TX watchdog: missed completion (ISR 0x%04x IMR 0x%04x)\n",
+                              isr, imr);
                 if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
                         re_start_locked(ifp, default_tx_qid);
+                return;
+        }
+
+        device_printf(sc->dev,
+                      "TX watchdog: stalled (TX %u/%u, ISR 0x%04x IMR 0x%04x TXCFG 0x%08x)\n",
+                      sc->re_desc.tx_cur_index[default_tx_qid],
+                      sc->re_desc.tx_last_index[default_tx_qid],
+                      isr, imr, txcfg);
+        if (txcfg == 0xffffffff) {
+                device_printf(sc->dev, "controller not responding\n");
                 return;
         }
 
