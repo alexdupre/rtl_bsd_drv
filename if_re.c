@@ -271,6 +271,7 @@ static void re_init_timer	__P((struct re_softc *));
 static void re_stop_timer	__P((struct re_softc *));
 static void re_drain_timer	__P((struct re_softc *));
 static void re_start_timer	__P((struct re_softc *));
+static void re_tx_watchdog	__P((struct re_softc *));
 static void re_tick				__P((void *));
 #if OS_VER < VERSION(7,0)
 static void re_watchdog				__P((struct ifnet *));
@@ -10081,6 +10082,7 @@ static void re_stop(struct re_softc *sc)  	/* Stop Driver */
 #endif
 
         re_stop_timer(sc);
+        sc->re_tx_watchdog = 0;
 
         re_stop_txrx(sc);
 
@@ -10514,6 +10516,7 @@ static void re_start_tx(struct re_softc	*sc)
         }
 
         _re_start_tx(sc);
+        sc->re_tx_watchdog = 5;
 }
 
 /*
@@ -10790,6 +10793,11 @@ static void re_txeof(struct re_softc *sc, u_int32_t qid)  	/* Transmit OK/ERR ha
                 sc->re_desc.tx_last_index[qid] = tx_last_index;
                 ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
         }
+
+        if (tx_cur_index == tx_last_index)
+                sc->re_tx_watchdog = 0;
+        else
+                sc->re_tx_watchdog = 5;
 
         /* prevent tx stop. */
         if (tx_cur_index != tx_last_index)
@@ -12025,9 +12033,38 @@ static void re_tick(void *xsc)
                 re_start_timer(sc);
         }
 
+        re_tx_watchdog(sc);
+
         RE_UNLOCK(sc);
 
         return;
+}
+
+static void re_tx_watchdog(struct re_softc *sc)
+{
+        struct ifnet *ifp;
+
+        if (sc->re_tx_watchdog == 0 || --sc->re_tx_watchdog != 0)
+                return;
+
+        ifp = RE_GET_IFNET(sc);
+        re_txeof(sc, default_tx_qid);
+        if (sc->re_desc.tx_cur_index[default_tx_qid] ==
+            sc->re_desc.tx_last_index[default_tx_qid]) {
+                if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
+                        re_start_locked(ifp, default_tx_qid);
+                return;
+        }
+
+#if OS_VER < VERSION(11,0)
+        ifp->if_oerrors++;
+#else
+        if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
+#endif
+        re_reset(sc);
+        re_init_unlock(sc);
+        if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
+                re_start_locked(ifp, default_tx_qid);
 }
 
 #if OS_VER < VERSION(7,0)
