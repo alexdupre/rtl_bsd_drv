@@ -245,7 +245,7 @@ static __inline void re_fixup_rx		__P((struct mbuf *));
 #endif
 static void re_txeof				__P((struct re_softc *, u_int32_t));
 
-//static int re_rxeof				__P((struct re_softc *));
+static int re_rxeof				__P((struct re_softc *));
 
 #if OS_VER < VERSION(7,0)
 static void re_intr				__P((void *));
@@ -9317,6 +9317,57 @@ static void re_disable_imr_8125(struct re_softc *sc)
                 CSR_WRITE_4(sc, RE_IMR0_8125, 0x00000000);
 }
 
+static bool re_tx_intr_recheck_8125(struct re_softc *sc, struct ifnet *ifp)
+{
+        u_int32_t status, tx_intr;
+        bool rx_intr;
+        int rx_done;
+
+        rx_intr = false;
+        rx_done = 0;
+        switch (sc->HwSuppIsrVer) {
+        case 1:
+                tx_intr = RE_ISR_TX_OK | RE_ISR_TX_ERR | RE_ISR_TDU;
+                break;
+        case 2:
+                tx_intr = RE_8125B_ISR_TXQ0_OK;
+                break;
+        case 3:
+                /* These revisions combine RX and TX completion status. */
+                tx_intr = RE_8126_ISR_TRXQ0_OK;
+                rx_intr = true;
+                break;
+        case 4:
+                tx_intr = RE_8125BP_ISR_TRXQ0_OK;
+                rx_intr = true;
+                break;
+        case 5:
+                tx_intr = RE_8125D_ISR_TXQ0_OK;
+                break;
+        case 6:
+                tx_intr = RE_8127_ISR_TXQ0_OK;
+                break;
+        case 7:
+                tx_intr = RE_8125CP_ISR_TXQ0_OK;
+                break;
+        default:
+                return (false);
+        }
+
+        status = re_get_isr_8125(sc);
+        if ((status & tx_intr) == 0)
+                return (false);
+
+        re_set_isr_8125(sc, status & tx_intr);
+        if (rx_intr)
+                rx_done = re_rxeof(sc);
+        re_txeof(sc, default_tx_qid);
+        if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
+                re_start_locked(ifp, default_tx_qid);
+
+        return (rx_done >= RE_RX_BUDGET);
+}
+
 static void re_hw_common_8125(struct re_softc *sc)
 {
         u_int16_t		data16;
@@ -11366,8 +11417,11 @@ static void re_int_task_8125_poll(void *arg, int npending)
         re_intr = true;
 #endif //OS_VER>=VERSION(7,0)
 
-        if (re_intr)
+        if (re_intr) {
                 sc->recheck_desc_ownbit = true;
+                if (re_tx_intr_recheck_8125(sc, ifp))
+                        re_intr = false;
+        }
 
         RE_UNLOCK(sc);
 
@@ -11384,6 +11438,7 @@ static void re_int_task_8125_poll(void *arg, int npending)
 
         /* Re-enable interrupts. */
         re_enable_imr_8125(sc);
+        (void)re_get_isr_8125(sc);
 }
 
 static void re_int_task_8125(void *arg, int npending)
@@ -11434,8 +11489,11 @@ static void re_int_task_8125(void *arg, int npending)
         re_intr = true;
 #endif //OS_VER>=VERSION(7,0)
 
-        if (re_intr)
+        if (re_intr) {
                 sc->recheck_desc_ownbit = true;
+                if (re_tx_intr_recheck_8125(sc, ifp))
+                        re_intr = false;
+        }
 
         RE_UNLOCK(sc);
 
@@ -11452,6 +11510,7 @@ static void re_int_task_8125(void *arg, int npending)
 
         /* Re-enable interrupts. */
         re_enable_imr_8125(sc);
+        (void)re_get_isr_8125(sc);
 }
 
 static void re_set_multicast_reg(struct re_softc *sc, u_int32_t mask0,
@@ -12054,21 +12113,26 @@ static void re_tick(void *xsc)
 static void re_tx_watchdog(struct re_softc *sc)
 {
         struct ifnet *ifp;
-        uint16_t isr, imr;
-        uint32_t txcfg;
+        uint32_t isr, imr, txcfg;
 
         if (sc->re_tx_watchdog == 0 || --sc->re_tx_watchdog != 0)
                 return;
 
         ifp = RE_GET_IFNET(sc);
-        isr = CSR_READ_2(sc, RE_ISR);
-        imr = CSR_READ_2(sc, RE_IMR);
+        if (sc->HwSuppIsrVer > 0) {
+                /* Report the configured mask; V2 SET/CLEAR has no readback. */
+                isr = re_get_isr_8125(sc);
+                imr = re_get_default_imr_8125(sc);
+        } else {
+                isr = CSR_READ_2(sc, RE_ISR);
+                imr = CSR_READ_2(sc, RE_IMR);
+        }
         txcfg = CSR_READ_4(sc, RE_TXCFG);
         re_txeof(sc, default_tx_qid);
         if (sc->re_desc.tx_cur_index[default_tx_qid] ==
             sc->re_desc.tx_last_index[default_tx_qid]) {
                 device_printf(sc->dev,
-                              "TX watchdog: missed completion (ISR 0x%04x IMR 0x%04x)\n",
+                              "TX watchdog: missed completion (ISR 0x%08x IMR 0x%08x)\n",
                               isr, imr);
                 if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
                         re_start_locked(ifp, default_tx_qid);
@@ -12076,7 +12140,7 @@ static void re_tx_watchdog(struct re_softc *sc)
         }
 
         device_printf(sc->dev,
-                      "TX watchdog: stalled (TX %u/%u, ISR 0x%04x IMR 0x%04x TXCFG 0x%08x)\n",
+                      "TX watchdog: stalled (TX %u/%u, ISR 0x%08x IMR 0x%08x TXCFG 0x%08x)\n",
                       sc->re_desc.tx_cur_index[default_tx_qid],
                       sc->re_desc.tx_last_index[default_tx_qid],
                       isr, imr, txcfg);
