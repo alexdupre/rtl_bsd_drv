@@ -265,6 +265,7 @@ static void re_setmulti			__P((struct re_softc *));
 static int  re_ioctl			__P((struct ifnet *, u_long, caddr_t));
 static u_int8_t re_link_ok	__P((struct re_softc *));
 static void re_stop_txrx	__P((struct re_softc *));
+static void re_quiesce_dma_8125	__P((struct re_softc *));
 static void re_link_on_patch	__P((struct re_softc *));
 static void re_link_down_patch	__P((struct re_softc *));
 static void re_init_timer	__P((struct re_softc *));
@@ -9692,6 +9693,9 @@ static void re_hw_start_unlock_8125(struct re_softc *sc)
          */
         re_set_rx_packet_filter(sc);
 
+        /* Reopen the RX datapath gated by re_quiesce_dma_8125(). */
+        CSR_WRITE_4(sc, RE_MISC, CSR_READ_4(sc, RE_MISC) & ~RE_MISC_RXDV_GATE);
+
         /* Enable transmit and receive.*/
         CSR_WRITE_1(sc, RE_COMMAND, RE_CMD_TX_ENB | RE_CMD_RX_ENB);
 
@@ -10074,6 +10078,49 @@ re_clrwol(struct re_softc *sc)
         re_disable_cfg9346_write(sc);
 }
 
+static void re_quiesce_dma_8125(struct re_softc *sc)
+{
+        int i;
+        bool stop_req;
+
+        /*
+         * Gate RX data so it cannot be written to host memory while
+         * shutting down. RTL8125A (MACFG_80/81) uses the FIFO-empty
+         * indication directly; RTL8125B and later also require STOPREQ
+         * and the interrupt-mitigation idle indication before reset.
+         */
+        CSR_WRITE_4(sc, RE_MISC, CSR_READ_4(sc, RE_MISC) | RE_MISC_RXDV_GATE);
+        DELAY(2000);
+
+        stop_req = (sc->re_type != MACFG_80 && sc->re_type != MACFG_81);
+        if (stop_req)
+                CSR_WRITE_1(sc, RE_COMMAND,
+                            CSR_READ_1(sc, RE_COMMAND) | RE_CMD_STOP_REQ);
+
+        for (i = RE_TIMEOUT; i > 0; i--) {
+                if ((CSR_READ_1(sc, RE_MCU_CMD) &
+                     (RE_TXFIFO_EMPTY | RE_RXFIFO_EMPTY)) ==
+                    (RE_TXFIFO_EMPTY | RE_RXFIFO_EMPTY))
+                        break;
+                DELAY(100);
+        }
+        if (i == 0)
+                device_printf(sc->dev, "TX/RX FIFO drain timed out!\n");
+
+        if (stop_req) {
+                for (i = RE_TIMEOUT; i > 0; i--) {
+                        if ((CSR_READ_2(sc, RE_IntrMitigate) &
+                             (BIT_0 | BIT_1 | BIT_8)) ==
+                            (BIT_0 | BIT_1 | BIT_8))
+                                break;
+                        DELAY(100);
+                }
+                if (i == 0)
+                        device_printf(sc->dev,
+                                      "TX/RX interrupt drain timed out!\n");
+        }
+}
+
 static void re_stop_txrx(struct re_softc *sc)
 {
         /*	RE_LOCK_ASSERT(sc);*/
@@ -10105,6 +10152,7 @@ static void re_stop_txrx(struct re_softc *sc)
         case MACFG_101:
                 re_disable_imr_8125(sc);
                 re_set_isr_8125(sc, 0xffffffff);
+                re_quiesce_dma_8125(sc);
                 break;
         default:
                 CSR_WRITE_2(sc, RE_IMR, 0x0000);

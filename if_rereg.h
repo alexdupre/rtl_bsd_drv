@@ -155,6 +155,8 @@
 #define RE_CPlusCmd	0x00E0
 #define RE_IntrMitigate	0x00E2
 #define	RE_MTPS		0x00EC
+#define RE_MISC		0x00F0		/* miscellaneous register */
+#define RE_MISC_RXDV_GATE	0x00080000	/* gate RX data into the FIFO */
 #define	RE_CMAC_IBCR0     	0x00F8
 #define	RE_CMAC_IBCR2     	0x00F9
 #define	RE_CMAC_IBIMR0    	0x00FA
