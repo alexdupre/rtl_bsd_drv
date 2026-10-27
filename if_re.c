@@ -131,13 +131,8 @@ __FBSDID("$FreeBSD: src/sys/dev/re/if_re.c,v " RE_VERSION __DATE__ " " __TIME__ 
 	CSR_WRITE_1(sc, RE_EECMD,			\
 		CSR_READ_1(sc, RE_EECMD) & ~x)
 
-struct bus_dma_tag {
-        struct bus_dma_tag_common common;
-        int                     map_count;
-        int                     bounce_flags;
-        bus_dma_segment_t       *segments;
-        struct bounce_zone      *bounce_zone;
-};
+#define RE_RX_LIST_SIZE	(sizeof(union RxDesc) * (RE_RX_BUF_NUM + 1))
+#define RE_TX_LIST_SIZE	(sizeof(union TxDesc) * (RE_TX_BUF_NUM + 1))
 
 /*
  * Various supported device vendors/types and their names.
@@ -6099,10 +6094,10 @@ re_sysctl_driver_variable(SYSCTL_HANDLER_ARGS)
                 printf("HwSuppMacMcuVer\t%d\n", sc->HwSuppMacMcuVer);
                 printf("MacMcuPageSize\t%d\n", sc->MacMcuPageSize);
                 for (int i = 0; i < RL_RX_QUEUE_NUM; i++)
-                        printf("rx_desc_tag maxsize%d\t%zd\n", i, sc->re_desc.rx_desc_tag[i]->common.maxsize);
+                        printf("rx_desc_tag maxsize%d\t%zd\n", i, RE_RX_LIST_SIZE);
                 for (int i = 0; i < RL_TX_QUEUE_NUM; i++)
-                        printf("tx_desc_tag maxsize%d\t%zd\n", i, sc->re_desc.tx_desc_tag[i]->common.maxsize);
-                printf("re_tally maxsize\t%zd\n", sc->re_tally.re_stag->common.maxsize);
+                        printf("tx_desc_tag maxsize%d\t%zd\n", i, RE_TX_LIST_SIZE);
+                printf("re_tally maxsize\t%zd\n", sizeof(struct re_stats));
                 printf("random_mac\t%d\n", sc->random_mac);
                 printf("org_mac_addr\t%6D\n", sc->org_mac_addr, ":");
 #if OS_VER < VERSION(6,0)
@@ -6601,7 +6596,7 @@ re_sysctl_dump_rx_desc(SYSCTL_HANDLER_ARGS)
                 for (int i = 0; i < RL_RX_QUEUE_NUM; i++) {
                         printf("%s rx desc(%d):%d\n", device_get_nameunit(sc->dev),
                                i, RE_RX_BUF_NUM);
-                        rx_list_size = sc->re_desc.rx_desc_tag[i]->common.maxsize;
+                        rx_list_size = RE_RX_LIST_SIZE;
                         re_dump_desc((void*)sc->re_desc.rx_desc[i], rx_list_size);
                 }
 
@@ -6630,7 +6625,7 @@ re_sysctl_dump_tx_desc(SYSCTL_HANDLER_ARGS)
                 for (int i = 0; i < RL_TX_QUEUE_NUM; i++) {
                         printf("%s tx desc(%d):%d\n", device_get_nameunit(sc->dev),
                                i, RE_TX_BUF_NUM);
-                        tx_list_size = sc->re_desc.tx_desc_tag[i]->common.maxsize;
+                        tx_list_size = RE_TX_LIST_SIZE;
                         re_dump_desc((void*)sc->re_desc.tx_desc[i], tx_list_size);
                 }
 
@@ -7140,7 +7135,7 @@ static int re_attach(device_t dev)
         if (error)
                 goto fail;
 
-        rx_list_size = sizeof(union RxDesc) * (RE_RX_BUF_NUM + 1);
+        rx_list_size = RE_RX_LIST_SIZE;
         for (int i = 0; i < RL_RX_QUEUE_NUM; i++) {
                 error = bus_dma_tag_create(
                                 sc->re_parent_tag,
@@ -7169,7 +7164,7 @@ static int re_attach(device_t dev)
                 }
         }
 
-        tx_list_size = sizeof(union TxDesc) * (RE_TX_BUF_NUM + 1);
+        tx_list_size = RE_TX_LIST_SIZE;
         for (int i=0; i<RL_TX_QUEUE_NUM; i++) {
                 error = bus_dma_tag_create(
                                 sc->re_parent_tag,
