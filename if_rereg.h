@@ -1110,6 +1110,7 @@ struct re_softc {
         u_int8_t re_hw_enable_msi_msix;
 
         u_int8_t re_coalesce_tx_pkt;
+        u_int8_t re_tx_watchdog;
 
         u_int8_t	link_state;
 

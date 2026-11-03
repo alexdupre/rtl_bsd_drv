@@ -266,6 +266,7 @@ static void re_init_timer	__P((struct re_softc *));
 static void re_stop_timer	__P((struct re_softc *));
 static void re_drain_timer	__P((struct re_softc *));
 static void re_start_timer	__P((struct re_softc *));
+static void re_tx_watchdog	__P((struct re_softc *));
 static void re_tick				__P((void *));
 #if OS_VER < VERSION(7,0)
 static void re_watchdog				__P((struct ifnet *));
@@ -10134,6 +10135,7 @@ static void re_stop(struct re_softc *sc)  	/* Stop Driver */
 #endif
 
         re_stop_timer(sc);
+        sc->re_tx_watchdog = 0;
 
         re_stop_txrx(sc);
 
@@ -10567,6 +10569,7 @@ static void re_start_tx(struct re_softc	*sc)
         }
 
         _re_start_tx(sc);
+        sc->re_tx_watchdog = 5;
 }
 
 /*
@@ -10843,6 +10846,10 @@ static void re_txeof(struct re_softc *sc, u_int32_t qid)  	/* Transmit OK/ERR ha
                 sc->re_desc.tx_last_index[qid] = tx_last_index;
                 ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
         }
+
+        /* disarm the watchdog on empty ring, never postpone it. */
+        if (tx_cur_index == tx_last_index)
+                sc->re_tx_watchdog = 0;
 
         /* prevent tx stop. */
         if (tx_cur_index != tx_last_index)
@@ -12094,9 +12101,62 @@ static void re_tick(void *xsc)
                 re_start_timer(sc);
         }
 
+        re_tx_watchdog(sc);
+
         RE_UNLOCK(sc);
 
         return;
+}
+
+static void re_tx_watchdog(struct re_softc *sc)
+{
+        struct ifnet *ifp;
+        u_int32_t isr, imr, txcfg;
+
+        if (sc->re_tx_watchdog == 0 || --sc->re_tx_watchdog != 0)
+                return;
+
+        ifp = RE_GET_IFNET(sc);
+        if (sc->HwSuppIsrVer > 0) {
+                /* Report the configured mask; V2 SET/CLEAR has no readback. */
+                isr = re_get_isr_8125(sc);
+                imr = re_get_default_imr_8125(sc);
+        } else {
+                isr = CSR_READ_2(sc, RE_ISR);
+                imr = CSR_READ_2(sc, RE_IMR);
+        }
+        txcfg = CSR_READ_4(sc, RE_TXCFG);
+        re_txeof(sc, default_tx_qid);
+        if (sc->re_desc.tx_cur_index[default_tx_qid] ==
+            sc->re_desc.tx_last_index[default_tx_qid]) {
+                device_printf(sc->dev,
+                              "TX watchdog: missed completion (ISR 0x%08x IMR 0x%08x)\n",
+                              isr, imr);
+                if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
+                        re_start_locked(ifp, default_tx_qid);
+                return;
+        }
+
+        device_printf(sc->dev,
+                      "TX watchdog: stalled (TX %u/%u, ISR 0x%08x IMR 0x%08x TXCFG 0x%08x)\n",
+                      sc->re_desc.tx_cur_index[default_tx_qid],
+                      sc->re_desc.tx_last_index[default_tx_qid],
+                      isr, imr, txcfg);
+        if (txcfg == 0xffffffff) {
+                device_printf(sc->dev, "controller not responding\n");
+                return;
+        }
+
+#if OS_VER < VERSION(11,0)
+        ifp->if_oerrors++;
+#else
+        if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
+#endif
+        re_reset(sc);
+        re_init_unlock(sc);
+        re_start_timer(sc);
+        if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
+                re_start_locked(ifp, default_tx_qid);
 }
 
 #if OS_VER < VERSION(7,0)
