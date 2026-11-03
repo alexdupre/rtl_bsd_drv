@@ -240,7 +240,7 @@ static __inline void re_fixup_rx		__P((struct mbuf *));
 #endif
 static void re_txeof				__P((struct re_softc *, u_int32_t));
 
-//static int re_rxeof				__P((struct re_softc *));
+static int re_rxeof				__P((struct re_softc *));
 
 #if OS_VER < VERSION(7,0)
 static void re_intr				__P((void *));
@@ -9311,6 +9311,64 @@ static void re_disable_imr_8125(struct re_softc *sc)
                 CSR_WRITE_4(sc, RE_IMR0_8125, 0x00000000);
 }
 
+static bool re_tx_intr_recheck(struct re_softc *sc, struct ifnet *ifp)
+{
+        u_int32_t status, tx_intr;
+        bool rx_intr;
+        int rx_done;
+
+        rx_intr = false;
+        rx_done = 0;
+        switch (sc->HwSuppIsrVer) {
+        case 0:
+        case 1:
+                tx_intr = RE_ISR_TX_OK | RE_ISR_TX_ERR | RE_ISR_TDU;
+                break;
+        case 2:
+                tx_intr = RE_8125B_ISR_TXQ0_OK;
+                break;
+        case 3:
+                /* These revisions combine RX and TX completion status. */
+                tx_intr = RE_8126_ISR_TRXQ0_OK;
+                rx_intr = true;
+                break;
+        case 4:
+                tx_intr = RE_8125BP_ISR_TRXQ0_OK;
+                rx_intr = true;
+                break;
+        case 5:
+                tx_intr = RE_8125D_ISR_TXQ0_OK;
+                break;
+        case 6:
+                tx_intr = RE_8127_ISR_TXQ0_OK;
+                break;
+        case 7:
+                tx_intr = RE_8125CP_ISR_TXQ0_OK;
+                break;
+        default:
+                return (false);
+        }
+
+        if (sc->HwSuppIsrVer == 0)
+                status = CSR_READ_2(sc, RE_ISR);
+        else
+                status = re_get_isr_8125(sc);
+        if ((status & tx_intr) == 0)
+                return (false);
+
+        if (sc->HwSuppIsrVer == 0)
+                CSR_WRITE_2(sc, RE_ISR, status & tx_intr);
+        else
+                re_set_isr_8125(sc, status & tx_intr);
+        if (rx_intr)
+                rx_done = re_rxeof(sc);
+        re_txeof(sc, default_tx_qid);
+        if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
+                re_start_locked(ifp, default_tx_qid);
+
+        return (rx_done >= RE_RX_BUDGET);
+}
+
 static void re_hw_common_8125(struct re_softc *sc)
 {
         u_int16_t		data16;
@@ -11198,8 +11256,11 @@ static void re_int_task_poll(void *arg, int npending)
         re_intr = true;
 #endif //OS_VER>=VERSION(7,0)
 
-        if (re_intr)
+        if (re_intr) {
                 sc->recheck_desc_ownbit = true;
+                if (re_tx_intr_recheck(sc, ifp))
+                        re_intr = false;
+        }
 
         RE_UNLOCK(sc);
 
@@ -11216,6 +11277,7 @@ static void re_int_task_poll(void *arg, int npending)
 
         /* Re-enable interrupts. */
         CSR_WRITE_2(sc, RE_IMR, RE_INTRS);
+        (void)CSR_READ_2(sc, RE_ISR);
 }
 
 static void re_int_task(void *arg, int npending)
@@ -11287,8 +11349,11 @@ static void re_int_task(void *arg, int npending)
         re_intr = true;
 #endif //OS_VER>=VERSION(7,0)
 
-        if (re_intr)
+        if (re_intr) {
                 sc->recheck_desc_ownbit = true;
+                if (re_tx_intr_recheck(sc, ifp))
+                        re_intr = false;
+        }
 
         RE_UNLOCK(sc);
 
@@ -11305,6 +11370,7 @@ static void re_int_task(void *arg, int npending)
 
         /* Re-enable interrupts. */
         CSR_WRITE_2(sc, RE_IMR, RE_INTRS);
+        (void)CSR_READ_2(sc, RE_ISR);
 }
 
 static void re_int_task_8125_poll(void *arg, int npending)
@@ -11342,8 +11408,11 @@ static void re_int_task_8125_poll(void *arg, int npending)
         re_intr = true;
 #endif //OS_VER>=VERSION(7,0)
 
-        if (re_intr)
+        if (re_intr) {
                 sc->recheck_desc_ownbit = true;
+                if (re_tx_intr_recheck(sc, ifp))
+                        re_intr = false;
+        }
 
         RE_UNLOCK(sc);
 
@@ -11360,6 +11429,7 @@ static void re_int_task_8125_poll(void *arg, int npending)
 
         /* Re-enable interrupts. */
         re_enable_imr_8125(sc);
+        (void)re_get_isr_8125(sc);
 }
 
 static void re_int_task_8125(void *arg, int npending)
@@ -11410,8 +11480,11 @@ static void re_int_task_8125(void *arg, int npending)
         re_intr = true;
 #endif //OS_VER>=VERSION(7,0)
 
-        if (re_intr)
+        if (re_intr) {
                 sc->recheck_desc_ownbit = true;
+                if (re_tx_intr_recheck(sc, ifp))
+                        re_intr = false;
+        }
 
         RE_UNLOCK(sc);
 
@@ -11428,6 +11501,7 @@ static void re_int_task_8125(void *arg, int npending)
 
         /* Re-enable interrupts. */
         re_enable_imr_8125(sc);
+        (void)re_get_isr_8125(sc);
 }
 
 static void re_set_multicast_reg(struct re_softc *sc, u_int32_t mask0,
